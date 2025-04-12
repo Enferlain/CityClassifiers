@@ -7,3 +7,6 @@ safetensors>=0.4.0
 transformers>=4.35.0
 gradio>=3.23.0
 huggingface-hub
+pytorch_optimizer==3.3.2
+torchao
+triton-windows
