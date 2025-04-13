@@ -1,6 +1,6 @@
 
 from typing import Dict, List
-from optimizer.utils import OPTIMIZER
+from optimizer.optimizer_utils import OPTIMIZER
 
 from optimizer.adabelief import AdaBelief
 from optimizer.adammini import AdamMini

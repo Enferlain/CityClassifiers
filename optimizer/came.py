@@ -11,7 +11,7 @@ from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import BETAS, CLOSURE, DEFAULTS, LOSS, PARAMETERS
 
-from .utils import UPDATE_STRATEGY
+from .optimizer_utils import UPDATE_STRATEGY
 
 
 class CAME(BaseOptimizer):

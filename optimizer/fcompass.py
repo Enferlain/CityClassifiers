@@ -1,6 +1,6 @@
 import torch
 from torch.optim import Optimizer
-from .utils import copy_stochastic_, NORM_TYPE, agc, newton_schulz
+from .optimizer_utils import copy_stochastic_, NORM_TYPE, agc, newton_schulz
 import math
 from torch.nn.functional import softplus
 

@@ -3,7 +3,7 @@ import torch
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import CLOSURE, DEFAULTS, LOSS, PARAMETERS
-from .utils import copy_stochastic_
+from .optimizer_utils import copy_stochastic_
 
 class SGDSaI(BaseOptimizer):
     r"""No More Adam: Learning Rate Scaling at Initialization is All You Need.

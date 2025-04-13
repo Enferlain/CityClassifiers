@@ -1,6 +1,6 @@
 # FMARSCrop from https://github.com/Clybius/Personalized-Optimizers by Clybius
 import torch
-from .utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, UPDATE_STRATEGY,orthograd
+from .optimizer_utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, UPDATE_STRATEGY,orthograd
 import math
 
 from pytorch_optimizer.base.optimizer import BaseOptimizer

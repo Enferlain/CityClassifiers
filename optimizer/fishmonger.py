@@ -1,7 +1,7 @@
 import torch
 from torch.optim import Optimizer
 
-from .utils import copy_stochastic_
+from .optimizer_utils import copy_stochastic_
 
 from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
 

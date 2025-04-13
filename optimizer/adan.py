@@ -8,7 +8,7 @@ from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import BETAS, CLOSURE, DEFAULTS, LOSS, PARAMETERS
 from pytorch_optimizer.optimizer.gc import centralize_gradient
 from pytorch_optimizer.optimizer.utils import get_global_gradient_norm
-from .utils import copy_stochastic_, UPDATE_STRATEGY
+from .optimizer_utils import copy_stochastic_, UPDATE_STRATEGY
 
 
 class Adan(BaseOptimizer):

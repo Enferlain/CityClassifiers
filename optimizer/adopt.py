@@ -7,7 +7,7 @@ import math
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import BETAS, CLOSURE, DEFAULTS, LOSS, PARAMETERS, OPTIMIZER
 from pytorch_optimizer.base.exception import NoSparseGradientError
-from .utils import copy_stochastic_, NORM_TYPE, agc, UPDATE_STRATEGY
+from .optimizer_utils import copy_stochastic_, NORM_TYPE, agc, UPDATE_STRATEGY
 
 class ADOPT(BaseOptimizer):
     r"""Modified Adam Can Converge with Any β2 with the Optimal Rate.

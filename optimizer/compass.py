@@ -5,7 +5,7 @@
 
 import torch
 from torch.optim import Optimizer
-from .utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, create_factored_dims, get_denom, update_second_moment, STATE_PRECISION, UPDATE_STRATEGY
+from .optimizer_utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, create_factored_dims, get_denom, update_second_moment, STATE_PRECISION, UPDATE_STRATEGY
 import math
 from torch.nn.functional import softplus
 from typing import Optional, Literal

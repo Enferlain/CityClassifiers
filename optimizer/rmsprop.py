@@ -1,5 +1,5 @@
 import torch
-from .utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, create_factored_dims, get_denom, update_second_moment
+from .optimizer_utils import copy_stochastic_, agc, NORM_TYPE, newton_schulz, create_factored_dims, get_denom, update_second_moment
 import math
 from typing import Optional, Literal
 

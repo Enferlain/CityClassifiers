@@ -23,29 +23,32 @@ if os.path.isdir(optimizer_dir_path):
 else:
      print(f"Warning: Optimizer directory not found at {optimizer_dir_path}")
 
-# --- Assuming new optimizers are in an 'optimizer' directory ---
-# --- Adjust path if necessary ---
-# --- You MUST install pytorch-optimizer: pip install pytorch-optimizer ---
-# --- You MIGHT need torchao/triton for ADOPTAOScheduleFree: pip install torchao triton ---
-try:
-    from optimizer.fmarscrop import FMARSCropV3ExMachina  # Example FMARSCrop
-    from optimizer.adopt import ADOPT  # Example ADOPT
-    from optimizer.schedulefree import (  # Example ScheduleFree
-        ScheduleFreeWrapper,
-        ADOPTScheduleFree,
-        ADOPTAOScheduleFree
-    )
-except ImportError:
-    print("Warning: Custom optimizer files not found. Only AdamW will be available.")
-    FMARSCropV3ExMachina = None
-    ADOPT = None
-    ScheduleFreeWrapper = None
-    ADOPTScheduleFree = None
-    ADOPTAOScheduleFree = None
-# --- End Optimizer Imports ---
+# --- Remove try/except temporarily to see the full error ---
+# try:
+from optimizer.fmarscrop import FMARSCropV3ExMachina # Example FMARSCrop
+print("Imported FMARSCropV3ExMachina")
+from optimizer.adopt import ADOPT # Example ADOPT
+print("Imported ADOPT")
+from optimizer.schedulefree import ( # Example ScheduleFree
+    ScheduleFreeWrapper,
+    ADOPTScheduleFree,
+    ADOPTAOScheduleFree
+)
+print("Imported ScheduleFree variants")
+# <-- Add imports for any other specific optimizers you want to use
+optimizers_available = True
+# except ImportError as e:
+#     print(f"Warning: Custom optimizer import failed ({e}). Check dependencies within optimizer files. Only AdamW available.")
+#     FMARSCropV3ExMachina = None
+#     ADOPT = None
+#     ScheduleFreeWrapper = None
+#     ADOPTScheduleFree = None
+#     ADOPTAOScheduleFree = None
+#     optimizers_available = False
+# --- End temporary modification ---
 
 from dataset import EmbeddingDataset, ImageDataset
-# !! REMINDER: utils.py needs updates for args and ModelWrapper !!
+# !! REMINDER: optimizer_utils.py needs updates for args and ModelWrapper !!
 from utils import ModelWrapper, get_embed_params, parse_args, write_config
 from model import PredictorModel
 
@@ -69,7 +72,7 @@ TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"  # Use CPU if CUDA n
 print(f"Using target device: {TARGET_DEV}")
 
 if __name__ == "__main__":
-    args = parse_args()  # !! REMINDER: Add args for optimizer choice, hyperparameters, and --precision in utils.py !!
+    args = parse_args()  # !! REMINDER: Add args for optimizer choice, hyperparameters, and --precision in optimizer_utils.py !!
 
     # --- Configure Precision ---
     precision_arg = getattr(args, 'precision', 'fp32').lower()
@@ -106,7 +109,7 @@ if __name__ == "__main__":
         wandb.init(
             project="city-classifiers",  # Or your preferred project name
             name=args.name,  # Use the model name for the run name
-            config=vars(args)  # Log all command-line args/config from utils.py
+            config=vars(args)  # Log all command-line args/config from optimizer_utils.py
         )
         print("Weights & Biases initialized successfully.")
     except Exception as e:

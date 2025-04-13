@@ -11,3 +11,4 @@ pytorch_optimizer==3.3.2
 torchao
 triton-windows
 matplotlib
+bitsandbytes

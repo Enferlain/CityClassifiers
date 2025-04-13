@@ -1,7 +1,7 @@
 # FARMSCrop from https://github.com/Clybius/Personalized-Optimizers by Clybius
 import torch
 from torch.optim import Optimizer
-from .utils import copy_stochastic_
+from .optimizer_utils import copy_stochastic_
 
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer

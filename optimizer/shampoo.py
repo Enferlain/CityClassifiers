@@ -12,7 +12,7 @@ from .shampoo_utils import (
     PreConditionerType,
     build_graft,
 )
-from .utils import copy_stochastic_
+from .optimizer_utils import copy_stochastic_
 
 class ScalableShampoo(BaseOptimizer):
     r"""Scalable Preconditioned Stochastic Tensor Optimization.

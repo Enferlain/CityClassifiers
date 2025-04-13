@@ -12,7 +12,7 @@ from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import BETAS, CLOSURE, DEFAULTS, LOSS, PARAMETERS
 from pytorch_optimizer.optimizer.gc import centralize_gradient
 from pytorch_optimizer.optimizer.utils import normalize_gradient, unit_norm
-from .utils import copy_stochastic_, agc
+from .optimizer_utils import copy_stochastic_, agc
 
 
 class Ranger21(BaseOptimizer):

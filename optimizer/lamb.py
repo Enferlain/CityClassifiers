@@ -6,7 +6,7 @@ from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.types import BETAS, CLOSURE, DEFAULTS, LOSS, PARAMETERS
 from pytorch_optimizer.optimizer.utils import get_global_gradient_norm
-from .utils import copy_stochastic_
+from .optimizer_utils import copy_stochastic_
 
 
 class Lamb(BaseOptimizer):
