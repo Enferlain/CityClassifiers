@@ -1,9 +1,10 @@
 # config/CCAnatomy-AnatomyFlaws-v1.yaml
 model:
   base: "CCAnatomy-AnatomyFlaws"
-  rev:  "v1.0_5crop" # Add identifier for the data used
-  arch: score        # Must be score for 0/1 labels
-  clip: CLIP-Anatomy # Use this to potentially trigger dataset loading in train.py later*
+  # Let's use a new revision name now to avoid confusion!
+  rev:  "v1.7_balanced_fmarscrop_nols" # New revision name
+  arch: class            # <--- Ensure this says 'class'
+  clip: CLIP
 
 train:
   lr:    5e-5     # Start with a potentially lower LR for stability
@@ -27,4 +28,12 @@ train:
   # cosine: True
   # warmup_steps: 500
 
-# No 'labels' section needed for score models
+# --- Add this 'labels' section ---
+labels:
+  0: # Corresponds to folder "0"
+    name: "Bad Anatomy"
+    loss: 1.0            # Optional: Adjust loss weight if needed later
+  1: # Corresponds to folder "1"
+    name: "Good Anatomy"
+    loss: 1.0            # Optional: Adjust loss weight if needed later
+# --- End Add ---

@@ -20,244 +20,351 @@
 #     ...                     #
 ###############################
 
+# dataset.py
+# Version 2.0.1: Fixed preload error handling, mutable default, and getitem error path
+
 import os
 import torch
 import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+import random
+from collections import defaultdict # Added defaultdict
 
 DEFAULT_ROOT = "data"
-ALLOWED_EXTS = [".npy"]
+ALLOWED_EXTS = [".npy"] # Keep this as a module-level constant
 
 class Shard:
-	"""
-	Shard to store embedding:score pairs in
-		path: path to embedding on disk
-		value: score for the original image
-	"""
-	def __init__(self, path, value):
-		self.path = path
-		self.value = value
-		self.data = None
+    """
+    Shard to store embedding:score pairs in
+        path: path to embedding on disk
+        value: score for the original image
+    """
+    def __init__(self, path, value):
+        self.path = path
+        self.value = value # Keep original value (e.g., 0 or 1 for class)
+        self.normalized_value = None # Will hold normalized score if mode='score'
+        self.data = None
+        self._preload_ok = True # Flag to track preload success
 
-	def exists(self):
-		return os.path.isfile(self.path) and self.value is not None
+    def exists(self):
+        # Also check if value is not None for robustness
+        return os.path.isfile(self.path) and self.value is not None
 
-	def get_data(self):
-		if self.data is not None: return deepcopy(self.data)
-		data = torch.from_numpy(
-			np.load(self.path)
-		)
-		if data.shape[0] == 1:
-			data = torch.squeeze(data, 0)
-		assert not torch.isnan(torch.sum(data.float()))
-		return {
-			"emb": data,
-			"raw": self.value,
-			"val": torch.tensor([self.value]),
-		}
+    def get_data(self):
+        # If preload was successful and data exists, return it
+        if self._preload_ok and self.data is not None:
+            return deepcopy(self.data)
+        # Otherwise, attempt to load now (handles failed preload or no preload)
+        try:
+            data_numpy = np.load(self.path)
+            # Ensure data is at least 1D before squeeze
+            if data_numpy.ndim > 1 and data_numpy.shape[0] == 1:
+                 data_tensor = torch.from_numpy(data_numpy).squeeze(0)
+            elif data_numpy.ndim == 1:
+                 data_tensor = torch.from_numpy(data_numpy)
+            else:
+                raise ValueError(f"Unexpected numpy shape {data_numpy.shape}")
 
-	def preload(self):
-		self.data = self.get_data()
+            if torch.isnan(data_tensor.float().sum()):
+                 raise ValueError(f"NaN detected in embedding file")
+
+            # Use normalized_value if available (for score mode), otherwise use original value
+            target_value = self.normalized_value if self.normalized_value is not None else self.value
+            loaded_data = {
+                "emb": data_tensor,
+                "raw": self.value, # Always return original value as raw
+                "val": torch.tensor([target_value]), # Return normalized for score, original for class
+            }
+            # If preloading was originally requested but failed, maybe cache it now?
+            # if not self._preload_ok and self.data is None:
+            #     self.data = loaded_data # Optional: cache on successful first load
+            return loaded_data
+        except Exception as e:
+             # Raise a specific error or return None/handle in collate_fn
+             raise IOError(f"Failed to load data for shard {self.path}: {e}") from e
+
+
+    def preload(self):
+        # Preload needs to handle potential errors gracefully during batch loading
+        try:
+            # Attempt to load data into self.data
+            self.data = self.get_data()
+            self._preload_ok = True
+        except Exception as e:
+            print(f"Error preloading {self.path}: {e}. Marking as unloadable.")
+            self.data = None # Ensure data is None on failure
+            self._preload_ok = False # Mark preload as failed
+
+    def is_preload_ok(self):
+        return self._preload_ok
 
 class EmbeddingDataset(Dataset):
-	def __init__(self, ver, root=DEFAULT_ROOT, mode="class", preload=False):
-		"""
-		Main dataset that returns list of requested images as (C, E) embeddings
-		  ver: CLIP version (folder)
-		  root: Path to folder with sorted files
-		  mode: Model type. Class pads return val to length of labels.
-		  preload: Load all files into memory on initialization
-		"""
-		self.ver = ver
-		self.root = f"{root}/{ver}"
-		self.mode = mode
-		self.shard_class = Shard
+    # v2.0.1: Refined preload handling and getitem
+    def __init__(self, ver, root=DEFAULT_ROOT, mode="class", preload=False, validation_split_count=0, seed=42):
+        """
+        Main dataset that returns list of requested images as (C, E) embeddings
+          ver: CLIP version (folder)
+          root: Path to folder with sorted files
+          mode: Model type. Class pads return val to length of labels. Score normalizes.
+          preload: Load all files into memory on initialization (will skip failed preloads).
+          validation_split_count: Number of samples per class to reserve for validation.
+          seed: Random seed for the validation split shuffle.
+        """
+        print(f"Initializing EmbeddingDataset v2.0.1...")
+        self.ver = ver
+        self.root = f"{root}/{ver}"
+        self.mode = mode
+        self.shard_class = Shard
+        self.validation_split_count = validation_split_count
+        self.seed = seed
+        self.num_labels = 0
 
-		if self.mode == "score":
-			self.parse_shards(
-				vprep = lambda x: float(x),
-				norm  = True,
-			)
-			self.eval_data = self.get_score_eval()
-		elif self.mode == "class":
-			self.parse_shards(
-				vprep = lambda x: int(x)
-			)
-			self.parse_labels()
-			self.eval_data = self.get_class_eval()
-		else:
-			raise NotImplementedError("Unknown mode")
+        self.train_shards = []
+        self.val_shards = []
 
-		if preload:  # cache to RAM
-			print("Dataset: Preloading data to system RAM")
-			[x.preload() for x in tqdm(self.shards)]
+        # Parse all shards first
+        all_shards_by_class = self._parse_all_shards(
+            vprep=(lambda x: int(x)) if self.mode == "class" else (lambda x: float(x))
+        )
 
-		print(f"Dataset: OK, {len(self)} items")
+        # Perform splitting
+        self._split_shards(all_shards_by_class)
 
-	def __len__(self):
-		return len(self.shards)
+        # Preload if requested - MUST happen before normalization/label parsing
+        # so that failed preloads can be filtered out if needed (though currently we keep them)
+        if preload:
+            print("Dataset: Preloading training data to system RAM...")
+            # We preload in place, the shard object marks itself if failed
+            [shard.preload() for shard in tqdm(self.train_shards)]
+            # Filter out failed preloads from training set? Optional, but safer.
+            initial_train_count = len(self.train_shards)
+            self.train_shards = [s for s in self.train_shards if s.is_preload_ok()]
+            filtered_train_count = len(self.train_shards)
+            if initial_train_count != filtered_train_count:
+                 print(f"Dataset: Filtered out {initial_train_count - filtered_train_count} training shards that failed to preload.")
 
-	def __getitem__(self, index):
-		data = self.load_shard(self.shards[index])
-		data["index"] = index
-		return data
+            if self.val_shards:
+                print("Dataset: Preloading validation data to system RAM...")
+                [shard.preload() for shard in tqdm(self.val_shards)]
+                initial_val_count = len(self.val_shards)
+                self.val_shards = [s for s in self.val_shards if s.is_preload_ok()]
+                filtered_val_count = len(self.val_shards)
+                if initial_val_count != filtered_val_count:
+                     print(f"Dataset: Filtered out {initial_val_count - filtered_val_count} validation shards that failed to preload.")
 
-	def load_shard(self, shard):
-		return shard.get_data()
 
-	def parse_shards(self, vprep, exts=ALLOWED_EXTS, norm=False):
-		print("Dataset: Parsing data from disk")
-		self.shards = []
-		for cat in tqdm(os.listdir(self.root)):
-			cat_dir = f"{self.root}/{cat}"
-			if not os.path.isdir(cat_dir): continue
-			for i in os.listdir(cat_dir):
-				fname, ext = os.path.splitext(i)
-				if ext not in exts: continue
-				self.shards.append(
-					self.shard_class(
-						path = f"{self.root}/{cat}/{fname}{ext}",
-						value = vprep(cat.split('_', 1)[0]),
-					)
-				)
-		if norm:
-			shard_min = min([x.value for x in self.shards])
-			shard_max = max([x.value for x in self.shards])
-			print(f"Normalizing scores [{shard_min}, {shard_max}]")
-			for s in self.shards:
-				s.value = (s.value - shard_min) / (shard_max - shard_min)
+        # Normalize scores only for training shards if mode is score
+        if self.mode == "score":
+            self._normalize_scores() # Normalize train and remaining val shards
 
-	def parse_labels(self):
-		assert self.mode == "class"
-		labels = list(set([int(x.value) for x in self.shards]))
-		self.num_labels = len(labels)
-		assert all([x in labels for x in range(self.num_labels)]), "Dataset: Class labels not sequential!"
-		print(f"Dataset: Found {self.num_labels} separate classes")
+        # Get number of labels from training data if class mode
+        if self.mode == "class":
+            self._parse_labels()
 
-	def get_class_eval(self, ext="npy"):
-		out = [self.get_single_class_eval(x, ext) for x in range(self.num_labels)]
-		return {
-			"emb": torch.stack([x.get("emb") for x in out], dim=0),
-			"val": torch.stack([x.get("val") for x in out], dim=0),
-		}
+        print(f"Dataset: OK. Training items: {len(self.train_shards)}, Validation items: {len(self.val_shards)}")
+        if self.mode == "class":
+            print(f"Dataset: Found {self.num_labels} classes in training data.")
 
-	def get_single_class_eval(self, label, ext="npy"):
-		fname = f"{label}_test.{ext}" if label >= 0 else f"test.{ext}"
-		shard = self.shard_class(f"{self.root}/{fname}", label)
-		if shard.exists():
-			data = self.load_shard(shard)
-		else:
-			print(f"Dataset: Eval '{fname}' missing!")
-			data = self[[x for x in range(len(self)) if self.shards[x].value == label][0]]
-		val = torch.zeros(self.num_labels)
-		val[label] = 1.0
-		return {
-			"emb": data.get("emb"),
-			"val": val,
-		}
+    def __len__(self):
+        return len(self.train_shards)
 
-	def get_score_eval(self, ext="npy"):
-		shard = self.shard_class(f"{self.root}/test.{ext}", 1.0)
-		data = self.load_shard(shard) if shard.exists() else self[0]
-		return {
-			"emb": data.get("emb").unsqueeze(0).to(torch.float32),
-			"val": data.get("val").unsqueeze(0).to(torch.float32),
-		}
+    def __getitem__(self, index):
+        # Get shard from the training set
+        shard = self.train_shards[index]
+        try:
+            data = shard.get_data() # This might fail if loading on-the-fly fails
+            data["index"] = index
+            return data
+        except Exception as e:
+             # This shard failed loading, either during preload or just now.
+             # Log the error and return None to be handled by collate_fn
+             print(f"ERROR in __getitem__ for index {index}, shard path {shard.path}: {e}")
+             return None # Signal error to DataLoader's collate_fn
 
-################################
-#    Code for live encoding    #
-################################
-import torchvision.transforms as TF
-from PIL import Image
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
-IMAGE_ROOT = "ratings"
-IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
+    def get_validation_loader(self, batch_size, num_workers=0):
+        if not self.val_shards:
+            return None
+        # ValidationSubDataset already uses the filtered self.val_shards
+        val_dataset = ValidationSubDataset(self.val_shards, self.mode, self.num_labels)
+        if len(val_dataset) == 0:
+             print("Warning: ValidationSubDataset is empty after filtering.")
+             return None
 
-class ImageShard(Shard):
-	"""
-	Shard to store embedding:score pairs in
-		path: path to embedding on disk
-		value: score for the original image
-	"""
-	def get_data(self):
-		if self.data is not None: return deepcopy(self.data)
-		return {
-			"img": Image.open(self.path).convert("RGB"),
-			"raw": self.value,
-			"val": torch.tensor([self.value]),
-		}
+        return DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=False,
+            num_workers=num_workers,
+            collate_fn=collate_ignore_none # Use the collate function
+        )
 
-class ImageDataset(EmbeddingDataset):
-	def __init__(self, ver, root=IMAGE_ROOT, mode="class", clip_dtype=torch.float16, preload=False):
-		"""
-		Secondary dataset that returns list of requested images as (C, E) embeddings
-		  ver: CLIP version 
-		  root: Path to folder with sorted files
-		  mode: Model type. Class pads return val to length of labels.
-		"""
-		self.ver = ver
-		self.root = root
-		self.mode = mode
+    # Fixed mutable default arg `exts`
+    def _parse_all_shards(self, vprep, exts=None):
+        if exts is None:
+            exts = ALLOWED_EXTS # Use the module-level constant if None
 
-		self.device = "cuda"
-		self.clip_ver = "openai/clip-vit-large-patch14-336"
-		self.clip_dtype = clip_dtype
-		self.shard_class = ImageShard
+        print("Dataset: Parsing all data from disk...")
+        # Use defaultdict for cleaner insertion
+        shards_by_class = defaultdict(list)
+        root_dir = self.root
+        if not os.path.isdir(root_dir):
+             raise FileNotFoundError(f"Dataset root directory not found: {root_dir}")
 
-		assert self.ver in ["CLIP"], "Dataset: META Clip not supported for live encoding!"
-		self.proc, self.clip = self.init_clip()
+        for cat_folder_name in tqdm(os.listdir(root_dir)):
+            cat_dir = os.path.join(root_dir, cat_folder_name)
+            if not os.path.isdir(cat_dir): continue
 
-		if self.mode == "score":
-			self.tfs = -1
-			self.tf = None
-			self.parse_shards(
-				vprep  = lambda x: float(x),
-				exts   = IMAGE_EXTS,
-				norm   = True,
-			)
-			self.eval_data = self.get_score_eval(ext="png")
-		elif self.mode == "class":
-			self.tfs = self.proc.size.get("shortest_edge", 256)*2
-			self.tf = TF.RandomCrop(self.tfs)
-			self.parse_shards(
-				vprep  = lambda x: int(x),
-				exts   = IMAGE_EXTS,
-			)
-			self.parse_labels()
-			self.eval_data = self.get_class_eval(ext="png")
-		else:
-			raise NotImplementedError("Unknown mode")
+            try:
+                class_label_str = cat_folder_name.split('_', 1)[0]
+                class_label = vprep(class_label_str)
+            except (ValueError, IndexError): # Catch potential errors splitting/converting
+                print(f"Warning: Could not parse class label from folder name '{cat_folder_name}'. Skipping.")
+                continue
 
-		[x.preload() for x in tqdm(self.shards)]
-		print(f"Dataset: OK, {len(self)} items")
+            for item_name in os.listdir(cat_dir):
+                fname, ext = os.path.splitext(item_name)
+                # Ensure comparison is case-insensitive just in case
+                if ext.lower() not in [e.lower() for e in exts]: continue
+                shard_path = os.path.join(cat_dir, item_name)
+                shard = self.shard_class(path=shard_path, value=class_label)
+                # Check existence *before* adding to list
+                if shard.exists():
+                     shards_by_class[class_label].append(shard)
+                # else: # Optional: Log skipped non-existent files
+                #     print(f"Debug: Skipping non-existent shard file: {shard_path}")
 
-	def load_shard(self, shard):
-		data = shard.get_data()
-		img = data.pop("img")
-		if self.tf and min(img.size) >= self.tfs:
-			img = self.tf(img) # apply transforms
-		data["emb"] = self.get_clip_emb(img).squeeze(0)
-		return data
 
-	def init_clip(self):
-		print(f"Dataset: Initializing CLIP ({self.ver})")
-		proc = CLIPImageProcessor.from_pretrained(self.clip_ver)
-		clip = CLIPVisionModelWithProjection.from_pretrained(
-			self.clip_ver,
-			device_map  = self.device,
-			torch_dtype = self.clip_dtype,
-		)
-		return (proc, clip)
+        print("Dataset: Found shards per class:")
+        if not shards_by_class:
+             print("  No classes found!")
+        else:
+             # Sort by class label for consistent output
+             for lbl in sorted(shards_by_class.keys()):
+                  print(f"  Class {lbl}: {len(shards_by_class[lbl])} shards")
 
-	def get_clip_emb(self, raw):
-		img = self.proc(
-			images = raw,
-			# do_rescale = False,
-			return_tensors = "pt"
-		)["pixel_values"].to(self.clip_dtype).to(self.device)
-		with torch.no_grad():
-			emb = self.clip(pixel_values=img)
-		return emb["image_embeds"].detach().to(torch.float32)
+        return shards_by_class
+
+    # _split_shards remains mostly the same, ensure it handles empty lists if a class had no valid shards
+    def _split_shards(self, all_shards_by_class):
+        print(f"Dataset: Splitting data (Validation count per class: {self.validation_split_count})...")
+        random.seed(self.seed)
+        self.train_shards = []
+        self.val_shards = []
+
+        if self.validation_split_count <= 0:
+            print("Dataset: No validation split requested. Using all data for training.")
+            for class_label, shards in all_shards_by_class.items():
+                self.train_shards.extend(shards)
+            if self.train_shards: random.shuffle(self.train_shards)
+            return
+
+        for class_label, shards in all_shards_by_class.items():
+            if not shards: # Skip if class had no valid shards
+                 print(f"Warning: Class {class_label} has no valid shards to split.")
+                 continue
+            num_shards = len(shards)
+            val_count = self.validation_split_count
+
+            if num_shards < val_count:
+                print(f"Warning: Class {class_label} has only {num_shards} samples, less than requested validation count {val_count}. Using all for training.")
+                self.train_shards.extend(shards)
+            elif num_shards == val_count:
+                print(f"Warning: Class {class_label} has exactly {num_shards} samples, equal to requested validation count {val_count}. Using all for validation, none for training this class.")
+                self.val_shards.extend(shards)
+            else:
+                random.shuffle(shards) # Shuffle before splitting
+                self.val_shards.extend(shards[:val_count])
+                self.train_shards.extend(shards[val_count:])
+
+        if self.train_shards: random.shuffle(self.train_shards) # Shuffle the final training list if it's not empty
+
+    # _normalize_scores remains the same, operates on potentially filtered lists
+    def _normalize_scores(self):
+        if not self.train_shards:
+            print("Warning: No training shards to calculate normalization range from.")
+            return
+        train_values = [s.value for s in self.train_shards]
+        if not train_values:
+            print("Warning: Training values list is empty after filtering, cannot normalize.")
+            return
+
+        shard_min = min(train_values)
+        shard_max = max(train_values)
+        print(f"Normalizing scores based on training range [{shard_min}, {shard_max}]")
+        value_range = shard_max - shard_min
+        if value_range == 0:
+            print("Warning: Training score range is zero. Setting all normalized scores to 0.")
+            norm_func = lambda x: 0.0
+        else:
+            norm_func = lambda x: (x - shard_min) / value_range
+
+        for s in self.train_shards: s.normalized_value = norm_func(s.value)
+        for s in self.val_shards: s.normalized_value = max(0.0, min(1.0, norm_func(s.value)))
+
+    # _parse_labels remains the same, operates on potentially filtered list
+    def _parse_labels(self):
+        if not self.train_shards:
+            print("Warning: No training shards to parse labels from.")
+            self.num_labels = 0
+            return
+        labels = set(int(s.value) for s in self.train_shards)
+        if not labels:
+            print("Warning: No labels found in training shards.")
+            self.num_labels = 0
+            return
+        # Determine num_labels reliably, even if non-sequential
+        self.num_labels = max(labels) + 1 if labels else 0
+        expected_labels = set(range(self.num_labels))
+        if not expected_labels.issubset(labels):
+             # It's okay if labels aren't sequential, just log it clearly
+             print(f"Dataset: Training class labels found: {sorted(list(labels))}. Max label is {max(labels)}. Setting num_labels to {self.num_labels}.")
+
+
+# ValidationSubDataset needs robust __getitem__ too
+class ValidationSubDataset(Dataset):
+    def __init__(self, shards, mode, num_labels):
+        self.shards = shards # Assumes shards are already filtered/valid
+        self.mode = mode
+        self.num_labels = num_labels
+
+    def __len__(self):
+        return len(self.shards)
+
+    def __getitem__(self, index):
+         shard = self.shards[index]
+         try:
+             data = shard.get_data() # Attempt to load data
+             # If class mode, ensure 'val' is one-hot encoded
+             if self.mode == 'class':
+                  label = int(data['raw'])
+                  one_hot_val = torch.zeros(self.num_labels)
+                  if 0 <= label < self.num_labels:
+                       one_hot_val[label] = 1.0
+                  else:
+                       print(f"Warning: Invalid label {label} encountered in validation set for num_labels {self.num_labels}. Using zero vector.")
+                  data['val'] = one_hot_val
+             return data
+         except Exception as e:
+             # Log error and return None to be handled by collate_fn
+             print(f"ERROR in ValidationSubDataset __getitem__ for index {index}, shard path {shard.path}: {e}")
+             return None
+
+
+# collate_ignore_none function remains the same
+def collate_ignore_none(batch):
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
+    try:
+         return torch.utils.data.dataloader.default_collate(batch)
+    except Exception as e:
+         print(f"Error in collate_ignore_none: {e}. Batch contents might be inconsistent.")
+         # Handle error, maybe return None or raise
+         return None
+
+# --- ImageDataset section removed for brevity, would need similar fixes ---

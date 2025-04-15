@@ -1,6 +1,6 @@
 # Version: 2.0.0
 # Desc: Integrate wandb logging and more args
-
+import math
 import os
 import json
 import yaml
@@ -19,427 +19,434 @@ SAVE_FOLDER = "models"
 # (This might become less relevant if using models that take images directly,
 # but keep it for now for the current model structure)
 def get_embed_params(ver):
-	if ver == "CLIP":
-		# CLIPVisionModelWithProjection
-		#  openai/clip-vit-large-patch14-336
-		return {
-			"features": 768,
-			"hidden": 1024,
-		}
-	elif ver == "META":
-		# open_clip
-		#  metaclip_fullcc | ViT-H-14-quickgelu
-		print("META ver. was only meant for testing!")
-		return {
-			"features": 1024,
-			"hidden": 1280,
-		}
-	else:
-		raise ValueError(f"Unknown model '{ver}'")
+    if ver == "CLIP":
+        # CLIPVisionModelWithProjection
+        #  openai/clip-vit-large-patch14-336
+        return {
+            "features": 768,
+            "hidden": 1024,
+        }
+    elif ver == "META":
+        # open_clip
+        #  metaclip_fullcc | ViT-H-14-quickgelu
+        print("META ver. was only meant for testing!")
+        return {
+            "features": 1024,
+            "hidden": 1280,
+        }
+    else:
+        raise ValueError(f"Unknown model '{ver}'")
 
 
 # --- Modify parse_args ---
+# v2.1.0: Added val_split_count
 def parse_args():
-	parser = argparse.ArgumentParser(description="Train aesthetic predictor/classifier")  # Updated description slightly
-	parser.add_argument("--config", required=True, help="Training config YAML file")
-	parser.add_argument('--resume', help="Checkpoint (.safetensors model file) to resume from")
-	parser.add_argument('--images', action=argparse.BooleanOptionalAction, default=False,
-						help="Live process images instead of using pre-computed embeddings")
-	parser.add_argument("--nsave", type=int, default=10000,
-						help="Save model every N steps (set to 0 or negative to disable)")  # Give a default like 10k?
+    parser = argparse.ArgumentParser(description="Train aesthetic predictor/classifier")
+    parser.add_argument("--config", required=True, help="Training config YAML file")
+    parser.add_argument('--resume', help="Checkpoint (.safetensors model file) to resume from")
+    parser.add_argument('--images', action=argparse.BooleanOptionalAction, default=False,
+                        help="Live process images instead of using pre-computed embeddings")
+    parser.add_argument("--nsave", type=int, default=10000,
+                        help="Save model every N steps (set to 0 or negative to disable)")
+    # --- NEW ARG for Validation Split ---
+    parser.add_argument("--val_split_count", type=int, default=0,
+                        help="Number of samples *per class* to hold out for validation (0 to disable)")
+    # --- END NEW ARG ---
 
-	# --- NEW ARGUMENTS START HERE ---
+    # --- Optimizer Args (Keep as is) ---
+    parser.add_argument('--optimizer', type=str, default='AdamW', # Keep default here
+                        choices=['AdamW', 'FMARSCropV3ExMachina', 'ADOPT',
+                                 'ADOPTScheduleFree', 'ADOPTAOScheduleFree'],
+                        help='Optimizer to use.')
+    parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'],  # ...
+                        help='Training precision (fp32, fp16, bf16).')
+    # ... (rest of optimizer args) ...
+    parser.add_argument('--betas', type=float, nargs='+', default=None,  # ...
+                        help='Optimizer beta parameters (e.g., 0.9 0.999 or 0.9 0.999 0.99)')
+    parser.add_argument('--eps', type=float, default=None, help='Optimizer epsilon term.')  # ...
+    parser.add_argument('--weight_decay', type=float, default=None, help='Optimizer weight decay.')  # ...
+    parser.add_argument('--gamma', type=float, default=None,
+                        help='Gamma for MARS correction (FMARSCrop/ADOPTMARS).')  # ...
+    parser.add_argument('--r_sf', type=float, default=None,
+                        help='ScheduleFree r parameter (polynomial weight power).')  # ...
+    parser.add_argument('--wlpow_sf', type=float, default=None, help='ScheduleFree weight_lr_power parameter.')  # ...
+    parser.add_argument('--state_precision', type=str, default='parameter',  # ...
+                        choices=['parameter', 'q8bit', 'q4bit', 'qfp8'],
+                        help='Precision for optimizer state (ADOPTAOScheduleFree).')
 
-	parser.add_argument('--optimizer', type=str, default='AdamW',
-						choices=['AdamW', 'FMARSCropV3ExMachina', 'ADOPT',
-								 'ADOPTScheduleFree', 'ADOPTAOScheduleFree'],  # Add more as needed
-						help='Optimizer to use.')
-	parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'],
-						help='Training precision (fp32, fp16, bf16).')
+    args = parser.parse_args()
+    if not os.path.isfile(args.config):
+        parser.error(f"Can't find config file '{args.config}'")
 
-	# General Optimizer Params (can be used by multiple optimizers)
-	parser.add_argument('--betas', type=float, nargs='+', default=None,
-						help='Optimizer beta parameters (e.g., 0.9 0.999 or 0.9 0.999 0.99)')  # Allow variable number
-	parser.add_argument('--eps', type=float, default=None, help='Optimizer epsilon term.')
-	parser.add_argument('--weight_decay', type=float, default=None, help='Optimizer weight decay.')
+    args = get_training_args(args, parser.get_default("optimizer"))
 
-	# FMARSCrop / ADOPTMARS Specific Params
-	parser.add_argument('--gamma', type=float, default=None, help='Gamma for MARS correction (FMARSCrop/ADOPTMARS).')
+    # --- Set defaults for optimizer params if not provided by YAML or command line ---
+    # We set defaults here *after* loading YAML so command line overrides YAML,
+    # and YAML overrides these defaults.
 
-	# ScheduleFree Specific Params
-	parser.add_argument('--r_sf', type=float, default=None, help='ScheduleFree r parameter (polynomial weight power).')
-	parser.add_argument('--wlpow_sf', type=float, default=None, help='ScheduleFree weight_lr_power parameter.')
-	# Note: sf_momentum is usually fixed like beta1, might not need cmd arg unless experimenting
+    # General defaults
+    if args.betas is None:
+        # Default depends on optimizer, handle this later or set a common default
+        args.betas = (0.9, 0.999)  # AdamW default, adjust if needed
+        if args.optimizer.lower() == 'fmarscropv3exmachina':
+            args.betas = (0.99, 0.9999, 0.999)  # FMARSCrop default
+        elif args.optimizer.lower() in ['adoptschedulefree', 'adoptaoschedulefree', 'adoptmarsschedulefree']:
+            args.betas = (0.9, 0.9999)  # ADOPT default
+    if args.eps is None:
+        args.eps = 1e-8 if args.optimizer.lower() == 'adamw' else 1e-6  # Different defaults common
+    if args.weight_decay is None:
+        args.weight_decay = 0.0
 
-	# ADOPTAOScheduleFree Specific Params
-	parser.add_argument('--state_precision', type=str, default='parameter',
-						choices=['parameter', 'q8bit', 'q4bit', 'qfp8'],
-						help='Precision for optimizer state (ADOPTAOScheduleFree).')
+    # FMARSCrop / ADOPTMARS defaults
+    if args.gamma is None and 'mars' in args.optimizer.lower():
+        args.gamma = 0.005  # Example default for FMARSCropV3ExMachina
 
-	# --- NEW ARGUMENTS END HERE ---
+    # ScheduleFree defaults
+    if args.r_sf is None and 'schedulefree' in args.optimizer.lower():
+        args.r_sf = 0.0
+    if args.wlpow_sf is None and 'schedulefree' in args.optimizer.lower():
+        args.wlpow_sf = 2.0
 
-	args = parser.parse_args()
-	if not os.path.isfile(args.config):
-		parser.error(f"Can't find config file '{args.config}'")
+    # --- End Defaults ---
 
-	# Now, merge YAML config with command-line args
-	args = get_training_args(args)
-
-	# --- Set defaults for optimizer params if not provided by YAML or command line ---
-	# We set defaults here *after* loading YAML so command line overrides YAML,
-	# and YAML overrides these defaults.
-
-	# General defaults
-	if args.betas is None:
-		# Default depends on optimizer, handle this later or set a common default
-		args.betas = (0.9, 0.999)  # AdamW default, adjust if needed
-		if args.optimizer.lower() == 'fmarscropv3exmachina':
-			args.betas = (0.99, 0.9999, 0.999)  # FMARSCrop default
-		elif args.optimizer.lower() in ['adoptschedulefree', 'adoptaoschedulefree', 'adoptmarsschedulefree']:
-			args.betas = (0.9, 0.9999)  # ADOPT default
-	if args.eps is None:
-		args.eps = 1e-8 if args.optimizer.lower() == 'adamw' else 1e-6  # Different defaults common
-	if args.weight_decay is None:
-		args.weight_decay = 0.0
-
-	# FMARSCrop / ADOPTMARS defaults
-	if args.gamma is None and 'mars' in args.optimizer.lower():
-		args.gamma = 0.005  # Example default for FMARSCropV3ExMachina
-
-	# ScheduleFree defaults
-	if args.r_sf is None and 'schedulefree' in args.optimizer.lower():
-		args.r_sf = 0.0
-	if args.wlpow_sf is None and 'schedulefree' in args.optimizer.lower():
-		args.wlpow_sf = 2.0
-
-	# --- End Defaults ---
-
-	return args
+    return args
 
 
 # --- Modify get_training_args ---
-def get_training_args(args):
-	"""Loads YAML config and merges with argparse args."""
-	with open(args.config) as f:
-		conf = yaml.safe_load(f)
+# Version 2.1.2: Actually load optimizer name from YAML config
+def get_training_args(args, default_optimizer_name):
+    """Loads YAML config and merges with argparse args."""
+    with open(args.config) as f:
+        conf = yaml.safe_load(f)
 
-	# --- Load Training Params from YAML ---
-	train_conf = conf.get("train", {})
-	args.lr = float(
-		train_conf.get("lr", args.lr if hasattr(args, 'lr') and args.lr is not None else 1e-4))  # Get base LR
-	args.steps = int(train_conf.get("steps", args.steps if hasattr(args, 'steps') else 100000))
-	args.batch = int(train_conf.get("batch", args.batch if hasattr(args, 'batch') else 1))
+    # --- Load Training Params from YAML ---
+    train_conf = conf.get("train", {})
+    args.lr = float(train_conf.get("lr", getattr(args, 'lr', 1e-4)))  # Use getattr for robustness
+    args.steps = int(train_conf.get("steps", getattr(args, 'steps', 100000)))
+    args.batch = int(train_conf.get("batch", getattr(args, 'batch', 1)))
+    # args.val_split_count is usually command-line, but could be added here if needed
 
-	# Allow YAML override for general optimizer params if not set via command line
-	if args.betas is None:
-		args.betas = tuple(map(float, train_conf.get("betas", []))) or None  # Convert list from YAML to tuple
-	if args.eps is None:
-		args.eps = train_conf.get("eps", None)
-	if args.weight_decay is None:
-		args.weight_decay = train_conf.get("weight_decay", None)
+    # --- Updated logic to load optimizer name ---
+    # If the current args.optimizer is still the default one (meaning it wasn't set via command line),
+    # try to load it from the YAML file.
+    if args.optimizer == default_optimizer_name:
+         # Use YAML value if present, otherwise keep the default from args
+         args.optimizer = train_conf.get("optimizer", args.optimizer)
 
-	# Allow YAML override for specific optimizer params
-	if args.gamma is None:
-		args.gamma = train_conf.get("gamma", None)
-	if args.r_sf is None:
-		args.r_sf = train_conf.get("r_sf", None)
-	if args.wlpow_sf is None:
-		args.wlpow_sf = train_conf.get("wlpow_sf", None)
+    # ... (rest of YAML loading for optimizer/scheduler params as before) ...
+    if args.betas is None: args.betas = tuple(map(float, train_conf.get("betas", []))) or None
+    if args.eps is None: args.eps = train_conf.get("eps", None)
+    if args.weight_decay is None: args.weight_decay = train_conf.get("weight_decay", None)
+    if args.gamma is None: args.gamma = train_conf.get("gamma", None)
+    if args.r_sf is None: args.r_sf = train_conf.get("r_sf", None)
+    if args.wlpow_sf is None: args.wlpow_sf = train_conf.get("wlpow_sf", None)
+    args.cosine = train_conf.get("cosine", getattr(args, 'cosine', True))
+    args.warmup_steps = int(train_conf.get("warmup_steps", getattr(args, 'warmup_steps', 5000)))
 
-	# Scheduler specific (might need adjustment if using schedule-free)
-	args.cosine = train_conf.get("cosine", getattr(args, 'cosine', True))  # Default to True if not set
-	args.warmup_steps = int(train_conf.get("warmup_steps", getattr(args, 'warmup_steps', 5000)))  # Add warmup_steps
+    # --- Load Model Params from YAML (Add CLIP-Anatomy check) ---
+    assert "model" in conf.keys(), "Model config not optional!"
+    args.base = conf["model"].get("base", "unknown")
+    args.rev = conf["model"].get("rev", "v0.0")
+    args.arch = conf["model"].get("arch", None)
+    args.clip = conf["model"].get("clip", "CLIP")
+    args.name = f"{args.base}-{args.rev}"
+    assert args.arch in ["score", "class"], f"Unknown arch '{args.arch}'"
+    # v2.0.1: Added CLIP-Anatomy to allowed list
+    assert args.clip in ["CLIP", "META", "CLIP-Anatomy"], f"Unknown CLIP '{args.clip}'"
 
-	# --- Load Model Params from YAML (Keep as is) ---
-	assert "model" in conf.keys(), "Model config not optional!"
-	args.base = conf["model"].get("base", "unknown")
-	args.rev = conf["model"].get("rev", "v0.0")
-	args.arch = conf["model"].get("arch", None)
-	args.clip = conf["model"].get("clip", "CLIP")
-	args.name = f"{args.base}-{args.rev}"
-	assert args.arch in ["score", "class"], f"Unknown arch '{args.arch}'"
-	assert args.clip in ["CLIP", "META"], f"Unknown CLIP '{args.clip}'"
+    # --- Load Labels/Weights from YAML ---
+    labels = conf.get("labels", {})
+    if args.arch == "class" and labels:
+        args.labels = {str(k): v.get("name", str(k)) for k, v in labels.items()}
+        try:
+            # Determine num_labels based on max key + 1, assuming 0-indexed
+            args.num_labels = max(int(k) for k in labels.keys()) + 1
+        except ValueError:
+            print("Warning: Could not determine num_labels from label keys. Set num_labels manually or check config.")
+            args.num_labels = 0  # Or some default/error handling
 
-	# --- Load Labels/Weights from YAML (Keep as is) ---
-	labels = conf.get("labels", {})
-	if args.arch == "class" and labels:
-		args.labels = {str(k): v.get("name", str(k)) for k, v in labels.items()}
-		args.num_labels = max([int(x) for x in labels.keys()]) + 1
-		weights = [1.0 for _ in range(args.num_labels)]
-		for k in labels.keys():
-			weights[k] = labels[k].get("loss", 1.0)
-		args.weights = weights  # This is used later in train.py
-	else:
-		# Ensure these exist even for score mode, maybe set to None or default
-		args.num_labels = 1
-		args.labels = None
-		args.weights = None
+        weights = [1.0] * args.num_labels  # Initialize with default weight 1.0
+        for k_str, label_conf in labels.items():
+            try:
+                k = int(k_str)
+                if 0 <= k < args.num_labels:
+                    weights[k] = float(label_conf.get("loss", 1.0))
+                else:
+                    print(f"Warning: Label key {k} out of range [0, {args.num_labels - 1}]. Ignoring weight.")
+            except ValueError:
+                print(f"Warning: Invalid label key '{k_str}' in config. Ignoring weight.")
+        args.weights = weights
+    else:
+        args.num_labels = 1
+        args.labels = None
+        args.weights = None
 
-	# Pass through any other args added by argparse
-	return args
+    # Pass through any other args added by argparse
+    return args
 
 
-# --- Keep write_config (No change needed for args) ---
+# --- Modify write_config ---
+# v2.1.0: Added val_split_count to saved config
 def write_config(args):
-	conf = {
-		"name": args.base,
-		"rev": args.rev,
-		"arch": args.arch,
-		"labels": args.labels,
-		# Add training and optimizer args to config dump for reproducibility
-		"train_args": {
-			"lr": args.lr,
-			"steps": args.steps,
-			"batch": args.batch,
-			"cosine": args.cosine,
-			"warmup_steps": args.warmup_steps,
-			"optimizer": args.optimizer,
-			"precision": args.precision,
-			"betas": args.betas,
-			"eps": args.eps,
-			"weight_decay": args.weight_decay,
-			"gamma": args.gamma,
-			"r_sf": args.r_sf,
-			"wlpow_sf": args.wlpow_sf,
-			"state_precision": args.state_precision,
-			# Add any other relevant args here...
-		}
-	}
-	conf["model_params"] = get_embed_params(args.clip)
-	conf["model_params"]["outputs"] = args.num_labels
+    conf = {
+        "name": args.base,
+        "rev": args.rev,
+        "arch": args.arch,
+        "labels": args.labels,
+        "train_args": {
+            "lr": args.lr,
+            "steps": args.steps,
+            "batch": args.batch,
+            "cosine": args.cosine,
+            "warmup_steps": args.warmup_steps,
+            "optimizer": args.optimizer,
+            "precision": args.precision,
+            "val_split_count": args.val_split_count,  # Add val split count
+            # --- Optimizer specific ---
+            "betas": args.betas,
+            "eps": args.eps,
+            "weight_decay": args.weight_decay,
+            "gamma": args.gamma,
+            "r_sf": args.r_sf,
+            "wlpow_sf": args.wlpow_sf,
+            "state_precision": args.state_precision,
+            # Add any other relevant args here...
+        }
+    }
+    conf["model_params"] = get_embed_params(args.clip)
+    conf["model_params"]["outputs"] = args.num_labels
 
-	os.makedirs(SAVE_FOLDER, exist_ok=True)
-	with open(f"{SAVE_FOLDER}/{args.name}.config.json", "w") as f:
-		f.write(json.dumps(conf, indent=2))
+    os.makedirs(SAVE_FOLDER, exist_ok=True)
+    config_path = f"{SAVE_FOLDER}/{args.name}.config.json"
+    try:
+        with open(config_path, "w") as f:
+            f.write(json.dumps(conf, indent=2))
+        print(f"Saved training config to {config_path}")
+    except Exception as e:
+        print(f"Error saving config file {config_path}: {e}")
 
 
 # --- Updated ModelWrapper Class ---
+# v2.1.0: Reworked evaluation logic for validation loader
 class ModelWrapper:
-	def __init__(self, name, model, optimizer, criterion, scheduler=None, device="cpu", dataset=None, stdout=True,
-				 scaler=None, wandb_run=None):  # Added scaler, wandb_run
-		self.name = name
-		self.device = device
-		self.losses = []
+    # Removed dataset from init args, removed eval_src/eval_dst
+    def __init__(self, name, model, optimizer, criterion, scheduler=None, device="cpu",
+                 stdout=True, scaler=None, wandb_run=None, num_labels=1):
+        self.name = name
+        self.device = device
+        self.losses = []  # Stores recent training losses for averaging
 
-		self.model = model
-		self.optimizer = optimizer
-		self.criterion = criterion
-		self.scheduler = scheduler
-		self.scaler = scaler  # Store scaler
-		self.wandb_run = wandb_run  # Store wandb object
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.scheduler = scheduler
+        self.scaler = scaler
+        self.wandb_run = wandb_run
+        self.num_labels = num_labels  # Store num_labels if needed for logging predictions
 
-		self.dataset = dataset
-		# Ensure eval data uses correct device and dtype
-		# Note: If eval_src becomes very large, consider loading/processing it inside eval_model
-		if dataset and dataset.eval_data:
-			self.eval_src = dataset.eval_data.get("emb").to(device=self.device)  # dtype handled by autocast later
-			self.eval_dst = dataset.eval_data.get("val").to(device=self.device,
-															dtype=torch.float32)  # target usually fp32
-		else:
-			print("Warning: No evaluation data found in dataset.")
-			self.eval_src = None
-			self.eval_dst = None
+        os.makedirs(SAVE_FOLDER, exist_ok=True)
+        # --- Log file handling ---
+        self.log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
+        # Check if resuming only if log file exists (less reliable than checking optim state)
+        file_mode = "a" if os.path.exists(self.log_file_path) else "w"
+        try:
+            self.csvlog = open(self.log_file_path, file_mode)
+            if file_mode == "w":
+                self.csvlog.write("step,train_loss_avg,eval_loss,learning_rate\n")
+        except IOError as e:
+            print(f"Warning: Could not open CSV log file {self.log_file_path}: {e}")
+            self.csvlog = None
+        self.stdout = stdout
+        print(f"ModelWrapper initialized. Logging to {self.log_file_path} (mode: {file_mode})")
 
-		os.makedirs(SAVE_FOLDER, exist_ok=True)
-		# --- Log file handling ---
-		self.log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
-		# Check if resuming, open in append mode if CSV exists
-		# Check if optimizer has state before assuming resume for append mode
-		file_mode = "a" if os.path.exists(self.log_file_path) and any(self.optimizer.state.values()) else "w"
-		try:
-			self.csvlog = open(self.log_file_path, file_mode)
-			if file_mode == "w":  # Write header only if creating new file
-				self.csvlog.write("step,train_loss_avg,eval_loss,learning_rate\n")
-		except IOError as e:
-			print(f"Warning: Could not open CSV log file {self.log_file_path}: {e}")
-			self.csvlog = None  # Set to None if opening fails
-		self.stdout = stdout
+    # log_step should also probably receive the step, even if not used directly now
+    def log_step(self, loss, step): # Added step back
+        if not math.isnan(loss):
+             self.losses.append(loss)
+             if len(self.losses) > LOSS_MEMORY: # Use LOSS_MEMORY directly now
+                  self.losses.pop(0) # Remove oldest element efficiently
 
-	# --- End log file handling ---
+    # New method for evaluation using a DataLoader
+    def evaluate_on_validation_set(self, val_loader):
+        """Performs evaluation on the provided validation DataLoader."""
+        if val_loader is None:
+            return float('nan')
 
-	def log_step(self, loss, step=None):
-		self.losses.append(loss)
-		current_step = step or len(self.losses)  # Use consistent naming
-		if current_step % LOG_EVERY_N == 0 and current_step > 0:  # Log every N steps, skip step 0 maybe
-			self.log_main(current_step)  # Pass the calculated step
+        self.model.eval()  # Set model to evaluation mode
+        # --- Set Optimizer Eval Mode (if applicable) ---
+        original_optimizer_mode_is_training = False
+        needs_optim_switch = (hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval) and
+                              hasattr(self.optimizer, 'train') and callable(self.optimizer.train) and
+                              hasattr(self.optimizer, 'state') and any(
+                    s for s in self.optimizer.state.values()))  # Check if state exists
+        if needs_optim_switch:
+            if hasattr(self.optimizer, 'train_mode'):
+                original_optimizer_mode_is_training = self.optimizer.train_mode
+            else:  # Heuristic if train_mode attribute doesn't exist
+                # Check if any param group has a non-zero step if available
+                if hasattr(self.optimizer, 'param_groups') and any(
+                        pg.get('step', 0) > 0 for pg in self.optimizer.param_groups):
+                    original_optimizer_mode_is_training = True  # Assume training if steps > 0
+            if original_optimizer_mode_is_training:
+                try:
+                    self.optimizer.eval()
+                except Exception as e:
+                    print(f"Warning: Error calling optimizer.eval(): {e}")
+                    needs_optim_switch = False  # Disable switch if call fails
 
-	def log_main(self, step):  # Renamed argument for clarity
-		lr = float(self.optimizer.param_groups[0]['lr'])
-		avg_len = min(len(self.losses), LOSS_MEMORY)
-		avg = sum(self.losses[-avg_len:]) / avg_len if avg_len > 0 else 0.0
+        total_loss = 0.0
+        total_samples = 0
+        # Determine autocast dtype based on scaler state (similar to eval_model logic)
+        autocast_enabled = self.scaler is not None and self.scaler.is_enabled()
+        if autocast_enabled:
+            if hasattr(self.scaler, 'get_amp_dtype'):  # More robust way if scaler provides it
+                current_amp_dtype = self.scaler.get_amp_dtype()
+            # Fallback heuristic
+            elif torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                current_amp_dtype = torch.bfloat16
+            else:
+                current_amp_dtype = torch.float16
+        else:
+            current_amp_dtype = torch.float32
 
-		# --- Perform Evaluation ---
-		# This call now handles setting eval/train modes internally
-		eval_loss_val, eval_pred_tensor = self.eval_model()
-		# --- End Evaluation ---
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is None: continue  # Skip None batches from collate_ignore_none
 
-		# --- Stdout Logging ---
-		if self.stdout:
-			pred_str = "N/A"
-			if eval_pred_tensor is not None:
-				# Check tensor shape and content before processing
-				try:
-					if eval_pred_tensor.ndim >= 2 and eval_pred_tensor.shape[1] == 1:  # score (batch_size, 1)
-						pred_str = f"{eval_pred_tensor.mean().item() * 100:.2f}%"
-					elif eval_pred_tensor.ndim >= 2 and eval_pred_tensor.shape[
-						0] > 0:  # class (batch_size, num_classes)
-						conf, _ = torch.max(eval_pred_tensor[0], dim=0)  # Max conf for first sample
-						pred_str = f"cls_conf={conf.item():.3f}"
-					else:
-						pred_str = f"Invalid shape: {eval_pred_tensor.shape}"
-				except Exception as e:
-					pred_str = f"Error ({e})"
+                # Ensure batch items are on the correct device and correct type
+                emb = batch.get("emb").to(self.device)
+                val = batch.get("val")
+                if val is None: continue  # Skip if target is missing
 
-			tqdm.write(
-				f"{str(step):<10} Loss(avg): {avg:.4e} | Eval Loss: {eval_loss_val:.4e} | LR: {lr:.4e} | Eval Pred: {pred_str}")
-		# --- End Stdout Logging ---
+                # Move target 'val' to device and ensure correct dtype
+                if self.criterion.__class__.__name__ == 'L1Loss':  # Score mode
+                    val = val.to(self.device, dtype=torch.float32)
+                elif self.criterion.__class__.__name__ == 'CrossEntropyLoss':  # Class mode
+                    # Check if val is already one-hot float or class indices long
+                    if val.dtype == torch.float and val.ndim == 2:  # Assume one-hot float
+                        val = val.to(self.device, dtype=torch.float32)
+                    elif val.dtype == torch.long and val.ndim == 1:  # Class indices
+                        val = val.to(self.device, dtype=torch.long)
+                    elif val.ndim == 2 and val.shape[1] == 1:  # Indices with extra dim
+                        val = val.squeeze(-1).to(self.device, dtype=torch.long)
+                    else:  # Fallback/error case? Assume class indices needed
+                        print(
+                            f"Warning: Unexpected validation target shape/type: {val.shape}, {val.dtype}. Attempting Long conversion.")
+                        try:
+                            val = val.squeeze().to(self.device, dtype=torch.long)
+                        except Exception as e:
+                            print(f"  Conversion failed: {e}. Skipping batch.")
+                            continue
 
-		# --- Wandb Logging ---
-		if self.wandb_run:
-			log_data = {
-				"train/loss_avg": avg,  # Use groups for clarity
-				"eval/loss": eval_loss_val,
-				"train/learning_rate": lr,
-				# Removed step from here, wandb uses its own step counter by default
-				# or you can log with step=step if needed: self.wandb_run.log(log_data, step=step)
-			}
-			# Example: Add eval prediction confidence if available
-			if eval_pred_tensor is not None and eval_pred_tensor.ndim >= 2 and eval_pred_tensor.shape[0] > 0 and \
-					eval_pred_tensor.shape[1] > 1:
-				try:
-					conf, _ = torch.max(eval_pred_tensor[0], dim=0)
-					log_data["eval/pred_max_conf_sample0"] = conf.item()
-				except:
-					pass  # Ignore errors in optional logging
+                batch_size = emb.size(0)
 
-			self.wandb_run.log(log_data)  # Log the dictionary
-		# --- End Wandb Logging ---
+                with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=current_amp_dtype):
+                    y_pred = self.model(emb)
+                    loss = self.criterion(y_pred.to(torch.float32), val)  # Ensure compatible types for loss
 
-		# --- CSV Logging ---
-		if self.csvlog:
-			try:
-				self.csvlog.write(f"{step},{avg},{eval_loss_val},{lr}\n")
-				self.csvlog.flush()
-			except IOError as e:
-				print(f"Warning: Could not write to CSV log file: {e}")
-				self.csvlog = None  # Stop trying if write fails
+                if not math.isnan(loss.item()):
+                    total_loss += loss.item() * batch_size
+                    total_samples += batch_size
+                else:
+                    print("Warning: NaN encountered in validation loss calculation. Skipping batch contribution.")
 
-	# --- End CSV Logging ---
+        # --- Restore Modes ---
+        self.model.train()  # Set model back to training mode
+        if needs_optim_switch and original_optimizer_mode_is_training:
+            try:
+                self.optimizer.train()
+            except Exception as e:
+                print(f"Warning: Error calling optimizer.train(): {e}")
 
-	# --- eval_model with mode handling ---
-	def eval_model(self):
-		"""Performs evaluation and handles model/optimizer modes."""
-		if self.eval_src is None or self.eval_dst is None:
-			# Return NaN or suitable default if no eval data
-			return float('nan'), None
+        if total_samples == 0:
+            return float('nan')  # Avoid division by zero if no valid samples seen
+        return total_loss / total_samples
 
-		eval_loss = torch.tensor(float('nan'), device=self.device)  # Default to NaN
-		eval_pred = None
+    def log_main(self, step, train_loss_batch, eval_loss): # Renamed train_loss for clarity
+        lr = float(self.optimizer.param_groups[0]['lr']) if self.optimizer.param_groups else 0.0
 
-		# --- Set Eval Modes ---
-		original_model_mode = self.model.training
-		original_optimizer_mode_is_training = False  # Track if optimizer was training
+        # --- Calculate moving average of training loss ---
+        # Ensure self.losses is not empty before calculating average
+        if self.losses: # Check if the list has items
+             # Calculate average directly from the current buffer
+             train_loss_avg = sum(self.losses) / len(self.losses)
+        else:
+             # If buffer is empty (e.g., first log step), use current batch loss or NaN
+             train_loss_avg = train_loss_batch # Or use float('nan') if you prefer N/A on first step
+             if math.isnan(train_loss_avg): train_loss_avg = float('nan') # Ensure NaN propagates
 
-		# Check if optimizer needs mode switching (has state and eval method)
-		needs_optim_switch = (hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval) and
-							  hasattr(self.optimizer, 'train') and callable(self.optimizer.train) and
-							  hasattr(self.optimizer, 'state') and any(self.optimizer.state.values()))
+        # --- Stdout Logging ---
+        if self.stdout:
+            eval_loss_str = f"{eval_loss:.4e}" if not math.isnan(eval_loss) else "N/A"
+            train_avg_str = f"{train_loss_avg:.4e}" if not math.isnan(train_loss_avg) else "N/A"
+            # Use train_loss_batch for instant loss, train_loss_avg for average
+            # Let's keep showing the average as Loss(avg)
+            tqdm.write(f"{str(step):<10} Loss(avg): {train_avg_str} | Eval Loss: {eval_loss_str} | LR: {lr:.4e}")
+        # --- End Stdout Logging ---
 
-		if needs_optim_switch:
-			# Check if optimizer has a 'train_mode' attribute, otherwise assume it's training
-			if hasattr(self.optimizer, 'train_mode'):
-				original_optimizer_mode_is_training = self.optimizer.train_mode
-			elif original_model_mode:  # Heuristic: if model is training, optimizer probably is too
-				original_optimizer_mode_is_training = True
+        # --- Wandb Logging ---
+        if self.wandb_run:
+            log_data = {
+                "train/loss_batch": train_loss_batch, # Log current batch loss
+                "train/loss_avg": train_loss_avg, # Log the calculated average
+                "train/learning_rate": lr,
+            }
+            if not math.isnan(eval_loss):
+                 log_data["eval/loss"] = eval_loss
+            self.wandb_run.log(log_data, step=step)
+        # --- End Wandb Logging ---
 
-			if original_optimizer_mode_is_training:
-				self.optimizer.eval()  # Switch to eval if it was training
+        # --- CSV Logging ---
+        if self.csvlog:
+            try:
+                eval_loss_csv = eval_loss if not math.isnan(eval_loss) else ''
+                train_avg_csv = train_loss_avg if not math.isnan(train_loss_avg) else ''
+                # Add current batch loss to CSV? Optional. Let's stick to avg for now.
+                self.csvlog.write(f"{step},{train_avg_csv},{eval_loss_csv},{lr}\n")
+                self.csvlog.flush()
+            except IOError as e:
+                print(f"Warning: Could not write to CSV log file: {e}")
+            except Exception as e_csv:
+                 print(f"Warning: Error writing data to CSV log at step {step}: {e_csv}")
+        # --- End CSV Logging ---
 
-		self.model.eval()  # Always set model to eval
-		# --- End Set Eval Modes ---
+    # Modified save_model to accept optional suffix
+    def save_model(self, step=None, epoch=None, suffix=""):
+        current_step_num = step if step is not None else (len(self.losses) if self.losses else 0)
 
-		try:
-			autocast_enabled = self.scaler is not None and self.scaler.is_enabled()
-			# --- Determine correct dtype ---
-			if autocast_enabled:
-				# Infer dtype based on scaler state (less direct) or pass from train.py
-				# For simplicity, let's assume bf16 if supported, else fp16, if scaler enabled
-				# A better way is to pass args.precision or amp_dtype to ModelWrapper's __init__
-				if torch.cuda.is_bf16_supported():
-					current_amp_dtype = torch.bfloat16
-				else:
-					current_amp_dtype = torch.float16
-			else:
-				current_amp_dtype = torch.float32
-			# --- End determine dtype ---
+        if epoch is None and current_step_num >= 10 ** 6:
+            epoch_str = f"_s{round(current_step_num / 10 ** 6, 2)}M"
+        elif epoch is None and current_step_num >= 10 ** 3:
+            epoch_str = f"_s{round(current_step_num / 10 ** 3)}K"
+        elif epoch is not None:
+            epoch_str = f"_e{epoch}"
+        else:  # Handle step 0 or low steps
+            epoch_str = f"_s{current_step_num}"
 
-			# Use the determined dtype
-			with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=current_amp_dtype):
-				with torch.no_grad():
-					eval_pred = self.model(self.eval_src)
-					eval_loss = self.criterion(eval_pred, self.eval_dst)
-		except Exception as e:
-			print(f"Error during evaluation inference/loss calculation: {e}")
-			eval_loss = torch.tensor(float('nan'), device=self.device)
-			eval_pred = None
-		finally:
-			# --- Restore Modes ---
-			if needs_optim_switch and original_optimizer_mode_is_training:
-				self.optimizer.train()  # Switch back to train only if it was originally training
+        # Add suffix to filename if provided
+        output_name = f"./{SAVE_FOLDER}/{self.name}{epoch_str}{suffix}"
+        print(f"\nSaving checkpoint: {output_name} (Step: {current_step_num})")
 
-			if original_model_mode:  # Restore model mode only if it was originally training
-				self.model.train()
-		# No need for else self.model.eval() because it was set above
-		# --- End Restore Modes ---
+        try:
+            save_file(self.model.state_dict(), f"{output_name}.safetensors")
+            torch.save(self.optimizer.state_dict(), f"{output_name}.optim.pth")
+            if self.scheduler is not None:
+                torch.save(self.scheduler.state_dict(), f"{output_name}.sched.pth")
+            if self.scaler is not None and self.scaler.is_enabled():
+                torch.save(self.scaler.state_dict(), f"{output_name}.scaler.pth")
+            print("Checkpoint saved successfully.")
+        except Exception as e:
+            print(f"Error saving checkpoint {output_name}: {e}")
 
-		return eval_loss.item(), eval_pred  # Return loss value and prediction tensor
-
-	# --- End eval_model modification ---
-
-	# --- save_model with scaler state saving ---
-	def save_model(self, step=None, epoch=None):
-		# Determine step number robustly
-		current_step_num = 0
-		if step is not None:
-			current_step_num = step
-		elif self.losses:
-			current_step_num = len(self.losses)
-
-		if epoch is None and current_step_num >= 10 ** 6:
-			epoch_str = f"_s{round(current_step_num / 10 ** 6, 2)}M"
-		elif epoch is None and current_step_num > 0:
-			epoch_str = f"_s{round(current_step_num / 10 ** 3)}K"
-		elif epoch is not None:
-			epoch_str = f"_e{epoch}"
-		else:
-			epoch_str = "_s0"
-
-		output_name = f"./{SAVE_FOLDER}/{self.name}{epoch_str}"
-		print(f"\nSaving checkpoint: {output_name} (Step: {current_step_num})")
-
-		try:
-			save_file(self.model.state_dict(), f"{output_name}.safetensors")
-			torch.save(self.optimizer.state_dict(), f"{output_name}.optim.pth")
-			if self.scheduler is not None:
-				torch.save(self.scheduler.state_dict(), f"{output_name}.sched.pth")
-			# --- Save Scaler State ---
-			if self.scaler is not None and self.scaler.is_enabled():
-				torch.save(self.scaler.state_dict(), f"{output_name}.scaler.pth")
-			# --- End Save Scaler State ---
-			print("Checkpoint saved successfully.")
-		except Exception as e:
-			print(f"Error saving checkpoint {output_name}: {e}")
-
-	# --- End save_model modification ---
-
-	def close(self):
-		if self.csvlog:
-			try:
-				self.csvlog.close()
-			except Exception as e:
-				print(f"Warning: Error closing CSV log file: {e}")
-			finally:
-				self.csvlog = None  # Ensure it's None after trying to close
+    def close(self):
+        if self.csvlog:
+            try:
+                self.csvlog.close()
+            except Exception as e:
+                print(f"Warning: Error closing CSV log file: {e}")
+            finally:
+                self.csvlog = None
+# --- End ModelWrapper Modifications ---
 # Optional: Close wandb run if passed and managed here?
 # if self.wandb_run:
 #     self.wandb_run.finish()
