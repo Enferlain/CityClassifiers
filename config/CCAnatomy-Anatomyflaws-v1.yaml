@@ -1,0 +1,30 @@
+# config/CCAnatomy-AnatomyFlaws-v1.yaml
+model:
+  base: "CCAnatomy-AnatomyFlaws"
+  rev:  "v1.0_5crop" # Add identifier for the data used
+  arch: score        # Must be score for 0/1 labels
+  clip: CLIP-Anatomy # Use this to potentially trigger dataset loading in train.py later*
+
+train:
+  lr:    5e-5     # Start with a potentially lower LR for stability
+  steps: 30000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
+  batch: 4        # Increase batch size slightly if VRAM allows? (optional)
+
+  # Optimizer specific args (can be overridden by command line)
+  optimizer: ADOPTAOScheduleFree # Specify default optimizer
+  betas: [0.9, 0.999] # Default ADOPT betas
+  weight_decay: 1e-3  # Start with some weight decay
+  eps: 1e-6           # Default ADOPT eps
+  # ScheduleFree Params (defaults usually fine)
+  r_sf: 0.0
+  wlpow_sf: 2.0
+  # ADOPTAO Params (defaults usually fine)
+  state_precision: parameter
+  adaptive_clip: 1.0
+  adaptive_clip_eps: 1e-3
+
+  # Scheduler args (Not used by ScheduleFree, but maybe keep for reference)
+  # cosine: True
+  # warmup_steps: 500
+
+# No 'labels' section needed for score models
