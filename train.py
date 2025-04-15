@@ -115,24 +115,34 @@ if __name__ == "__main__":
         wandb = None  # Set wandb to None if initialization fails
     # --- Wandb Initialized ---
 
-    # --- Dataset and DataLoader ---
+    # v2.3.0: Use args.embed_ver instead of args.clip
     data_root_path = getattr(args, 'data_root', 'data')
-    dataset_version = args.clip
-    if args.base == "CCAnatomy-AnatomyFlaws":
-        dataset_version = "CLIP-Anatomy"
-        print(f"Anatomy config detected, forcing dataset version to: {dataset_version}")
+
+    # --- Determine dataset version ---
+    # The dataset folder name is directly determined by embed_ver in the config now
+    dataset_version = args.embed_ver  # <<< Use the correct attribute directly
+
+    # We can remove the special check for "CCAnatomy-AnatomyFlaws" base name,
+    # as the config YAML should specify the correct embed_ver (like "CLIP-Anatomy" or "SIGLIP2-SO400M-512")
+    # if args.base == "CCAnatomy-AnatomyFlaws":
+    #     print(f"Anatomy config base name detected ({args.base}), using embed_ver: {args.embed_ver}")
+    # --- End dataset version determination ---
+    print(f"Using dataset version (folder name): {dataset_version}")
 
     try:
         # Pass the validation split count to the dataset constructor
         dataset = EmbeddingDataset(
-            dataset_version,
+            dataset_version,  # Pass the correctly determined version
             root=data_root_path,
             mode=args.arch,
-            preload=True, # Consider preload=False if RAM is an issue with large datasets
-            validation_split_count=args.val_split_count # New argument
+            preload=True,  # Consider preload=False if RAM is an issue
+            validation_split_count=args.val_split_count,
+            seed=218  # Assuming seed is okay as default
         )
     except Exception as e:
         print(f"Error creating dataset: {e}")
+        # Consider adding more detail, e.g., which dataset_version folder failed
+        print(f"  Check if dataset folder exists: {os.path.join(data_root_path, dataset_version)}")
         exit(1)
 
     # Training DataLoader uses the main dataset instance (which now only has training shards)
@@ -162,7 +172,7 @@ if __name__ == "__main__":
         criterion = torch.nn.L1Loss(reduction='mean') # Specify reduction for clarity
         model = PredictorModel(
             outputs=1,
-            **get_embed_params(args.clip)
+            **get_embed_params(args.embed_ver)
         )
     elif args.arch == "class":
         args.num_labels = args.num_labels or dataset.num_labels
@@ -180,7 +190,7 @@ if __name__ == "__main__":
         criterion = torch.nn.CrossEntropyLoss(weight=weights) #label_smoothing=0.1) # Add label_smoothing=0.1
         model = PredictorModel(
             outputs=args.num_labels,
-            **get_embed_params(args.clip)
+            **get_embed_params(args.embed_ver)
         )
     else:
         raise ValueError(f"Unknown model architecture '{args.arch}'")

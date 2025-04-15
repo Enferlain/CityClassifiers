@@ -27,7 +27,45 @@ def process_file(pipeline, src_path, dst_path):
 	if args.arch == "score":
 		pred = int(pred * 100) # [float]=>[int](percentage)
 	elif args.arch == "class":
-		pred = max([int(pred.get(str(x).strip()) * 100) for x in args.label.split(',')])
+		target_label_indices = [str(x).strip() for x in args.label.split(',')]  # e.g., ['1']
+		scores_for_target_indices = []
+
+		# The 'pred' dict keys are label names (or index strings if config failed)
+		# We need to find the score corresponding to the *index* specified in --label
+		# We need the mapping from index to name (which inference.py has but demo_folder doesn't easily)
+		# WORKAROUND: Assume the order in the returned dict corresponds *roughly*
+		# OR, a better fix is needed in inference.py/how results are passed.
+		# Let's try a simple assumption first: if labels are {'0': 'Bad', '1': 'Good'},
+		# the value for the key 'Good' corresponds to label index 1.
+
+		# A slightly more robust way if we know the number of classes (usually 2 here):
+		try:
+			if len(pred) == 2:  # Specific handling for our binary case
+				# Assume labels are 0 and 1 from training setup
+				score_label_0 = pred.get('0', pred.get('Bad Anatomy', None))  # Try index key then name key
+				score_label_1 = pred.get('1', pred.get('Good Anatomy', None))
+
+				if '1' in target_label_indices and score_label_1 is not None:
+					scores_for_target_indices.append(int(score_label_1 * 100))
+				if '0' in target_label_indices and score_label_0 is not None:
+					scores_for_target_indices.append(int(score_label_0 * 100))
+
+			else:  # Generic fallback (less reliable) - tries matching index string key directly
+				for lbl_idx_str in target_label_indices:
+					score = pred.get(lbl_idx_str)
+					if score is not None:
+						scores_for_target_indices.append(int(score * 100))
+
+			# If we found any scores for the requested label(s), take the max, else default to -1?
+			if scores_for_target_indices:
+				pred = max(scores_for_target_indices)
+			else:
+				print(f"Warning: Could not find score for requested label(s) '{args.label}' in prediction dict: {pred}")
+				pred = -1  # Indicate error
+		except Exception as e:
+			print(f"Error processing classifier prediction: {e}")
+			print(f"  Prediction dict: {pred}")
+			pred = -1  # Indicate error
 
 	tqdm.write(f" {pred:>3}% [{os.path.basename(src_path)}]")
 	if args.min <= pred <= args.max:

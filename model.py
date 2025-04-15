@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 
 class ResBlock(nn.Module):
-    # ... (ResBlock remains the same) ...
     def __init__(self, ch):
         super().__init__()
         self.norm = nn.LayerNorm(ch) # Maybe LayerNorm is better here than BatchNorm? Let's try LN first.

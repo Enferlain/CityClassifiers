@@ -1,4 +1,4 @@
-# Version: 2.0.0
+# Version: 2.2.0
 # Desc: Integrate wandb logging and more args
 import math
 import os
@@ -20,20 +20,19 @@ SAVE_FOLDER = "models"
 # but keep it for now for the current model structure)
 def get_embed_params(ver):
     if ver == "CLIP":
-        # CLIPVisionModelWithProjection
-        #  openai/clip-vit-large-patch14-336
-        return {
-            "features": 768,
-            "hidden": 1024,
-        }
+        # OpenAI CLIP-L/14 @ 336px
+        return {"features": 768, "hidden": 1024}
+    elif ver == "CLIP-Anatomy": # Keep this if still needed for old data
+         # Same as CLIP for now unless specified otherwise
+         return {"features": 768, "hidden": 1024}
+    elif ver == "SIGLIP2-SO400M-512": # <<< New Version
+        # google/siglip2-so400m-patch16-512
+        return {"features": 1152, "hidden": 1280} # Use 1280 hidden? Or keep 1024? Let's try 1280
     elif ver == "META":
         # open_clip
         #  metaclip_fullcc | ViT-H-14-quickgelu
         print("META ver. was only meant for testing!")
-        return {
-            "features": 1024,
-            "hidden": 1280,
-        }
+        return {"features": 1024, "hidden": 1280}
     else:
         raise ValueError(f"Unknown model '{ver}'")
 
@@ -111,7 +110,6 @@ def parse_args():
 
     return args
 
-
 # --- Modify get_training_args ---
 # Version 2.1.2: Actually load optimizer name from YAML config
 def get_training_args(args, default_optimizer_name):
@@ -133,7 +131,6 @@ def get_training_args(args, default_optimizer_name):
          # Use YAML value if present, otherwise keep the default from args
          args.optimizer = train_conf.get("optimizer", args.optimizer)
 
-    # ... (rest of YAML loading for optimizer/scheduler params as before) ...
     if args.betas is None: args.betas = tuple(map(float, train_conf.get("betas", []))) or None
     if args.eps is None: args.eps = train_conf.get("eps", None)
     if args.weight_decay is None: args.weight_decay = train_conf.get("weight_decay", None)
@@ -143,79 +140,83 @@ def get_training_args(args, default_optimizer_name):
     args.cosine = train_conf.get("cosine", getattr(args, 'cosine', True))
     args.warmup_steps = int(train_conf.get("warmup_steps", getattr(args, 'warmup_steps', 5000)))
 
-    # --- Load Model Params from YAML (Add CLIP-Anatomy check) ---
+    # --- Model Params ---
     assert "model" in conf.keys(), "Model config not optional!"
-    args.base = conf["model"].get("base", "unknown")
-    args.rev = conf["model"].get("rev", "v0.0")
-    args.arch = conf["model"].get("arch", None)
-    args.clip = conf["model"].get("clip", "CLIP")
+    model_conf = conf["model"] # Get the whole model dict
+    args.base = model_conf.get("base", "unknown")
+    args.rev = model_conf.get("rev", "v0.0")
+    args.arch = model_conf.get("arch", None)
+    # Use 'embed_ver' for the type of embedding (CLIP, SIGLIP2...), keep 'clip' if needed for backward compat?
+    # Let's rename 'clip' -> 'embed_ver' conceptually
+    args.embed_ver = model_conf.get("embed_ver", model_conf.get("clip", "CLIP")) # Read 'embed_ver', fallback to 'clip', then 'CLIP'
     args.name = f"{args.base}-{args.rev}"
+
+    # --- ADD: Store the actual vision model name ---
+    # Default mapping from embed_ver to HF model name
+    default_vision_models = {
+        "CLIP": "openai/clip-vit-large-patch14-336",
+        "CLIP-Anatomy": "openai/clip-vit-large-patch14-336", # Assuming same base
+        "SIGLIP2-SO400M-512": "google/siglip2-so400m-patch16-512",
+        "META": "openai/clip-vit-large-patch14-336" # Default if META specified? Needs clarification
+    }
+    # Allow overriding in config: model: { embed_ver: ..., base_vision_model: ... }
+    args.base_vision_model = model_conf.get("base_vision_model", default_vision_models.get(args.embed_ver, None))
+    if args.base_vision_model is None:
+         print(f"Warning: Could not determine base_vision_model for embed_ver '{args.embed_ver}'. Inference scripts might fail.")
+
     assert args.arch in ["score", "class"], f"Unknown arch '{args.arch}'"
-    # v2.0.1: Added CLIP-Anatomy to allowed list
-    assert args.clip in ["CLIP", "META", "CLIP-Anatomy"], f"Unknown CLIP '{args.clip}'"
+    # v2.2.1: Use args.embed_ver in assertion check
+    allowed_versions = list(default_vision_models.keys()) # Get allowed from our map
+    assert args.embed_ver in allowed_versions, f"Unknown embed version '{args.embed_ver}'" # <<< Use args.embed_ver
 
     # --- Load Labels/Weights from YAML ---
     labels = conf.get("labels", {})
-    if args.arch == "class" and labels:
-        args.labels = {str(k): v.get("name", str(k)) for k, v in labels.items()}
-        try:
-            # Determine num_labels based on max key + 1, assuming 0-indexed
-            args.num_labels = max(int(k) for k in labels.keys()) + 1
-        except ValueError:
-            print("Warning: Could not determine num_labels from label keys. Set num_labels manually or check config.")
-            args.num_labels = 0  # Or some default/error handling
-
-        weights = [1.0] * args.num_labels  # Initialize with default weight 1.0
-        for k_str, label_conf in labels.items():
-            try:
-                k = int(k_str)
-                if 0 <= k < args.num_labels:
-                    weights[k] = float(label_conf.get("loss", 1.0))
-                else:
-                    print(f"Warning: Label key {k} out of range [0, {args.num_labels - 1}]. Ignoring weight.")
-            except ValueError:
-                print(f"Warning: Invalid label key '{k_str}' in config. Ignoring weight.")
-        args.weights = weights
-    else:
+    if args.arch == "class":
+        if labels:
+            args.labels = {str(k): v.get("name", str(k)) for k, v in labels.items()}
+            try: args.num_labels = max(int(k) for k in labels.keys()) + 1
+            except: args.num_labels = 0
+            weights = [1.0] * args.num_labels
+            for k_str, label_conf in labels.items():
+                try:
+                    k = int(k_str); weights[k] = float(label_conf.get("loss", 1.0))
+                except: pass # Ignore errors
+            args.weights = weights
+        else: # Need num_labels even if no labels section (e.g. if dataset handles it)
+             args.num_labels = model_conf.get("outputs", 2) # Default to 2 outputs for class if not specified
+             args.labels = None
+             args.weights = None
+    else: # Score
         args.num_labels = 1
         args.labels = None
         args.weights = None
 
-    # Pass through any other args added by argparse
     return args
 
-
-# --- Modify write_config ---
-# v2.1.0: Added val_split_count to saved config
 def write_config(args):
+    # Determine embed params based on the version string
+    embed_params = get_embed_params(args.embed_ver)
+
     conf = {
         "name": args.base,
         "rev": args.rev,
         "arch": args.arch,
         "labels": args.labels,
+        "embed_ver": args.embed_ver,             # <<< Store embedding version used
+        "base_vision_model": args.base_vision_model, # <<< Store base vision model used
         "train_args": {
-            "lr": args.lr,
-            "steps": args.steps,
-            "batch": args.batch,
-            "cosine": args.cosine,
-            "warmup_steps": args.warmup_steps,
-            "optimizer": args.optimizer,
-            "precision": args.precision,
-            "val_split_count": args.val_split_count,  # Add val split count
-            # --- Optimizer specific ---
-            "betas": args.betas,
-            "eps": args.eps,
-            "weight_decay": args.weight_decay,
-            "gamma": args.gamma,
-            "r_sf": args.r_sf,
-            "wlpow_sf": args.wlpow_sf,
-            "state_precision": args.state_precision,
-            # Add any other relevant args here...
+            # ... (store all relevant train args as before) ...
+            "lr": args.lr, "steps": args.steps, "batch": args.batch, "cosine": args.cosine, "warmup_steps": args.warmup_steps,
+            "optimizer": args.optimizer, "precision": args.precision, "val_split_count": args.val_split_count, "betas": args.betas,
+            "eps": args.eps, "weight_decay": args.weight_decay, "gamma": args.gamma, "r_sf": args.r_sf, "wlpow_sf": args.wlpow_sf,
+            "state_precision": args.state_precision
+        },
+        "model_params": {
+            "features": embed_params["features"], # <<< Store correct feature dim
+            "hidden": embed_params["hidden"],     # <<< Store hidden dim used
+            "outputs": args.num_labels
         }
     }
-    conf["model_params"] = get_embed_params(args.clip)
-    conf["model_params"]["outputs"] = args.num_labels
-
     os.makedirs(SAVE_FOLDER, exist_ok=True)
     config_path = f"{SAVE_FOLDER}/{args.name}.config.json"
     try:
