@@ -23,7 +23,7 @@ def parse_args():
 	return parser.parse_args()
 
 def process_file(pipeline, src_path, dst_path):
-	pred = pipeline(Image.open(src_path))
+	pred = pipeline(Image.open(src_path), tile_strat='mean')
 	if args.arch == "score":
 		pred = int(pred * 100) # [float]=>[int](percentage)
 	elif args.arch == "class":
@@ -100,7 +100,7 @@ if __name__ == "__main__":
 	pipeline_args = {}
 	if torch.cuda.is_available():
 		pipeline_args["device"] = "cuda"
-		pipeline_args["clip_dtype"] = torch.float16
+		pipeline_args["clip_dtype"] = torch.float32
 
 	if args.arch == "score":
 		pipeline = CityAestheticsPipeline(args.model, **pipeline_args)

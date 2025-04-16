@@ -4,7 +4,9 @@ import math
 import os
 import json
 import yaml
-import torch
+import torch # Should already be there
+import torch.nn as nn # Add if not present
+import torch.nn.functional as F # Add if not present
 import argparse  # Make sure argparse is imported
 from tqdm import tqdm
 from safetensors.torch import save_file
@@ -13,6 +15,44 @@ from safetensors.torch import save_file
 LOSS_MEMORY = 500
 LOG_EVERY_N = 100
 SAVE_FOLDER = "models"
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss, as described in https://arxiv.org/abs/1708.02002.
+
+    It modifies standard Cross Entropy loss to focus more on hard examples.
+    """
+    def __init__(self, gamma=2.0, reduction='mean'):
+        """
+        Args:
+            gamma (float): Focusing parameter. Higher values mean more focus on hard examples. Defaults to 2.0.
+            reduction (str): 'mean', 'sum', or 'none'. Defaults to 'mean'.
+        """
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: raw logits from model (size: [B, C])
+            targets: integer class indices (size: [B], dtype=torch.long)
+        """
+        # Calculate Cross Entropy loss without reduction to get per-sample loss
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        # Calculate probabilities of the true class: pt = exp(-ce_loss)
+        pt = torch.exp(-ce_loss)
+        # Calculate Focal Loss: (1-pt)^gamma * ce_loss
+        focal_loss = (1 - pt)**self.gamma * ce_loss
+
+        # Apply reduction
+        if self.reduction == 'mean':
+            return torch.mean(focal_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(focal_loss)
+        else: # 'none'
+            return focal_loss
 
 
 # --- Keep existing get_embed_params ---
@@ -312,38 +352,95 @@ class ModelWrapper:
 
         with torch.no_grad():
             for batch in val_loader:
-                if batch is None: continue  # Skip None batches from collate_ignore_none
+                if batch is None: continue
 
-                # Ensure batch items are on the correct device and correct type
                 emb = batch.get("emb").to(self.device)
                 val = batch.get("val")
-                if val is None: continue  # Skip if target is missing
+                if val is None:
+                     print("Warning: 'val' is None in validation batch. Skipping.")
+                     continue
 
-                # Move target 'val' to device and ensure correct dtype
-                if self.criterion.__class__.__name__ == 'L1Loss':  # Score mode
-                    val = val.to(self.device, dtype=torch.float32)
-                elif self.criterion.__class__.__name__ == 'CrossEntropyLoss':  # Class mode
-                    # Check if val is already one-hot float or class indices long
-                    if val.dtype == torch.float and val.ndim == 2:  # Assume one-hot float
-                        val = val.to(self.device, dtype=torch.float32)
-                    elif val.dtype == torch.long and val.ndim == 1:  # Class indices
-                        val = val.to(self.device, dtype=torch.long)
-                    elif val.ndim == 2 and val.shape[1] == 1:  # Indices with extra dim
-                        val = val.squeeze(-1).to(self.device, dtype=torch.long)
-                    else:  # Fallback/error case? Assume class indices needed
-                        print(
-                            f"Warning: Unexpected validation target shape/type: {val.shape}, {val.dtype}. Attempting Long conversion.")
-                        try:
+                # +++ START OF NEW CODE BLOCK TO PASTE +++
+                # v2.2.3: Ensure scorer target `val` is shape [B] for MSELoss
+                if self.num_labels == 1: # Scorer mode (expects single float output)
+                    try:
+                        # Move val to device and ensure float32
+                        val = val.to(device=self.device, dtype=torch.float32)
+
+                        # --- Ensure val is shape [B] ---
+                        if val.ndim == 2 and val.shape[1] == 1:
+                            # If it's [B, 1], squeeze it to [B]
+                            val = val.squeeze(1)
+                        elif val.ndim != 1:
+                            # If it's not [B] or [B, 1], try a general squeeze just in case, then raise error if still not 1D
+                            print(f"Warning: Unexpected scorer target shape {val.shape}. Squeezing.")
+                            val = val.squeeze()
+                            if val.ndim != 1:
+                                 raise ValueError(f"Scorer target shape is {val.shape} after squeeze, expected 1D [B].")
+                        # Now 'val' should have shape [B]
+                        # --- End shape handling ---
+
+                    except Exception as e:
+                         print(f"Error processing scorer target tensor 'val': {e}")
+                         print(f"  Original val shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
+                         continue # Skip this batch if target is bad
+
+                elif self.num_labels > 1: # Classifier mode
+                    # Existing logic for CrossEntropyLoss / classification targets
+                    try:
+                        if val.dtype == torch.float and val.ndim == 2:  # Assume one-hot float
+                            print(f"Warning: Classifier target is float one-hot? {val.shape}. Trying argmax.")
+                            val = torch.argmax(val, dim=1).to(device=self.device, dtype=torch.long)
+                        elif val.dtype == torch.long and val.ndim == 1:  # Class indices Long
+                            val = val.to(self.device, dtype=torch.long)
+                        elif val.ndim == 2 and val.shape[1] == 1:  # Class indices with extra dim
+                            val = val.squeeze(-1).to(self.device, dtype=torch.long)
+                        else:  # Fallback/error case? Assume class indices needed
+                            print(
+                                f"Warning: Unexpected classifier target shape/type: {val.shape}, {val.dtype}. Assuming Long indices needed.")
                             val = val.squeeze().to(self.device, dtype=torch.long)
-                        except Exception as e:
-                            print(f"  Conversion failed: {e}. Skipping batch.")
-                            continue
+                        # Add shape check for classifier target
+                        if val.ndim != 1:
+                            raise ValueError(f"Classifier target shape is {val.shape}, expected 1D [B].")
 
+                    except Exception as e:
+                        print(f"Error processing classifier target tensor 'val': {e}")
+                        print(f"  Original val shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
+                        continue  # Skip this batch if target is bad
+                else:
+                    # Should not happen if num_labels is properly set
+                    print(
+                        f"Error: Invalid num_labels ({self.num_labels}) encountered in validation. Cannot process target 'val'.")
+                    continue
+                    # --- End Device Moving and Shape Handling Logic ---
+
+                    # Now 'val' should be on the correct device and have shape [B]
                 batch_size = emb.size(0)
 
+                # Add shape check before loss calculation
+                if emb.shape[0] != val.shape[0]:
+                    print(
+                        f"Error: Mismatch batch size between embeddings ({emb.shape[0]}) and processed targets ({val.shape[0]}) before loss. Skipping batch.")
+                    continue
+
                 with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=current_amp_dtype):
-                    y_pred = self.model(emb)
-                    loss = self.criterion(y_pred.to(torch.float32), val)  # Ensure compatible types for loss
+                    y_pred = self.model(emb)  # Shape [B, 1] for scorer
+
+                    # Squeeze prediction y_pred [B, 1] -> [B] for MSELoss
+                    # Target 'val' is already [B]
+                    if self.num_labels == 1 and y_pred.ndim == 2 and y_pred.shape[1] == 1:
+                        y_pred_for_loss = y_pred.squeeze(1)
+                    else:
+                        y_pred_for_loss = y_pred  # Shape [B, num_classes] for CrossEntropy
+
+                    # v2.2.4: Handle target dtype correctly for CrossEntropyLoss vs others
+                    y_pred_final = y_pred_for_loss.to(torch.float32) # Ensure prediction is float32 for loss calc
+                    if isinstance(self.criterion, (torch.nn.CrossEntropyLoss, FocalLoss)): # <<< MODIFIED: Added FocalLoss
+                        # CrossEntropy expects Float prediction and Long target
+                        loss = self.criterion(y_pred_final, val) # val is already Long and on device
+                    else:
+                        # L1/MSE expect Float prediction and Float target
+                        loss = self.criterion(y_pred_final, val.to(y_pred_final.dtype)) # Convert val to Float
 
                 if not math.isnan(loss.item()):
                     total_loss += loss.item() * batch_size
@@ -352,7 +449,7 @@ class ModelWrapper:
                     print("Warning: NaN encountered in validation loss calculation. Skipping batch contribution.")
 
         # --- Restore Modes ---
-        self.model.train()  # Set model back to training mode
+        self.model.train() # Set model back to training mode
         if needs_optim_switch and original_optimizer_mode_is_training:
             try:
                 self.optimizer.train()
@@ -360,7 +457,8 @@ class ModelWrapper:
                 print(f"Warning: Error calling optimizer.train(): {e}")
 
         if total_samples == 0:
-            return float('nan')  # Avoid division by zero if no valid samples seen
+            print("Warning: No valid samples processed during validation.")
+            return float('nan') # Avoid division by zero
         return total_loss / total_samples
 
     def log_main(self, step, train_loss_batch, eval_loss): # Renamed train_loss for clarity

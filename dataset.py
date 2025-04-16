@@ -335,25 +335,48 @@ class ValidationSubDataset(Dataset):
     def __len__(self):
         return len(self.shards)
 
+    # v2.0.2: Correct target format for classifier validation
     def __getitem__(self, index):
          shard = self.shards[index]
          try:
-             data = shard.get_data() # Attempt to load data
-             # If class mode, ensure 'val' is one-hot encoded
+             data = shard.get_data() # Attempt to load data (returns dict: {'emb': ..., 'raw': ..., 'val': ...})
+
+             # --- TARGET FORMAT CORRECTION ---
              if self.mode == 'class':
-                  label = int(data['raw'])
-                  one_hot_val = torch.zeros(self.num_labels)
-                  if 0 <= label < self.num_labels:
-                       one_hot_val[label] = 1.0
-                  else:
-                       print(f"Warning: Invalid label {label} encountered in validation set for num_labels {self.num_labels}. Using zero vector.")
-                  data['val'] = one_hot_val
-             return data
+                  # The 'val' from shard.get_data() currently holds the original class label (0, 1, etc.)
+                  # as a tensor like tensor([0.]) or tensor([1.]).
+                  # CrossEntropyLoss in training loop expects LongTensor of shape [B] (indices).
+                  # Let's ensure 'val' in the output dict IS the Long index.
+                  try:
+                      # Convert the single-element tensor from get_data() to a Long scalar, then back to a 0-dim Long tensor.
+                      # Or maybe just ensure it's the right type and shape for collate_fn?
+                      # Let's directly use the 'raw' value which should be the integer label.
+                      label_index = int(data['raw']) # Get the integer label (0, 1, ...)
+                      if not (0 <= label_index < self.num_labels):
+                           # Handle case where label might be out of bounds if data is weird
+                           print(f"Warning: Invalid label {label_index} encountered in validation set for num_labels {self.num_labels}. Using label 0.")
+                           label_index = 0
+                      # Put the correct LongTensor index into the 'val' field for the dataloader
+                      data['val'] = torch.tensor(label_index, dtype=torch.long) # Store as 0-dim Long Tensor
+
+                  except Exception as e_label:
+                      print(f"ERROR converting validation label {data.get('raw')} to Long index: {e_label}")
+                      # Handle error - maybe return None or a default? Returning None is safer.
+                      return None
+
+             elif self.mode == 'score':
+                  # Ensure score 'val' is float and maybe shape [1] for consistency?
+                  # get_data already returns 'val' as tensor([float_val]) which is fine.
+                  data['val'] = data['val'].float() # Ensure float type
+
+             # --- END TARGET FORMAT CORRECTION ---
+
+             return data # Return the dictionary with corrected 'val'
+
          except Exception as e:
              # Log error and return None to be handled by collate_fn
              print(f"ERROR in ValidationSubDataset __getitem__ for index {index}, shard path {shard.path}: {e}")
              return None
-
 
 # collate_ignore_none function remains the same
 def collate_ignore_none(batch):

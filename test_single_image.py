@@ -196,6 +196,7 @@ if __name__ == "__main__":
     print("\n--- Results ---")
     print(f"Image: {os.path.basename(args.image_path)}")
     probabilities_cpu = probabilities.squeeze().cpu().numpy() # Remove batch dim, move to CPU
+    print(f"Raw Probabilities (Bad=0, Good=1): {probabilities_cpu}")  # <-- ADD THIS LINE
 
     # Check if output is scalar (shouldn't be for classifier) or array
     if probabilities_cpu.ndim == 0: # Is scalar

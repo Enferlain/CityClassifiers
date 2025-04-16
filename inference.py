@@ -246,8 +246,8 @@ class CityAestheticsMultiModelPipeline(BasePipeline):
         return out
 
 
-# --- Classifier Pipelines ---
 class CityClassifierPipeline(BasePipeline):
+    # v1.1: Added init code back for clarity
     def __init__(self, model_path, config_path=None, device="cpu", clip_dtype=torch.float32):
         # Find and load config first
         if config_path is None or not os.path.isfile(config_path):
@@ -272,32 +272,99 @@ class CityClassifierPipeline(BasePipeline):
 
         print(f"CityClassifier: Pipeline init ok (Labels: {self.labels})")
 
+    # v1.5.3: Added debug print for raw tile predictions
     def __call__(self, raw, default=True, tiling=True, tile_strat="mean"):
-        emb = self.get_clip_emb_tiled(raw, tiling=tiling)
-        pred = self.get_model_pred_generic(self.model, emb)
-        return self.format_pred(pred, labels=self.labels, drop_default=(not default), tile_strategy=tile_strat if tiling and emb.shape[0] > 1 else "raw")
+        # Get embeddings (potentially tiled)
+        emb = self.get_clip_emb_tiled(raw, tiling=tiling) # emb shape: [num_tiles, features]
+
+        # --- Optional: Keep L2 Normalization Here ---
+        # Normalize embeddings BEFORE feeding them to the model
+        if emb.ndim == 2 and emb.shape[0] > 0: # Check if it's a batch of embeddings (tiles)
+            emb_norm = torch.linalg.norm(emb, dim=1, keepdim=True)
+            # Add a small epsilon to prevent division by zero for potential zero vectors
+            emb = emb / (emb_norm + 1e-8)
+            # print(f"DEBUG: Normalized {emb.shape[0]} tile embeddings.") # Optional debug print
+        elif emb.ndim == 1: # Handle single embedding case (tiling=False or single tile image)
+            emb_norm = torch.linalg.norm(emb)
+            emb = emb / (emb_norm + 1e-8)
+            # print("DEBUG: Normalized single embedding.") # Optional debug print
+        else:
+            # Handle unexpected shapes (e.g., empty tensor) if necessary
+            print(f"Warning: Unexpected embedding shape {emb.shape}. Skipping normalization.")
+        # --- End Optional L2 Normalization ---
+
+        # Get the raw model prediction for all tiles using the (now potentially normalized) embeddings
+        pred = self.get_model_pred_generic(self.model, emb) # pred shape: [num_tiles, num_classes]
+
+        # --- ADDED DEBUG PRINT HERE ---
+        # Check the shape and print the raw predictions before formatting/combining
+        num_tiles_pred = pred.shape[0]
+        if num_tiles_pred > 1 and tiling: # Only print if we actually got multiple tile predictions and tiling was requested
+             # Using .detach() just in case gradients were somehow still attached
+             print(f"DEBUG: Raw Tile Predictions (Shape: {pred.shape}, [Bad, Good]):\n{pred.detach().cpu().numpy()}")
+        # --- END ADDED DEBUG PRINT ---
+
+        # Format the prediction (includes tile combination logic from format_pred method below)
+        # This combines the 'pred' tensor based on tile_strat if needed
+        formatted_output = self.format_pred(
+            pred,                            # Pass the raw predictions tensor
+            labels=self.labels,              # Pass the loaded labels
+            drop_default=(not default),      # Pass the flag to drop the default class
+            # Determine the strategy: combine only if tiling was on AND we got multiple tile results
+            tile_strategy=tile_strat if tiling and num_tiles_pred > 1 else "raw"
+        )
+
+        # Return the final formatted dictionary (e.g., {'Bad Anatomy': 0.1, 'Good Anatomy': 0.9})
+        return formatted_output
 
     def format_pred(self, pred, labels, drop_default=False, tile_strategy="mean"):
-        # (format_pred logic remains the same as v1.3)
         num_classes = pred.shape[-1]
         num_tiles = pred.shape[0]
         if num_tiles > 1 and tile_strategy != "raw":
-            combined_pred = torch.zeros(num_classes)
+            combined_pred = torch.zeros(num_classes, device=pred.device)
             for k in range(num_classes):
                 tile_scores = pred[:, k]
-                if   tile_strategy == "mean":   val = torch.mean(tile_scores)
-                elif tile_strategy == "median": val = torch.median(tile_scores).values
-                elif tile_strategy == "max":    val = torch.max(tile_scores)
-                elif tile_strategy == "min":    val = torch.min(tile_scores)
-                else: raise NotImplementedError(f"Invalid combine strategy '{tile_strategy}'!")
-                combined_pred[k] = float(val)
-            pred_to_format = combined_pred
-        else: pred_to_format = pred[0]
-        out = {}; k = 0
+
+                val = None
+                if   tile_strategy == "mean":
+                    val = torch.mean(tile_scores).item()
+                elif tile_strategy == "median":
+                    # --- CORRECT MEDIAN LOGIC ---
+                    # torch.median(1D_tensor) returns the median value as a 0-dim tensor directly
+                    median_value_tensor = torch.median(tile_scores)
+                    val = median_value_tensor.item() # Use .item() directly on the result
+                    # --- END CORRECTION ---
+                elif tile_strategy == "max":
+                    val = torch.max(tile_scores).item()
+                elif tile_strategy == "min":
+                    val = torch.min(tile_scores).item()
+                else:
+                    raise NotImplementedError(f"Invalid combine strategy '{tile_strategy}'!")
+
+                if val is None:
+                     print(f"ERROR: 'val' was not assigned for strategy '{tile_strategy}', class {k}. Skipping assignment.")
+                     continue
+
+                # Assign the Python float value directly to the FloatTensor element
+                combined_pred[k] = val
+
+            # combined_pred is now filled with floats, move to CPU
+            pred_to_format = combined_pred.cpu()
+        else: # Single tile or raw output requested
+            # pred[0] is shape [num_classes], move to cpu
+            pred_to_format = pred[0].cpu()
+
+        # Format into dictionary using CPU tensor
+        out = {}
         for k in range(num_classes):
+            label_index_str = str(k)
             if k == 0 and drop_default: continue
-            key = labels.get(str(k), str(k))
-            out[key] = float(pred_to_format[k])
+            key = labels.get(label_index_str, label_index_str)
+            # Get value using .item() if it's still a tensor (e.g., from single tile path)
+            # If pred_to_format[k] is already a float (from combined_pred), .item() isn't needed
+            # Let's just ensure it's float
+            value_to_store = pred_to_format[k].item() if isinstance(pred_to_format[k], torch.Tensor) else pred_to_format[k]
+            out[key] = float(value_to_store) # Ensure final value is float
         return out
 
 # Fixed mutable default for config_paths=[]
@@ -339,36 +406,66 @@ class CityClassifierMultiModelPipeline(BasePipeline):
         if not self.models: raise ValueError("No valid models loaded.")
         print("CityClassifier MultiModel: Pipeline init ok")
 
+    # v1.5.1: Added normalization before prediction loop
     def __call__(self, raw, default=True, tiling=True, tile_strat="mean"):
-        emb = self.get_clip_emb_tiled(raw, tiling=tiling)
+        # Get embeddings (potentially tiled)
+        emb = self.get_clip_emb_tiled(raw, tiling=tiling) # Shape: [num_tiles, features]
+
+        # --- Add L2 Normalization along the feature dimension ---
+        # Normalize embeddings BEFORE feeding them to any model
+        if emb.ndim == 2 and emb.shape[0] > 0: # Check if it's a batch of embeddings (tiles)
+            emb_norm = torch.linalg.norm(emb, dim=1, keepdim=True)
+            # Add a small epsilon to prevent division by zero for potential zero vectors
+            emb = emb / (emb_norm + 1e-8)
+            print(f"DEBUG: Normalized {emb.shape[0]} tile embeddings.")
+        elif emb.ndim == 1: # Handle single embedding case (tiling=False or single tile image)
+            emb_norm = torch.linalg.norm(emb)
+            emb = emb / (emb_norm + 1e-8)
+            print("DEBUG: Normalized single embedding.")
+        else:
+            # Handle unexpected shapes (e.g., empty tensor) if necessary
+            print(f"Warning: Unexpected embedding shape {emb.shape}. Skipping normalization.")
+        # --- End Normalization ---
+
         out_list = []
+        # Loop through each loaded model
         for name, model in self.models.items():
-             pred = self.get_model_pred_generic(model, emb)
+             # Use the (now normalized) embedding tensor for prediction
+             pred = self.get_model_pred_generic(model, emb) # pred shape: [num_tiles, num_classes]
+
+             # Format the prediction (applies tile combination strategy)
              formatted_pred = self._format_single_pred(pred, labels=self.labels[name], drop_default=(not default),
                  tile_strategy=tile_strat if tiling and emb.shape[0] > 1 else "raw", num_classes=model.outputs)
-             out_list.append(formatted_pred)
+             out_list.append(formatted_pred) # Add result for this model
+
+        # Return list of results (one dictionary per model)
         return out_list
 
     # (Keep _format_single_pred helper method as in v1.4)
     def _format_single_pred(self, pred, labels, drop_default, tile_strategy, num_classes):
         num_tiles = pred.shape[0]
+        # Combine tile predictions if necessary
         if num_tiles > 1 and tile_strategy != "raw":
-            combined_pred = torch.zeros(num_classes)
+            combined_pred = torch.zeros(num_classes, device=pred.device) # Keep on same device initially
             for k in range(num_classes):
                 tile_scores = pred[:, k]
                 if   tile_strategy == "mean":   val = torch.mean(tile_scores)
                 elif tile_strategy == "median": val = torch.median(tile_scores).values
-                elif tile_strategy == "max":    val = torch.max(tile_scores)
-                elif tile_strategy == "min":    val = torch.min(tile_scores)
+                elif tile_strategy == "max":    val = torch.max(tile_scores).values # .values for torch >= 1.7
+                elif tile_strategy == "min":    val = torch.min(tile_scores).values # .values for torch >= 1.7
                 else: raise NotImplementedError(f"Invalid combine strategy '{tile_strategy}'!")
-                combined_pred[k] = float(val)
-            pred_to_format = combined_pred
-        else: pred_to_format = pred[0]
-        out = {}; k = 0
+                combined_pred[k] = val # Store combined value
+            pred_to_format = combined_pred.cpu() # Move final combined prediction to CPU
+        else: # Single tile or raw output
+            pred_to_format = pred[0].cpu() # Move single prediction to CPU
+
+        # Format into dictionary
+        out = {}
         for k in range(num_classes):
-            if k == 0 and drop_default: continue
-            key = labels.get(str(k), str(k))
-            out[key] = float(pred_to_format[k])
+            label_index_str = str(k)
+            if k == 0 and drop_default: continue # Skip default class if requested
+            key = labels.get(label_index_str, label_index_str) # Get label name or use index
+            out[key] = float(pred_to_format[k]) # Convert final value to float
         return out
 
 # --- get_model_path (Utility - unchanged from v1.4) ---

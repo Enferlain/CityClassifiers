@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from safetensors.torch import load_file
 import wandb
 import math # Added for isnan check
+from utils import ModelWrapper, get_embed_params, parse_args, write_config, LOG_EVERY_N, FocalLoss
 
 # Add the directory containing 'train.py' to the path
 # This ensures Python looks for the 'optimizer' folder relative to 'train.py'
@@ -169,7 +170,7 @@ if __name__ == "__main__":
     # --- Model Definition (No Change) ---
     if args.arch == "score":
         # Make sure criterion handles potential NaN outputs if model or target is bad
-        criterion = torch.nn.L1Loss(reduction='mean') # Specify reduction for clarity
+        criterion = torch.nn.MSELoss(reduction='mean') # Specify reduction for clarity
         model = PredictorModel(
             outputs=1,
             **get_embed_params(args.embed_ver)
@@ -180,14 +181,13 @@ if __name__ == "__main__":
              print(f"Warning: Label count mismatch! Config/Args: {args.num_labels}, Dataset: {dataset.num_labels}. Using dataset value.")
              args.num_labels = dataset.num_labels # Prioritize dataset derived value
 
-        weights = None
-        if args.weights and len(args.weights) == args.num_labels:
-            weights = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32)
-            print(f"Class weights: '{args.weights}'")
-        elif args.weights:
-            print(f"Warning: Mismatch between number of weights ({len(args.weights)}) and number of labels ({args.num_labels}). Ignoring weights.")
+        # +++ START OF NEW CODE TO PASTE +++
+        # Use Focal Loss instead of CrossEntropyLoss
+        print("Using Focal Loss (gamma=2.0)")  # Log that we're using it
+        criterion = FocalLoss(gamma=2.0)  # Default gamma=2, reduction='mean'
+        # NOTE: We are ignoring class weights for this basic Focal Loss implementation.
+        # +++ END OF NEW CODE TO PASTE +++
 
-        criterion = torch.nn.CrossEntropyLoss(weight=weights) #label_smoothing=0.1) # Add label_smoothing=0.1
         model = PredictorModel(
             outputs=args.num_labels,
             **get_embed_params(args.embed_ver)
