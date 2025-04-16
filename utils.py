@@ -39,13 +39,15 @@ def get_embed_params(ver):
     # Add new embedding types here as needed
     embed_configs = {
         "CLIP": {"features": 768, "hidden": 1024},
-        "CLIP-Anatomy": {"features": 768, "hidden": 1024}, # Example legacy
+        "CLIP-Anatomy": {"features": 768, "hidden": 1024},
         "SIGLIP2-SO400M-512": {"features": 1152, "hidden": 1280},
-        "SIGLIP2-SO400M-512_NoCrop": {"features": 1152, "hidden": 1280}, # Same dims
-        "SIGLIP2-SO400M-512_FitPad": {"features": 1152, "hidden": 1280}, # Same dims
-        # Add Naflex dimensions when known, e.g.:
-        # "NaflexSigLIP_FitPad": {"features": 1024, "hidden": 1280},
-        "META": {"features": 1024, "hidden": 1280}, # Old test
+        "SIGLIP2-SO400M-512_NoCrop": {"features": 1152, "hidden": 1280},
+        "SIGLIP2-SO400M-512_FitPad": {"features": 1152, "hidden": 1280},
+        # --- ADD THIS LINE ---
+        "siglip2_so400m_patch16_512_CenterCrop": {"features": 1152, "hidden": 1280},
+        # --- END ADD ---
+        # "NaflexSigLIP_FitPad": {"features": 1024, "hidden": 1280}, # Example for Naflex
+        "META": {"features": 1024, "hidden": 1280},
     }
     if ver in embed_configs:
         return embed_configs[ver]
@@ -112,7 +114,13 @@ def parse_and_load_args():
     args.attn_dropout = model_conf.get("attn_dropout", 0.1) # Default from PredictorModel
 
     # Vision model lookup
-    default_vision_models = { "CLIP": "openai/clip-vit-large-patch14-336", "SIGLIP2-SO400M-512": "google/siglip2-so400m-patch16-512", "SIGLIP2-SO400M-512_NoCrop": "google/siglip2-so400m-patch16-512", "SIGLIP2-SO400M-512_FitPad": "google/siglip2-so400m-patch16-512", "NaflexSigLIP_FitPad": "google/siglip-naflex-so400m-patch14-384" } # Add more
+    default_vision_models = {
+        "CLIP": "openai/clip-vit-large-patch14-336",
+        "SIGLIP2-SO400M-512": "google/siglip2-so400m-patch16-512",
+        "SIGLIP2-SO400M-512_NoCrop": "google/siglip2-so400m-patch16-512",
+        "SIGLIP2-SO400M-512_CenterCrop": "google/siglip2-so400m-patch16-512",
+        "SIGLIP2-SO400M-512_FitPad": "google/siglip2-so400m-patch16-512",
+        "NaflexSigLIP_FitPad": "google/siglip-naflex-so400m-patch14-384" } # Add more
     args.base_vision_model = model_conf.get("base_vision_model", default_vision_models.get(args.embed_ver))
     if not args.base_vision_model: print(f"Warning: Could not determine base_vision_model for embed_ver '{args.embed_ver}'.")
 
@@ -221,25 +229,27 @@ def write_config(args):
 # --- End Argument Parsing and Config Loading ---
 
 
-# --- ModelWrapper Class ---
-# v2.3.0: Cleaned up saving logic
+# v2.5.0: Correctly handles single latest _sXXX_best_val file, optional aux saving.
 class ModelWrapper:
     def __init__(self, name, model, optimizer, criterion, scheduler=None, device="cpu",
                  stdout=True, scaler=None, wandb_run=None, num_labels=1):
         self.name = name
-        self.device = device
-        self.losses = []
-        self.current_step = 0 # Track current step internally
-        self.best_val_loss = float('inf') # Track best val loss
-        self.best_val_checkpoint_path = None # Store path to best checkpoint
-
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
         self.scheduler = scheduler
+        self.device = device
         self.scaler = scaler
         self.wandb_run = wandb_run
+        self.stdout = stdout
         self.num_labels = num_labels
+
+        self.losses = []
+        self.current_step = 0
+        self.best_val_loss = float('inf')
+        # Store the path to the *last known* best checkpoint file ending with _best_val.safetensors
+        self.current_best_val_model_path = None
+        # Try to find existing best model on init/resume? More complex, skip for now.
 
         os.makedirs(SAVE_FOLDER, exist_ok=True)
         self.log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
@@ -270,69 +280,114 @@ class ModelWrapper:
              if len(self.losses) > LOSS_MEMORY:
                   self.losses.pop(0)
 
+    # v2.3.1: Simplified + correct device/dtype/shape handling
     def evaluate_on_validation_set(self, val_loader):
         """Performs evaluation on the provided validation DataLoader."""
-        # --- Keep the evaluate_on_validation_set method from v2.2.5 ---
-        # (Including the fix for target dtypes/shapes for CE/Focal/L1/MSE)
-        # ... (Paste the full function from previous response here) ...
-        if val_loader is None: return float('nan')
-        self.model.eval()
-        original_optimizer_mode_is_training = False
-        # ... (optimizer eval mode switching) ...
-        if hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval): # Simplified check
-             if hasattr(self.optimizer, 'train_mode') and self.optimizer.train_mode:
-                  original_optimizer_mode_is_training = True; self.optimizer.eval()
-             elif not hasattr(self.optimizer, 'train_mode'): # Heuristic if no explicit mode
-                  if hasattr(self.optimizer, 'param_groups') and any(pg.get('step', 0) > 0 for pg in self.optimizer.param_groups):
-                       original_optimizer_mode_is_training = True; self.optimizer.eval()
+        if val_loader is None:
+             print("Validation loader not provided, skipping evaluation.")
+             return float('nan')
 
-        total_loss = 0.0; total_samples = 0
+        self.model.eval()  # Set model to evaluation mode
+        # --- Set Optimizer Eval Mode (if applicable) ---
+        original_optimizer_mode_is_training = False
+        # Check if optimizer has state and distinct eval/train modes
+        needs_optim_switch = (hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval) and
+                              hasattr(self.optimizer, 'train') and callable(self.optimizer.train) and
+                              hasattr(self.optimizer, 'state') and any(s for s in self.optimizer.state.values()))
+        if needs_optim_switch:
+            # Try to determine current mode and switch to eval
+            is_training = False
+            if hasattr(self.optimizer, 'train_mode'): # Explicit flag
+                is_training = self.optimizer.train_mode
+            elif hasattr(self.optimizer, 'param_groups') and any(pg.get('step', 0) > 0 for pg in self.optimizer.param_groups): # Heuristic: check steps
+                is_training = True
+
+            if is_training:
+                try:
+                    self.optimizer.eval()
+                    original_optimizer_mode_is_training = True # Mark that we need to switch back
+                except Exception as e:
+                    print(f"Warning: Error calling optimizer.eval(): {e}")
+                    needs_optim_switch = False # Don't try to switch back if eval failed
+        # --- End Optimizer Eval Mode ---
+
+        total_loss = 0.0
+        total_samples = 0
         autocast_enabled = self.scaler is not None and self.scaler.is_enabled()
+        amp_dtype = torch.float32
         if autocast_enabled:
-             # ... (get amp_dtype) ...
-             if hasattr(self.scaler, 'get_amp_dtype'): current_amp_dtype = self.scaler.get_amp_dtype()
-             elif torch.cuda.is_available() and torch.cuda.is_bf16_supported(): current_amp_dtype = torch.bfloat16
-             else: current_amp_dtype = torch.float16
-        else: current_amp_dtype = torch.float32
+            # Determine AMP dtype
+            if hasattr(self.scaler, 'get_amp_dtype'): current_amp_dtype = self.scaler.get_amp_dtype()
+            elif self.device == 'cuda' and torch.cuda.is_bf16_supported(): current_amp_dtype = torch.bfloat16
+            else: current_amp_dtype = torch.float16 # Default AMP dtype
+            amp_dtype = current_amp_dtype # Use determined dtype
 
         with torch.no_grad():
             for batch in val_loader:
-                if batch is None: continue
-                emb = batch.get("emb").to(self.device); val = batch.get("val")
-                if val is None: print("Warning: 'val' is None in validation batch."); continue
+                if batch is None: continue # Skip bad batches from dataloader
 
-                # --- Target Prep Block ---
+                emb = batch.get("emb")
+                val = batch.get("val")
+                if emb is None or val is None:
+                    print("Warning: Validation batch missing 'emb' or 'val'. Skipping.")
+                    continue
+
+                emb = emb.to(self.device) # Move embeddings to device
+
+                # --- Prepare Target Tensor (val) ---
                 try:
                     if self.num_labels == 1: # Scorer mode
-                        val = val.to(device=self.device, dtype=torch.float32)
-                        if val.ndim == 2 and val.shape[1] == 1: val = val.squeeze(1)
-                        elif val.ndim != 1: val = val.squeeze();
-                        if val.ndim != 1 : raise ValueError(f"Scorer target shape {val.shape}, expected 1D.")
+                        val = val.to(device=self.device, dtype=torch.float32) # Needs Float on device
+                        if val.ndim == 2 and val.shape[1] == 1: val = val.squeeze(1) # [B, 1] -> [B]
+                        elif val.ndim != 1: val = val.squeeze() # Try general squeeze if needed
+                        if val.ndim != 1: raise ValueError(f"Scorer target shape {val.shape}, expected 1D [B].")
                     elif self.num_labels > 1: # Classifier mode
-                        if val.dtype == torch.float and val.ndim == 2: val = torch.argmax(val, dim=1) # Assume one-hot
-                        val = val.squeeze().to(device=self.device, dtype=torch.long) # Ensure Long, correct device, squeeze just in case
-                        if val.ndim != 1: raise ValueError(f"Classifier target shape {val.shape}, expected 1D.")
-                except Exception as e: print(f"Error processing val tensor: {e}"); continue
+                        if val.dtype == torch.float and val.ndim == 2: val = torch.argmax(val, dim=1) # Handle one-hot float input
+                        val = val.squeeze().to(device=self.device, dtype=torch.long) # Ensure Long, on device, shape [B]
+                        if val.ndim != 1: raise ValueError(f"Classifier target shape {val.shape}, expected 1D [B].")
+                    else: # Should not happen
+                        raise ValueError(f"Invalid num_labels ({self.num_labels})")
+                except Exception as e:
+                    print(f"Error processing val tensor in validation: {e}")
+                    print(f"  Original shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
+                    continue # Skip batch if target prep fails
                 # --- End Target Prep ---
 
                 batch_size = emb.size(0)
-                if emb.shape[0] != val.shape[0]: print(f"Error: Val Batch size mismatch emb/val."); continue
+                if emb.shape[0] != val.shape[0]:
+                     print(f"Error: Validation batch size mismatch emb ({emb.shape[0]}) vs val ({val.shape[0]}). Skipping.")
+                     continue
 
-                with torch.amp.autocast(device_type=self.device, enabled=autocast_enabled,
-                                        dtype=current_amp_dtype):  # <<< Corrected
-                    y_pred = self.model(emb)
-                    if self.num_labels == 1 and y_pred.ndim == 2: y_pred_for_loss = y_pred.squeeze(1)
-                    else: y_pred_for_loss = y_pred
+                # --- Prediction and Loss ---
+                with torch.amp.autocast(device_type=self.device, enabled=autocast_enabled, dtype=amp_dtype):
+                    y_pred = self.model(emb) # Model forward pass
 
-                    # v2.2.5: Correct target dtype handling for loss
+                    # Prepare prediction shape for loss function
+                    if self.num_labels == 1 and y_pred.ndim == 2 and y_pred.shape[1] == 1:
+                         y_pred_for_loss = y_pred.squeeze(1) # [B, 1] -> [B] for L1/MSE
+                    else:
+                         y_pred_for_loss = y_pred # Shape [B, C] for CE/Focal
+
+                    # Ensure prediction is Float32 for stable loss calculation
                     y_pred_final = y_pred_for_loss.to(torch.float32)
+
+                    # Calculate loss, ensuring target dtype matches loss function expectation
                     if isinstance(self.criterion, (torch.nn.CrossEntropyLoss, FocalLoss)):
-                        loss = self.criterion(y_pred_final, val) # val should be Long
-                    else: # L1/MSE
-                        loss = self.criterion(y_pred_final, val.to(y_pred_final.dtype)) # val should be Float
-                # ... (loss aggregation) ...
-                if not math.isnan(loss.item()): total_loss += loss.item() * batch_size; total_samples += batch_size
-                else: print("Warning: NaN validation loss.")
+                        loss = self.criterion(y_pred_final, val) # val is Long
+                    else: # L1/MSE etc.
+                        loss = self.criterion(y_pred_final, val.to(y_pred_final.dtype)) # val needs to be Float
+                # --- End Prediction and Loss ---
+
+                # --- Accumulate Loss ---
+                if not math.isnan(loss.item()):
+                    total_loss += loss.item() * batch_size # Use item's batch size
+                    total_samples += batch_size
+                else:
+                    print("Warning: NaN encountered in validation loss calculation.")
+                # --- End Accumulate Loss ---
+
+            # End batch loop
+        # End torch.no_grad()
 
         # --- Restore Modes ---
         self.model.train()
@@ -371,79 +426,86 @@ class ModelWrapper:
                 self.csvlog.flush()
             except Exception as e_csv: print(f"Warning: Error writing CSV log: {e_csv}")
 
-        # Update best validation loss tracking
+        # --- Update Best Loss Tracking ---
+        # Note: Saving is now handled ONLY by the explicit save_model call from train_loop
         if not math.isnan(eval_loss) and eval_loss < self.best_val_loss:
              self.best_val_loss = eval_loss
-             print(f"\nNew best validation loss: {self.best_val_loss:.4e}. Saving best model...")
-             self.save_model(step=step, is_best=True) # Pass flag
+             # We don't save here anymore, just update the best loss value
 
-    def save_model(self, step=None, epoch=None, suffix="", is_best=False):
-        """Saves model, optimizer, scheduler, and scaler states."""
+    # --- Model Saving ---
+    # v2.5.1: Final corrected saving logic
+    def save_model(self, step=None, epoch=None, suffix="", save_aux=False):
+        """
+        Saves model checkpoint. If suffix contains '_best_val', it manages the single
+        latest best checkpoint with that naming convention.
+        Auxiliary files (optim, etc.) are only saved if save_aux is True.
+        """
         current_step_num = step if step is not None else self.current_step
 
-        # --- Determine Filename ---
+        # --- Determine Filename Components ---
         step_str = ""
-        if epoch is None: # Use step count
+        is_best = "_best_val" in suffix # Check if this save is intended as a best model save
+
+        if epoch is None: # Use step count for filename base
             if current_step_num >= 1_000_000: step_str = f"_s{round(current_step_num / 1_000_000, 1)}M"
             elif current_step_num >= 1_000: step_str = f"_s{round(current_step_num / 1_000)}K"
             else: step_str = f"_s{current_step_num}"
         else: # Use epoch string if provided (e.g., "final")
             step_str = f"_e{epoch}"
 
+        # Construct the full path for the file(s) being saved in THIS call
+        # Includes the step and the full suffix (which might contain _best_val)
         base_output_name = f"./{SAVE_FOLDER}/{self.name}{step_str}{suffix}"
         model_output_path = f"{base_output_name}.safetensors"
-        optim_output_path = f"{base_output_name}.optim" # Use shorter extension
+        # Define aux paths even if not saved, for potential deletion
+        optim_output_path = f"{base_output_name}.optim"
+        sched_output_path = f"{base_output_name}.sched"
+        scaler_output_path = f"{base_output_name}.scaler"
+        # --- End Filename Components ---
 
-        # --- Saving Logic ---
         print(f"\nSaving checkpoint: {base_output_name} (Step: {current_step_num})")
         try:
+            # --- Delete OLD Best Checkpoint FIRST (if this is a new best) ---
+            if is_best:
+                # Check if we have a record of the PREVIOUS best model's path
+                if self.current_best_val_model_path and os.path.exists(self.current_best_val_model_path):
+                     # Check if the file we are about to save is DIFFERENT from the stored previous best
+                     if os.path.abspath(model_output_path) != os.path.abspath(self.current_best_val_model_path):
+                          try:
+                               print(f"  Removing previous best model checkpoint: {os.path.basename(self.current_best_val_model_path)}")
+                               os.remove(self.current_best_val_model_path)
+                               # Remove corresponding aux files ONLY if save_aux was likely True when THEY were saved
+                               # This is tricky. Simpler: don't save/delete aux for _best_val saves at all.
+                          except OSError as e:
+                               print(f"  Warning: Could not remove previous best checkpoint file: {e}")
+                     else:
+                          # If the filename is the same (e.g. re-saving best at same step), don't delete.
+                           print(f"  New best model has same name as previous, not removing.")
+            # --- End Delete OLD ---
+
+            # --- Save CURRENT Checkpoint Files ---
             # Save Model (safetensors)
             save_file(self.model.state_dict(), model_output_path)
 
-            # Save Optimizer State (standard torch save)
-            torch.save(self.optimizer.state_dict(), optim_output_path)
+            # Optionally Save Aux Files
+            if save_aux:
+                print("  Saving auxiliary files (optim, sched, scaler)...")
+                torch.save(self.optimizer.state_dict(), optim_output_path)
+                if self.scheduler is not None: torch.save(self.scheduler.state_dict(), sched_output_path)
+                if self.scaler is not None and self.scaler.is_enabled(): torch.save(self.scaler.state_dict(), scaler_output_path)
+            # --- End Save CURRENT ---
 
-            # Save Scheduler State (if exists)
-            if self.scheduler is not None:
-                torch.save(self.scheduler.state_dict(), f"{base_output_name}.sched")
+            print(f"Checkpoint base ({os.path.basename(model_output_path)}) saved successfully.")
 
-            # Save Scaler State (if enabled)
-            if self.scaler is not None and self.scaler.is_enabled():
-                torch.save(self.scaler.state_dict(), f"{base_output_name}.scaler")
-
-            print("Checkpoint saved successfully.")
-
-            # --- Best Model Handling ---
+            # --- Update Path if This Was the Best Model ---
             if is_best:
-                 # Define the path for the single best model file
-                 best_model_symlink_path = f"./{SAVE_FOLDER}/{self.name}_best_val.safetensors"
-                 best_optim_symlink_path = f"./{SAVE_FOLDER}/{self.name}_best_val.optim"
-                 # Remove previous best model file if it exists
-                 if self.best_val_checkpoint_path and os.path.exists(self.best_val_checkpoint_path):
-                      try:
-                           print(f"  Removing previous best model checkpoint: {os.path.basename(self.best_val_checkpoint_path)}")
-                           os.remove(self.best_val_checkpoint_path)
-                           # Also remove corresponding optimizer state
-                           old_best_optim = f"{os.path.splitext(self.best_val_checkpoint_path)[0]}.optim"
-                           if os.path.exists(old_best_optim): os.remove(old_best_optim)
-                           # Add sched/scaler removal if needed
-                      except OSError as e:
-                           print(f"  Warning: Could not remove previous best checkpoint file: {e}")
-
-                 # Copy the current checkpoint to be the new best one (overwrite if exists)
-                 try:
-                      shutil.copy2(model_output_path, best_model_symlink_path)
-                      shutil.copy2(optim_output_path, best_optim_symlink_path)
-                      print(f"  Copied as new best model: {os.path.basename(best_model_symlink_path)}")
-                      # Store the path of the checkpoint *that this best model represents*
-                      self.best_val_checkpoint_path = model_output_path
-                 except Exception as e:
-                      print(f"  Warning: Could not copy checkpoint as best model: {e}")
-            # --- End Best Model Handling ---
+                self.current_best_val_model_path = model_output_path # Store the path we just saved
+                print(f"  Marked {os.path.basename(model_output_path)} as new best model path.")
+            # --- End Update Path ---
 
         except Exception as e:
             print(f"Error saving checkpoint {base_output_name}: {e}")
-
+    # --- End Model Saving ---
 
     def close(self):
         """Closes the CSV log file."""

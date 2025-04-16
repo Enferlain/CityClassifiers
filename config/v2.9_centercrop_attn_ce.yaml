@@ -1,0 +1,39 @@
+model:
+  base: "AnatomyFlaws"
+  # Let's use a new revision name now to avoid confusion!
+  rev:  "v3.0_centercrop_attn_fl" # New revision name
+  arch: class            # <--- Ensure this says 'class'
+  embed_ver: siglip2_so400m_patch16_512_CenterCrop
+
+train:
+  lr:    1e-4     # Start with a potentially lower LR for stability
+  steps: 50000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
+  batch: 32        # Increase batch size slightly if VRAM allows? (optional)
+
+  # Optimizer specific args (can be overridden by command line)
+  optimizer: ADOPTAOScheduleFree # Specify default optimizer
+  loss_function: focal
+  betas: [0.9, 0.999] # Default ADOPT betas
+  weight_decay: 1e-3  # Start with some weight decay
+  eps: 1e-6           # Default ADOPT eps
+  # ScheduleFree Params (defaults usually fine)
+  r_sf: 0.0
+  wlpow_sf: 2.0
+  # ADOPTAO Params (defaults usually fine)
+  state_precision: parameter
+  adaptive_clip: 1.0
+  adaptive_clip_eps: 1e-3
+
+  # Scheduler args (Not used by ScheduleFree, but maybe keep for reference)
+  # cosine: True
+  # warmup_steps: 500
+
+# --- Add this 'labels' section ---
+labels:
+  0: # Corresponds to folder "0"
+    name: "Bad Anatomy"
+    loss: 1.0            # Optional: Adjust loss weight if needed later
+  1: # Corresponds to folder "1"
+    name: "Good Anatomy"
+    loss: 1.0            # Optional: Adjust loss weight if needed later
+# --- End Add ---
