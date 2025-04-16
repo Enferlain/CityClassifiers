@@ -1,79 +1,71 @@
-# Version: 2.1.1
-# Desc: Enabled TF32, fixed potential undefined 'val' variable.
+# Version: 2.2.0 (Refactored for Clarity and Loss Selection)
 import os
 import sys
-
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from safetensors.torch import load_file
 import wandb
-import math # Added for isnan check
-from utils import ModelWrapper, get_embed_params, parse_args, write_config, LOG_EVERY_N, FocalLoss
+import math
+import torch.nn as nn               # <--- Added nn import
+import torch.nn.functional as F     # <--- Added functional import
 
-# Add the directory containing 'train.py' to the path
-# This ensures Python looks for the 'optimizer' folder relative to 'train.py'
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-optimizer_dir_path = os.path.join(current_script_dir, 'optimizer') # Construct full path
-
-# Check if the optimizer directory exists before adding to path
-if os.path.isdir(optimizer_dir_path):
-     print(f"Adding optimizer directory to sys.path: {current_script_dir}") # Use current_script_dir for clarity
-     # Add the *parent* directory of 'optimizer' so 'import optimizer' works
-     if current_script_dir not in sys.path:
-         sys.path.insert(0, current_script_dir)
-else:
-     print(f"Warning: Optimizer directory not found at {optimizer_dir_path}")
-
-# --- Remove try/except temporarily to see the full error ---
-
-from optimizer.fmarscrop import FMARSCropV3ExMachina # Example FMARSCrop
-from optimizer.adopt import ADOPT # Example ADOPT
-from optimizer.schedulefree import ( # Example ScheduleFree
-    ScheduleFreeWrapper,
-    ADOPTScheduleFree,
-    ADOPTAOScheduleFree
+# --- Local Imports ---
+# Assuming utils.py is in the same directory or accessible
+from utils import (
+    ModelWrapper, get_embed_params, parse_and_load_args, write_config, # <<< CHANGED HERE
+    LOG_EVERY_N, FocalLoss
 )
-print("Imported ScheduleFree variants")
-# <-- Add imports for any other specific optimizers you want to use
-optimizers_available = True
-# except ImportError as e:
-#     print(f"Warning: Custom optimizer import failed ({e}). Check dependencies within optimizer files. Only AdamW available.")
-#     FMARSCropV3ExMachina = None
-#     ADOPT = None
-#     ScheduleFreeWrapper = None
-#     ADOPTScheduleFree = None
-#     ADOPTAOScheduleFree = None
-#     optimizers_available = False
-# --- End temporary modification ---
-
-from dataset import EmbeddingDataset # ImageDataset might need similar update if used
-from utils import ModelWrapper, get_embed_params, parse_args, write_config, LOG_EVERY_N # Import LOG_EVERY_N
+from dataset import EmbeddingDataset
 from model import PredictorModel
 
-# --- Enable TF32 potentially speeds up fp32 operations on Ampere+ ---
-# Check if CUDA is available before trying to set backend flags
+# --- Optimizer Imports ---
+# Add the directory containing 'train.py' to the path for optimizer imports
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+optimizer_dir_path = os.path.join(current_script_dir, 'optimizer')
+if os.path.isdir(optimizer_dir_path):
+    print(f"Adding optimizer directory to sys.path: {current_script_dir}")
+    if current_script_dir not in sys.path:
+        sys.path.insert(0, current_script_dir)
+else:
+    print(f"Warning: Optimizer directory not found at {optimizer_dir_path}")
+
+try:
+    from optimizer.fmarscrop import FMARSCropV3ExMachina
+    from optimizer.adopt import ADOPT
+    from optimizer.schedulefree import (
+        ScheduleFreeWrapper, ADOPTScheduleFree, ADOPTAOScheduleFree
+    )
+    print("Imported custom optimizers.")
+    optimizers_available = True
+except ImportError as e:
+    print(f"Warning: Custom optimizer import failed ({e}). Check dependencies. Only AdamW/standard torch optims available.")
+    FMARSCropV3ExMachina = None
+    ADOPT = None
+    ScheduleFreeWrapper = None
+    ADOPTScheduleFree = None
+    ADOPTAOScheduleFree = None
+    optimizers_available = False
+# --- End Optimizer Imports ---
+
+# --- Global Settings ---
+TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 if torch.cuda.is_available():
-    # These lines enable TensorFloat-32 for matrix multiplications and convolutions on supported hardware.
-    # It can provide a significant speedup for fp32 operations with minimal precision loss.
-    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for matrix multiplications
-    torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for cuDNN convolution operations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     print("TF32 support enabled for CUDA operations.")
 else:
     print("CUDA not available, TF32 settings not applied.")
-# --- End TF32 ---
+torch.backends.cudnn.benchmark = True
+torch.manual_seed(0)
+# --- End Global Settings ---
 
+# ================================================
+#        Setup Functions
+# ================================================
 
-torch.backends.cudnn.benchmark = True  # Enable cuDNN benchmark mode (good if input sizes don't vary much)
-torch.manual_seed(0)  # Set random seed for reproducibility
-
-TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"  # Use CPU if CUDA not found
-print(f"Using target device: {TARGET_DEV}")
-
-if __name__ == "__main__":
-    args = parse_args()  # !! REMINDER: Add args for optimizer choice, hyperparameters, and --precision in optimizer_utils.py !!
-
-    # --- Configure Precision ---
+def setup_precision(args):
+    """Sets up training precision based on args."""
     precision_arg = getattr(args, 'precision', 'fp32').lower()
     enabled_amp = False
     amp_dtype = torch.float32
@@ -85,137 +77,156 @@ if __name__ == "__main__":
             print("Using fp16 mixed precision.")
         else:
             print("Warning: fp16 requested but CUDA is not available. Falling back to fp32.")
-            precision_arg = 'fp32'
     elif precision_arg == 'bf16':
         if TARGET_DEV == 'cuda' and torch.cuda.is_bf16_supported():
             amp_dtype = torch.bfloat16
             enabled_amp = True
             print("Using bf16 mixed precision.")
         else:
-            if TARGET_DEV != 'cuda':
-                print("Warning: bf16 requested but CUDA is not available. Falling back to fp32.")
-            else:
-                print("Warning: bf16 requested but not supported by hardware. Falling back to fp32.")
-            precision_arg = 'fp32'  # Fallback
+            if TARGET_DEV != 'cuda': print("Warning: bf16 requested but CUDA is not available. Falling back to fp32.")
+            else: print("Warning: bf16 requested but not supported by hardware. Falling back to fp32.")
     else:
         print("Using fp32 precision.")
-        if precision_arg != 'fp32':
-            print(f"Warning: Unknown precision '{precision_arg}' specified. Using fp32.")
-    # --- End Precision Config ---
+        if precision_arg not in ['fp32']:
+             print(f"Warning: Unknown precision '{precision_arg}' specified. Using fp32.")
 
-    # --- Initialize Wandb (Keep as before) ---
+    return amp_dtype, enabled_amp
+
+def setup_wandb(args):
+    """Initializes Weights & Biases if available and enabled."""
+    if not hasattr(wandb, 'init'): # Check if wandb was imported successfully
+         print("Wandb library not available.")
+         return None
     try:
-        wandb.init(
-            project="city-classifiers",  # Or your preferred project name
-            name=args.name,  # Use the model name for the run name
-            config=vars(args)  # Log all command-line args/config from optimizer_utils.py
+        wandb_run = wandb.init(
+            project=getattr(args, 'wandb_project', 'city-classifiers'),
+            name=args.name,
+            config=vars(args)
         )
         print("Weights & Biases initialized successfully.")
+        return wandb_run
     except Exception as e:
         print(f"Could not initialize Weights & Biases: {e}. Training without wandb logging.")
-        wandb = None  # Set wandb to None if initialization fails
-    # --- Wandb Initialized ---
+        return None
 
-    # v2.3.0: Use args.embed_ver instead of args.clip
+def setup_dataloaders(args):
+    """Sets up the dataset and dataloaders."""
     data_root_path = getattr(args, 'data_root', 'data')
-
-    # --- Determine dataset version ---
-    # The dataset folder name is directly determined by embed_ver in the config now
-    dataset_version = args.embed_ver  # <<< Use the correct attribute directly
-
-    # We can remove the special check for "CCAnatomy-AnatomyFlaws" base name,
-    # as the config YAML should specify the correct embed_ver (like "CLIP-Anatomy" or "SIGLIP2-SO400M-512")
-    # if args.base == "CCAnatomy-AnatomyFlaws":
-    #     print(f"Anatomy config base name detected ({args.base}), using embed_ver: {args.embed_ver}")
-    # --- End dataset version determination ---
+    dataset_version = args.embed_ver
     print(f"Using dataset version (folder name): {dataset_version}")
 
     try:
-        # Pass the validation split count to the dataset constructor
         dataset = EmbeddingDataset(
-            dataset_version,  # Pass the correctly determined version
+            dataset_version,
             root=data_root_path,
             mode=args.arch,
-            preload=True,  # Consider preload=False if RAM is an issue
+            preload=getattr(args, 'preload_data', True),
             validation_split_count=args.val_split_count,
-            seed=218  # Assuming seed is okay as default
+            seed=getattr(args, 'seed', 218)
         )
     except Exception as e:
         print(f"Error creating dataset: {e}")
-        # Consider adding more detail, e.g., which dataset_version folder failed
-        print(f"  Check if dataset folder exists: {os.path.join(data_root_path, dataset_version)}")
+        print(f"Check if dataset folder exists: {os.path.join(data_root_path, dataset_version)}")
         exit(1)
 
-    # Training DataLoader uses the main dataset instance (which now only has training shards)
-    loader = DataLoader(
+    train_loader = DataLoader(
         dataset,
         batch_size=args.batch,
         shuffle=True,
         drop_last=True,
         pin_memory=False,
-        num_workers=0, # Set num_workers > 0 if not using preload=True or ImageDataset
-        collate_fn=dataset.collate_ignore_none if hasattr(dataset, 'collate_ignore_none') else None # Use the collate_fn from dataset if available
+        num_workers=getattr(args, 'num_workers', 0),
+        collate_fn=getattr(dataset, 'collate_ignore_none', None)
     )
 
-    # Create Validation DataLoader
     val_loader = dataset.get_validation_loader(
-        batch_size=args.batch * 2, # Can often use larger batch for validation
-        num_workers=0 # Use 0 if validation data is preloaded
+        batch_size=args.batch * 2,
+        num_workers=getattr(args, 'num_workers', 0)
     )
     if val_loader:
         print(f"Created validation loader with {len(val_loader.dataset)} samples.")
     else:
         print("No validation split requested or possible, skipping validation during training.")
 
-    # --- Model Definition (No Change) ---
+    return dataset, train_loader, val_loader
+
+def setup_model_criterion(args, dataset):
+    """Sets up the model and criterion based on args."""
+    criterion = None
+    model = None
+    loss_function_name = getattr(args, 'loss_function', None) # Get loss func name from args/config
+
+    embed_params = get_embed_params(args.embed_ver)
+
     if args.arch == "score":
-        # Make sure criterion handles potential NaN outputs if model or target is bad
-        criterion = torch.nn.MSELoss(reduction='mean') # Specify reduction for clarity
-        model = PredictorModel(
-            outputs=1,
-            **get_embed_params(args.embed_ver)
-        )
+        num_outputs = 1
+        # Select scorer loss function
+        if loss_function_name == 'l1':
+            print("Using L1Loss for scorer.")
+            criterion = nn.L1Loss(reduction='mean')
+        elif loss_function_name == 'mse':
+            print("Using MSELoss (L2) for scorer.")
+            criterion = nn.MSELoss(reduction='mean')
+        else: # Default for scorer
+            print("Defaulting to L1Loss for scorer.")
+            criterion = nn.L1Loss(reduction='mean')
+
     elif args.arch == "class":
-        args.num_labels = args.num_labels or dataset.num_labels
-        if args.num_labels != dataset.num_labels:
+        num_outputs = getattr(args, 'num_labels', None) or dataset.num_labels
+        if getattr(args, 'num_labels', None) and args.num_labels != dataset.num_labels:
              print(f"Warning: Label count mismatch! Config/Args: {args.num_labels}, Dataset: {dataset.num_labels}. Using dataset value.")
-             args.num_labels = dataset.num_labels # Prioritize dataset derived value
+             args.num_labels = dataset.num_labels # Update args to match dataset
 
-        # +++ START OF NEW CODE TO PASTE +++
-        # Use Focal Loss instead of CrossEntropyLoss
-        print("Using Focal Loss (gamma=2.0)")  # Log that we're using it
-        criterion = FocalLoss(gamma=2.0)  # Default gamma=2, reduction='mean'
-        # NOTE: We are ignoring class weights for this basic Focal Loss implementation.
-        # +++ END OF NEW CODE TO PASTE +++
+        # Select classifier loss function
+        if loss_function_name == 'focal':
+            print("Using Focal Loss (gamma=2.0) for classifier.")
+            criterion = FocalLoss(gamma=getattr(args, 'focal_loss_gamma', 2.0))
+            # Note: Basic FocalLoss here ignores class weights from args.weights
+        elif loss_function_name == 'crossentropy':
+            print("Using CrossEntropyLoss for classifier.")
+            weights = None
+            if args.weights and len(args.weights) == num_outputs:
+                weights = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32)
+                print(f"Class weights: {args.weights}")
+            elif args.weights:
+                print(f"Warning: Mismatch weights ({len(args.weights)}) vs labels ({num_outputs}). Ignoring weights.")
+            criterion = nn.CrossEntropyLoss(weight=weights)
+        else: # Default for classifier
+            print("Defaulting to CrossEntropyLoss for classifier.")
+            criterion = nn.CrossEntropyLoss() # No weights by default
 
-        model = PredictorModel(
-            outputs=args.num_labels,
-            **get_embed_params(args.embed_ver)
-        )
     else:
         raise ValueError(f"Unknown model architecture '{args.arch}'")
 
+    # Instantiate the model
+    # Pass attention params from args if they exist, otherwise defaults in PredictorModel apply
+    model_init_kwargs = embed_params.copy()
+    model_init_kwargs["outputs"] = num_outputs
+    if hasattr(args, 'num_attn_heads'): model_init_kwargs['num_attn_heads'] = args.num_attn_heads
+    if hasattr(args, 'attn_dropout'): model_init_kwargs['attn_dropout'] = args.attn_dropout
+
+    model = PredictorModel(**model_init_kwargs)
     model.to(TARGET_DEV)
 
-    # --- Optimizer Selection (Keep as before) ---
+    return model, criterion
+
+def setup_optimizer_scheduler(args, model):
+    """Sets up the optimizer and scheduler based on args."""
     optimizer = None
+    scheduler = None
     is_schedule_free = False
     optimizer_name = getattr(args, 'optimizer', 'AdamW').lower()
     print(f"Using optimizer: {optimizer_name}")
-    # (Optimizer selection logic remains the same as previous version)
-    # Example for AdamW:
+
+    # --- Optimizer Selection Logic ---
     if optimizer_name == 'adamw':
         optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(args.lr),
-            betas=tuple(getattr(args, 'betas', (0.9, 0.999))),  # Ensure betas is a tuple
-            weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            eps=float(getattr(args, 'eps', 1e-8)),
+            model.parameters(), lr=float(args.lr), betas=tuple(getattr(args, 'betas', (0.9, 0.999))),
+            weight_decay=float(getattr(args, 'weight_decay', 0.0)), eps=float(getattr(args, 'eps', 1e-8)),
         )
-
-        # --- ADD THIS BLOCK ---
-    elif optimizer_name == 'fmarscropv3exmachina' and 'FMARSCropV3ExMachina' in globals() and FMARSCropV3ExMachina is not None:
+    elif optimizer_name == 'fmarscropv3exmachina' and FMARSCropV3ExMachina is not None:
         print("Instantiating FMARSCropV3ExMachina...")
+        # +++ START ADDED BLOCK +++
         try:
             # Gather necessary args from the 'args' object (set by config/defaults)
             fmarscrop_args = {
@@ -224,286 +235,309 @@ if __name__ == "__main__":
                 'eps': float(getattr(args, 'eps', 1e-6)),
                 'weight_decay': float(getattr(args, 'weight_decay', 1e-3)),
                 'gamma': float(getattr(args, 'gamma', 0.005)),
-                # Include other relevant defaults from FMARSCropV3ExMachina.__init__ if needed
+                # Include other relevant defaults if needed by constructor
                 'eps2': float(getattr(args, 'eps2', 1e-2)),
                 'eps_floor': getattr(args, 'eps_floor', None),
                 'centralization': float(getattr(args, 'centralization', 0.0)),
                 'moment_centralization': float(getattr(args, 'moment_centralization', 0.0)),
-                'diff_mult': float(getattr(args, 'diff_mult', 1.0)),  # Default might vary between FMARS versions
-                'momentum_lambda': float(getattr(args, 'momentum_lambda', 2.0)),  # Default for V3Ex
-                # 'clip': float(getattr(args, 'clip', 1.0)),  # Default for V3Ex
-                'adaptive_clip': float(getattr(args, 'adaptive_clip', 1.0)),  # Default for V3Ex
-                'adaptive_clip_eps': float(getattr(args, 'adaptive_clip_eps', 1e-3)),  # Default for V3Ex
-                'adaptive_clip_type': getattr(args, 'adaptive_clip_type', 'global'),  # Default for V3Ex
-                'stable_weight_decay': bool(getattr(args, 'stable_weight_decay', False)),  # Default for V3Ex
-                'debias_beta1': bool(getattr(args, 'debias_beta1', False)),  # Default for V3Ex
-                'debias_beta2': bool(getattr(args, 'debias_beta2', False)),  # Default for V3Ex
-                'use_muon_pp': bool(getattr(args, 'use_muon_pp', False)),  # Default for V3Ex
-                'update_strategy': getattr(args, 'update_strategy', 'cautious'),  # Default for V3Ex
-                'stable_update': bool(getattr(args, 'stable_update', False)),  # Default for V3Ex
-                'atan2_denom': bool(getattr(args, 'atan2_denom', False)),  # Default for V3Ex
-                'use_orthograd': bool(getattr(args, 'use_orthograd', False)),  # Default for V3Ex
+                'diff_mult': float(getattr(args, 'diff_mult', 1.0)),
+                'momentum_lambda': float(getattr(args, 'momentum_lambda', 2.0)),
+                'adaptive_clip': float(getattr(args, 'adaptive_clip', 1.0)),
+                'adaptive_clip_eps': float(getattr(args, 'adaptive_clip_eps', 1e-3)),
+                'adaptive_clip_type': getattr(args, 'adaptive_clip_type', 'global'),
+                'stable_weight_decay': bool(getattr(args, 'stable_weight_decay', False)),
+                'debias_beta1': bool(getattr(args, 'debias_beta1', False)),
+                'debias_beta2': bool(getattr(args, 'debias_beta2', False)),
+                'use_muon_pp': bool(getattr(args, 'use_muon_pp', False)),
+                'update_strategy': getattr(args, 'update_strategy', 'cautious'),
+                'stable_update': bool(getattr(args, 'stable_update', False)),
+                'atan2_denom': bool(getattr(args, 'atan2_denom', False)),
+                'use_orthograd': bool(getattr(args, 'use_orthograd', False)),
             }
-            # Filter out None values if the optimizer __init__ doesn't handle them
-            # fmarscrop_args = {k: v for k, v in fmarscrop_args.items() if v is not None} # Optional filtering
-
+            # Filter out None values ONLY if the constructor *cannot* handle them
+            # fmarscrop_args = {k: v for k, v in fmarscrop_args.items() if v is not None}
             optimizer = FMARSCropV3ExMachina(model.parameters(), **fmarscrop_args)
-        except TypeError as e:
-            print(
-                f"ERROR: Failed to instantiate FMARSCropV3ExMachina. Check arguments in config/defaults vs optimizer __init__.")
+        except (TypeError, AttributeError) as e:  # Catch errors if args mismatch
+            print(f"ERROR: Failed to instantiate FMARSCropV3ExMachina. Check arguments.")
             print(f"  Error details: {e}")
             print("  Falling back to AdamW.")
             optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr))  # Fallback
-    # --- END ADD BLOCK ---
 
-    elif optimizer_name == 'adoptaoschedulefree' and 'ADOPTAOScheduleFree' in globals() and ADOPTAOScheduleFree is not None:
-        optimizer = ADOPTAOScheduleFree(
-            model.parameters(),
-            lr=float(args.lr),
-            betas=tuple(getattr(args, 'betas', (0.9, 0.9999))),  # Ensure betas is tuple
-            weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            eps=float(getattr(args, 'eps', 1e-6)),
-            r=float(getattr(args, 'r_sf', 0.0)),
-            weight_lr_power=float(getattr(args, 'wlpow_sf', 2.0)),
-            state_precision=getattr(args, 'state_precision', 'parameter'),
-            # ... other ADOPTAOScheduleFree params ...
-        )
+    elif optimizer_name == 'adoptaoschedulefree' and ADOPTAOScheduleFree is not None:
+        # Gather args specifically for ADOPTAOScheduleFree
+        adopt_args = {k: getattr(args, k) for k in [
+            'lr', 'betas', 'weight_decay', 'eps', 'eps2', 'eps_floor',
+            'weight_decouple', 'stable_weight_decay',
+            'adaptive_clip', 'adaptive_clip_eps', 'adaptive_clip_type', # <--- Includes adaptive_clip_eps
+            'debias_beta2', 'use_beta2_warmup', 'beta2_warmup_initial', 'beta2_warmup_steps',
+            'mars_gamma', 'use_muon_pp', 'r', 'weight_lr_power',
+            'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd',
+            'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step', 'spam_clipping_type',
+            'state_precision'] if hasattr(args, k)}
+
+        # --- Add/Ensure this conversion exists ---
+        if 'adaptive_clip_eps' in adopt_args and adopt_args['adaptive_clip_eps'] is not None:
+             try: adopt_args['adaptive_clip_eps'] = float(adopt_args['adaptive_clip_eps'])
+             except ValueError: print(f"Warning: Could not convert adaptive_clip_eps '{adopt_args['adaptive_clip_eps']}' to float. Using default?") # Handle
+
+        # Convert types as needed
+        adopt_args['lr'] = float(adopt_args['lr'])
+        adopt_args['betas'] = tuple(adopt_args['betas'])
+        adopt_args['weight_decay'] = float(adopt_args.get('weight_decay', 0.0))
+        adopt_args['eps'] = float(adopt_args.get('eps', 1e-6))
+        adopt_args['r'] = float(adopt_args.get('r', 0.0)) # Use get for non-essential args
+        adopt_args['weight_lr_power'] = float(adopt_args.get('weight_lr_power', 2.0))
+        # Remove None values if constructor doesn't handle them
+        adopt_args = {k: v for k, v in adopt_args.items() if v is not None}
+
+        optimizer = ADOPTAOScheduleFree(model.parameters(), **adopt_args)
         is_schedule_free = True
-    # ... Fallback to AdamW ...
+    # Add elif blocks for other custom optimizers (ADOPT, ScheduleFreeWrapper) if needed...
     else:
         if optimizer_name != 'adamw':
             print(f"Warning: Optimizer '{optimizer_name}' not found or not supported. Falling back to AdamW.")
+        # Fallback to AdamW
         optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(args.lr),
-            betas=tuple(getattr(args, 'betas', (0.9, 0.999))),
-            weight_decay=float(getattr(args, 'weight_decay', 0.0)),
-            eps=float(getattr(args, 'eps', 1e-8)),
+            model.parameters(), lr=float(args.lr), betas=tuple(getattr(args, 'betas', (0.9, 0.999))),
+            weight_decay=float(getattr(args, 'weight_decay', 0.0)), eps=float(getattr(args, 'eps', 1e-8)),
         )
+    # --- End Optimizer Selection ---
 
-    # --- Scheduler Initialization (Conditional - Keep as before) ---
-    scheduler = None
+    # --- Scheduler Setup ---
     if not is_schedule_free:
-        if args.cosine:
-            print("Using CosineAnnealingLR")
-            # Ensure T_max is at least 1
+        if getattr(args, 'cosine', True): # Default to cosine if not schedule free
+            print("Using CosineAnnealingLR Scheduler.")
             t_max_steps = max(1, int(args.steps / args.batch))
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=t_max_steps,
-            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max_steps)
+        elif getattr(args, 'warmup_steps', 0) > 0:
+            print("Using LinearLR Warmup Scheduler.")
+            warmup_iters = max(1, int(args.warmup_steps / args.batch))
+            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_iters)
         else:
-            print("Using LinearLR Warmup")
-            # Ensure total_iters is at least 1
-            warmup_iters = max(1, int(getattr(args, 'warmup_steps', 5000) / args.batch))
-            scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=0.1,
-                end_factor=1.0,
-                total_iters=warmup_iters,
-            )
+             print("No scheduler specified or needed (not schedule-free, no cosine, no warmup).")
     else:
         print("Using a schedule-free optimizer, no scheduler will be used.")
+    # --- End Scheduler Setup ---
 
-    # --- Initialize GradScaler ---
-    # Enabled=False just makes its methods no-ops if not using AMP / on CPU
-    scaler = torch.cuda.amp.GradScaler(enabled=(enabled_amp and TARGET_DEV == 'cuda'))
-    print(f"GradScaler enabled: {scaler.is_enabled()}")
-    # --- End GradScaler ---
+    return optimizer, scheduler, is_schedule_free
 
-    # --- Resume Logic (Modified Scaler Part) ---
-    start_step = 0  # Keep track of starting step for resuming progress bar
+def load_checkpoint(args, model, optimizer, scheduler, scaler):
+    """Loads state from checkpoint if args.resume is provided."""
+    start_step = 0
     if args.resume:
         print(f"Resuming from {args.resume}")
         if not os.path.isfile(args.resume):
-            print(f"Error: Resume file not found: {args.resume}")
-            exit(1)
+            print(f"Error: Resume file not found: {args.resume}"); exit(1)
 
-        model.load_state_dict(load_file(args.resume))
+        try:
+             model.load_state_dict(load_file(args.resume))
+        except Exception as e:
+             print(f"Error loading model state_dict: {e}"); exit(1)
 
         optim_path = f"{os.path.splitext(args.resume)[0]}.optim.pth"
+        sched_path = f"{os.path.splitext(args.resume)[0]}.sched.pth"
+        scaler_path = f"{os.path.splitext(args.resume)[0]}.scaler.pth"
+
         if os.path.exists(optim_path):
-            optimizer.load_state_dict(torch.load(optim_path, map_location=TARGET_DEV))  # Load to correct device
-            print("Optimizer state loaded.")
-            # Find the step number from the checkpoint filename if possible
-            try:
-                step_str = args.resume.split('_s')[-1].split('K')[0].split('M')[0]
-                scale = 1000 if 'K' in args.resume else (1000000 if 'M' in args.resume else 1)
-                start_step = int(float(step_str) * scale)
-                print(f"Attempting to resume progress from step ~{start_step}")
-            except:
-                print("Could not determine step number from checkpoint filename.")
+            try: optimizer.load_state_dict(torch.load(optim_path, map_location=TARGET_DEV)); print("Optimizer state loaded.")
+            except Exception as e: print(f"Warning: Could not load optimizer state: {e}")
+        else: print("Warning: Optimizer state file not found. Starting fresh.")
 
-            # Optional: try to load scheduler state if it exists
-            sched_path = f"{os.path.splitext(args.resume)[0]}.sched.pth"
-            if scheduler is not None and os.path.exists(sched_path):
-                scheduler.load_state_dict(torch.load(sched_path, map_location=TARGET_DEV))
-                print("Scheduler state loaded.")
-            # Optional: try to load scaler state
-            scaler_path = f"{os.path.splitext(args.resume)[0]}.scaler.pth"
-            if scaler.is_enabled() and os.path.exists(scaler_path):
-                scaler.load_state_dict(torch.load(scaler_path, map_location=TARGET_DEV))
-                print("GradScaler state loaded.")
+        if scheduler is not None and os.path.exists(sched_path):
+             try: scheduler.load_state_dict(torch.load(sched_path, map_location=TARGET_DEV)); print("Scheduler state loaded.")
+             except Exception as e: print(f"Warning: Could not load scheduler state: {e}")
 
-        else:
-            print(f"Warning: Optimizer state file not found at {optim_path}. Starting with fresh optimizer state.")
-    # --- End Resume Logic ---
+        if scaler.is_enabled() and os.path.exists(scaler_path):
+             try: scaler.load_state_dict(torch.load(scaler_path, map_location=TARGET_DEV)); print("GradScaler state loaded.")
+             except Exception as e: print(f"Warning: Could not load GradScaler state: {e}")
 
-    # --- Config and Wrapper (Pass potentially None scheduler) ---
-    write_config(args)
-    # !! REMINDER: ModelWrapper needs modification for wandb logging & optimizer.eval/train !!
-    wrapper = ModelWrapper(
-        name=args.name,
-        model=model,
-        device=TARGET_DEV,
-        # dataset=dataset,
-        num_labels=dataset.num_labels if args.arch == 'class' else 1,
-        # Pass num_labels explicitly if needed by wrapper logging
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,  # Pass scheduler (might be None)
-        scaler=scaler,  # Pass scaler
-        wandb_run=wandb  # Pass wandb run object
-    )
+        # Try to determine start step from filename
+        try:
+            step_str = args.resume.split('_s')[-1].split('.')[0].split('_')[0] # More robust split
+            scale = 1
+            if 'K' in step_str: scale = 1000; step_str = step_str.replace('K', '')
+            elif 'M' in step_str: scale = 1000000; step_str = step_str.replace('M', '')
+            start_step = int(float(step_str) * scale)
+            print(f"Attempting to resume progress from step ~{start_step}")
+        except:
+            print("Could not determine step number from checkpoint filename.")
+            start_step = 0 # Default to 0 if parse fails
+    return start_step
 
-    # --- Set Optimizer Train Mode (Keep as before) ---
+# ================================================
+#        Main Training Loop Function
+# ================================================
+
+def train_loop(args, model, criterion, optimizer, scheduler, scaler,
+               train_loader, val_loader, wrapper, start_step, enabled_amp, amp_dtype):
+    """Runs the main training loop."""
+
     if hasattr(optimizer, 'train') and callable(optimizer.train):
         print("Setting optimizer to train mode.")
         optimizer.train()
+    model.train()
 
-    model.train() # Set model to train mode initially
-    progress = tqdm(total=args.steps, initial=start_step)
+    progress = tqdm(total=args.steps, initial=start_step, desc="Training")
     if start_step > 0:
         progress.n = start_step
         progress.last_print_n = start_step
 
     current_step = start_step
-    best_eval_loss = float('inf') # Keep track of best validation loss
+    best_eval_loss = float('inf')
 
     while current_step < args.steps:
-        for batch in loader:
+        for batch in train_loader:
             if current_step >= args.steps: break
-            if batch is None: # Handle None batch from collate_ignore_none
-                 print(f"Warning: Skipping step {current_step} due to invalid batch (likely data loading error).")
-                 # Optionally increment step counter even if skipping? Depends on desired behavior.
-                 # current_step += args.batch # If you want skipped batches to count towards total steps
-                 progress.update(args.batch) # Update progress bar anyway
-                 continue # Skip this iteration
+            if batch is None:
+                print(f"Warning: Skipping step {current_step} due to invalid batch.")
+                progress.update(args.batch)
+                continue
 
-            # Ensure batch items are on the correct device
             emb = batch.get("emb").to(TARGET_DEV)
-            val = batch.get("val") # Keep on CPU initially if processing needed
-
+            val = batch.get("val")
             if val is None:
-                print(f"Error: 'val' is None in batch at step {current_step}. Skipping step.")
+                print(f"Error: 'val' is None in batch at step {current_step}. Skipping.")
                 progress.update(args.batch)
                 continue
 
-            # Move target value 'val' to device and ensure correct dtype
-            if args.arch == "score":
-                val = val.to(TARGET_DEV, dtype=torch.float32)
-            # v2.2.3: Correct target tensor preparation for CrossEntropyLoss
-            elif args.arch == "class":
-                # Target for CrossEntropyLoss needs to be 1D LongTensor of class indices
-                if val is None:  # Check if val was loaded correctly
-                    print(f"Error: Target 'val' is None in batch at step {current_step}. Skipping.")
-                    progress.update(args.batch)
-                    continue  # Skip this batch
+            # --- Prepare Target Tensor ---
+            try:
+                if args.arch == "score":
+                    # Scorer needs Float target, shape [B]
+                    val = val.to(TARGET_DEV, dtype=torch.float32).squeeze()
+                    if val.ndim != 1: raise ValueError(f"Scorer target shape {val.shape} != 1D")
+                elif args.arch == "class":
+                    # Classifier needs Long target, shape [B]
+                    val = val.squeeze().to(dtype=torch.long, device=TARGET_DEV) # Squeeze first, then convert
+                    if val.ndim != 1: raise ValueError(f"Classifier target shape {val.shape} != 1D")
+            except Exception as e:
+                print(f"Error processing target tensor 'val' at step {current_step}: {e}")
+                print(f"  Original val shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
+                progress.update(args.batch); continue
+            # --- End Target Prep ---
 
-                try:
-                    # Dataset returns shape [B, 1], squeeze to [B] and convert to long
-                    val = val.squeeze(-1).to(dtype=torch.long, device=TARGET_DEV)
-                    # Shape check after processing
-                    if val.ndim != 1 or val.shape[0] != emb.shape[0]:
-                        raise ValueError(f"Processed target shape {val.shape} is not 1D or batch size mismatch.")
-                except Exception as e:
-                    print(f"Error processing target tensor 'val' at step {current_step}: {e}")
-                    print(f"  Original val shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
-                    progress.update(args.batch)
-                    continue  # Skip this batch
-
-            # Check shapes
             if emb.shape[0] != val.shape[0]:
-                print(f"Error: Mismatch batch size between embeddings ({emb.shape[0]}) and targets ({val.shape[0]}) at step {current_step}. Skipping.")
-                progress.update(args.batch)
-                continue
+                print(f"Error: Batch size mismatch emb ({emb.shape[0]}) vs val ({val.shape[0]}). Skipping.")
+                progress.update(args.batch); continue
 
-            # Forward/Backward Pass with AMP
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled(), dtype=amp_dtype):
-                y_pred = model(emb)
-                # Check for NaNs in prediction
-                if torch.isnan(y_pred).any():
-                    print(f"Warning: NaN detected in model prediction at step {current_step}. Skipping step.")
-                    progress.update(args.batch) # Still update progress
-                    # Consider stopping training or reducing LR if NaNs persist
-                    continue
-                loss = criterion(y_pred.to(torch.float32), val) # Cast prediction to fp32 for stable loss calculation
-                # Check for NaNs/inf in loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: NaN or Inf detected in loss at step {current_step}. Skipping backward/step.")
-                    progress.update(args.batch)
-                    # Skip optimizer step if loss is invalid
-                    current_step += args.batch # Increment step here since we skip the logging section maybe? Or log with NaN loss?
-                    continue # Skip the rest of the loop for this batch
+            # --- Forward/Backward Pass ---
+            with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
+                y_pred = model(emb) # Prediction on device
+
+                # Prepare prediction for loss (e.g., squeeze for scorer)
+                if args.arch == "score" and y_pred.ndim == 2 and y_pred.shape[1] == 1:
+                     y_pred_for_loss = y_pred.squeeze(1)
+                else:
+                     y_pred_for_loss = y_pred
+
+                # Calculate loss - ensure prediction is float32 for stability, target 'val' has correct type
+                loss = criterion(y_pred_for_loss.to(torch.float32), val)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN or Inf loss detected at step {current_step}. Skipping step.")
+                progress.update(args.batch)
+                # Optionally: Try skipping optimizer step but still increment step?
+                # current_step += args.batch
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            # Optional: Gradient Clipping (before scaler.step)
-            # scaler.unscale_(optimizer) # Unscale first if needed by clip_grad_norm_
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Example
+            # Optional: Gradient Clipping here if needed
             scaler.step(optimizer)
             scaler.update()
 
             if scheduler is not None:
                 scheduler.step()
+            # --- End Forward/Backward ---
 
-            current_step += args.batch
-            progress.update(args.batch)
+            current_step += args.batch # Use actual batch size processed?
+            progress.update(args.batch) # Update progress bar by configured batch size
 
-            # --- Evaluation and Logging Step ---
+            # --- Logging and Saving ---
             if current_step % LOG_EVERY_N == 0 and current_step > 0:
-                eval_loss_val = float('nan') # Default to NaN if no validation
+                eval_loss_val = float('nan')
                 if val_loader:
-                    # Perform evaluation on the validation set
-                    eval_loss_val = wrapper.evaluate_on_validation_set(val_loader)
-                    model.train() # Ensure model is back in train mode after eval
+                    eval_loss_val = wrapper.evaluate_on_validation_set(val_loader) # This handles model.eval()/train()
+                    model.train() # Re-ensure train mode just in case
 
-                # Log metrics (pass eval loss to log_main)
-                # Check if eval_loss_val is NaN before logging
-                if math.isnan(eval_loss_val):
-                     print(f"Step {current_step}: Eval loss is NaN (validation loader might be empty or evaluation failed).")
+                if math.isnan(eval_loss_val): print(f"Step {current_step}: Eval loss is NaN.")
+                wrapper.log_main(step=current_step, train_loss_batch=loss.item(), eval_loss=eval_loss_val)
 
-                # v2.2.1: Use correct arg name train_loss_batch when calling log_main
-                wrapper.log_main(
-                    step=current_step,
-                    train_loss_batch=loss.item(),  # Log current batch train loss <--- NEW ARG NAME
-                    eval_loss=eval_loss_val
-                )
-
-                # Checkpoint saving based on validation loss (optional)
                 if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
-                     best_eval_loss = eval_loss_val
-                     print(f"\nNew best validation loss: {best_eval_loss:.4e}. Saving best model...")
-                     wrapper.save_model(step=current_step, suffix="_best_val") # Add suffix
+                    best_eval_loss = eval_loss_val
+                    print(f"\nNew best validation loss: {best_eval_loss:.4e}. Saving best model...")
+                    wrapper.save_model(step=current_step, suffix="_best_val")
 
-            # --- Periodic Saving (Keep original logic too) ---
             if args.nsave > 0 and (current_step // args.batch) % (args.nsave // args.batch) == 0:
-                wrapper.save_model(step=current_step)
+                 if current_step > start_step: # Avoid saving at step 0 if not resuming
+                      wrapper.save_model(step=current_step)
+            # --- End Logging and Saving ---
 
-            if current_step >= args.steps: break # Inner loop break
+            if current_step >= args.steps: break # Break inner loop if steps reached
 
-        # End of epoch/loader iteration
-        if current_step >= args.steps: break # Outer loop break
+        if current_step >= args.steps: break # Break outer loop
 
     progress.close()
+    print(f"\nTraining loop finished at step {current_step}.")
 
-    # --- Final Save and Cleanup ---
-    print(f"\nTraining finished at step {current_step}. Saving final model...")
-    wrapper.save_model(epoch="final", step=current_step) # Use 'final' epoch string
-    # Save final best val model again? Usually covered by periodic save or last step.
-    wrapper.close()
+# ================================================
+#        Main Execution Block
+# ================================================
 
-    if wandb:
-        print("Finishing Weights & Biases run...")
-        wandb.finish()
+def main():
+    """Main function to run the training process."""
+    args = parse_and_load_args() # <<< CHANGED HERE
+    print(f"Target device: {TARGET_DEV}")
 
-    print("Training script finished.")
+    amp_dtype, enabled_amp = setup_precision(args)
+    wandb_run = setup_wandb(args)
+    dataset, train_loader, val_loader = setup_dataloaders(args)
+    model, criterion = setup_model_criterion(args, dataset)
+    optimizer, scheduler, is_schedule_free = setup_optimizer_scheduler(args, model)
+
+    # Needs to be created after potential precision changes
+    scaler = torch.amp.GradScaler(device=TARGET_DEV, enabled=(enabled_amp and TARGET_DEV == 'cuda'))
+    print(f"GradScaler enabled: {scaler.is_enabled()}")
+
+    start_step = load_checkpoint(args, model, optimizer, scheduler, scaler)
+
+    # Config needs to be written after all args might have been updated (e.g., num_labels)
+    write_config(args)
+
+    wrapper = ModelWrapper(
+        name=args.name,
+        model=model,
+        device=TARGET_DEV,
+        num_labels=getattr(args, 'num_labels', 1), # Use updated num_labels
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        wandb_run=wandb_run
+    )
+
+    try:
+        train_loop(args, model, criterion, optimizer, scheduler, scaler,
+                   train_loader, val_loader, wrapper, start_step, enabled_amp, amp_dtype)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+    except Exception as e:
+         print(f"\nAn error occurred during training: {e}")
+         import traceback
+         traceback.print_exc() # Print full traceback for debugging
+    finally:
+        # --- Final Save and Cleanup ---
+        print(f"Saving final model...")
+        # Determine final step count accurately
+        final_step = wrapper.get_current_step() if hasattr(wrapper, 'get_current_step') else start_step # Assuming wrapper tracks steps, else use last known
+        wrapper.save_model(epoch="final", step=final_step)
+        wrapper.close() # Close log file
+
+        if wandb_run:
+            print("Finishing Weights & Biases run...")
+            wandb_run.finish()
+
+        print("Training script finished.")
+
+if __name__ == "__main__":
+    main()
