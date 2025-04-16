@@ -19,6 +19,24 @@ except ImportError as e:
     print("Ensure model.py and utils.py are in the same directory or your PYTHONPATH is set correctly.")
     raise
 
+def preprocess_fit_pad(img_pil, target_size=512, fill_color=(0, 0, 0)):
+    """
+    Resizes an image to fit within target_size maintaining aspect ratio,
+    then pads with fill_color to reach target_size.
+    (Ensure this is IDENTICAL to the one in generate_embeddings.py)
+    """
+    original_width, original_height = img_pil.size
+    target_w, target_h = target_size, target_size
+    scale = min(target_w / original_width, target_h / original_height)
+    new_w = int(original_width * scale)
+    new_h = int(original_height * scale)
+    img_resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    img_padded = Image.new(img_pil.mode, (target_w, target_h), fill_color)
+    pad_left = (target_w - new_w) // 2
+    pad_top = (target_h - new_h) // 2
+    img_padded.paste(img_resized, (pad_left, pad_top))
+    return img_padded
+
 # --- Utility function to load config (shared) ---
 def _load_config_helper(config_path):
     """Loads full config from JSON file."""
@@ -66,23 +84,26 @@ def _load_model_helper(model_path, expected_features, expected_outputs=None):
         raise
 
 
-# --- Base Pipeline Class (Common Methods) ---
 class BasePipeline:
+    # v1.1: Modified _init_vision_model
     def __init__(self, config, device="cpu", clip_dtype=torch.float32):
         self.device = device
-        self.clip_dtype = clip_dtype
+        self.clip_dtype = clip_dtype # Dtype for vision model computation
         self.config = config if config is not None else {} # Ensure config is a dict
 
         self.base_vision_model_name = self.config.get("base_vision_model")
         if not self.base_vision_model_name:
             print("Warning: base_vision_model not found in config. Defaulting to OpenAI CLIP.")
+            # Update default if needed, but config should override
             self.base_vision_model_name = "openai/clip-vit-large-patch14-336"
 
         self.proc = None
-        self.clip_model = None # Renamed from 'clip' for clarity
-        self.proc_size = 224
-        self._init_vision_model()
+        self.clip_model = None
+        self.proc_size = 224 # Default, will be updated
+        self._init_vision_model() # Call the modified init method
 
+    # --- MODIFIED _init_vision_model ---
+    # v1.1: Added logic to disable processor resize/crop
     def _init_vision_model(self):
         model_name = self.base_vision_model_name
         print(f"Initializing Vision Model using AutoClasses: {model_name} on {self.device} with dtype {self.clip_dtype}")
@@ -94,38 +115,99 @@ class BasePipeline:
             print(f"Loaded model class: {self.clip_model.__class__.__name__}")
             print(f"Loaded processor class: {self.proc.__class__.__name__}")
 
-            # Determine proc_size
+            # --- DISABLE PROCESSOR RESIZE/CROP ---
+            if hasattr(self.proc, 'image_processor'):
+                 image_processor = self.proc.image_processor
+                 print(f"DEBUG Inference: Original image processor config: {image_processor}") # Debug
+                 if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
+                 if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
+                 # if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False # Keep? Usually normalize handles this
+                 if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True # Keep True
+                 print(f"DEBUG Inference: Modified image processor config: {image_processor}") # Verify
+            else:
+                 print("Warning: Could not access 'image_processor' on loaded processor in inference. Cannot disable resize/crop.")
+            # --- END DISABLE ---
+
+            # Determine proc_size (target size model expects)
+            self.proc_size = 512 # Default or get from loaded_config if available?
             if hasattr(self.proc, 'image_processor') and hasattr(self.proc.image_processor, 'size'):
                  proc_sz = self.proc.image_processor.size
-                 if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("shortest_edge", proc_sz.get("height", proc_sz.get("crop_size", 224))))
+                 if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("shortest_edge", proc_sz.get("height", proc_sz.get("crop_size", 512))))
                  elif isinstance(proc_sz, int): self.proc_size = int(proc_sz)
-                 else: self.proc_size = 224
             elif hasattr(self.proc, 'size'):
                  proc_sz = self.proc.size
-                 if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("shortest_edge", proc_sz.get("height", 224)))
+                 if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("shortest_edge", proc_sz.get("height", 512)))
                  elif isinstance(proc_sz, int): self.proc_size = int(proc_sz)
-                 else: self.proc_size = 224
-            else: self.proc_size = 224
-            print(f"Determined processor input size: {self.proc_size}")
+
+            print(f"Determined processor target size: {self.proc_size}")
         except Exception as e:
             print(f"Error initializing vision model {model_name}: {e}")
             raise
 
+    # --- MODIFIED get_clip_emb ---
+    # v1.1: Apply fit-and-pad preprocessing, ensure normalization
     def get_clip_emb(self, img_list):
+        """Applies fit-and-pad, uses processor for normalization, gets embeddings, and L2 normalizes."""
         if not isinstance(img_list, list): img_list = [img_list]
+
+        processed_imgs = []
+        for img_pil in img_list:
+            # --- Apply Fit and Pad ---
+            try:
+                 # Use self.proc_size determined during _init_vision_model
+                 img_padded = preprocess_fit_pad(img_pil, target_size=self.proc_size)
+                 processed_imgs.append(img_padded)
+            except Exception as e_pad:
+                 print(f"Error during fit-and-pad in inference for an image: {e_pad}. Skipping image.")
+        # --- End Apply Fit and Pad ---
+
+        if not processed_imgs:
+             print("Error: No images left after fit-and-pad processing.")
+             return None # Handle potential failure
+
         try:
-            inputs = self.proc(images=img_list, return_tensors="pt").to(device=self.device)
-        except Exception as e: print(f"Error processing images: {e}"); raise
+            # Processor should now only perform normalization and tensor conversion
+            # Use clip_dtype here as it's for the vision model input
+            inputs = self.proc(images=processed_imgs, return_tensors="pt").to(device=self.device, dtype=self.clip_dtype)
+        except Exception as e:
+            print(f"Error processing padded images: {e}")
+            return None # Handle potential failure
+
+        # Get embeddings using the vision model's compute dtype (self.clip_dtype)
         with torch.no_grad():
+            pixel_values = inputs.get("pixel_values")
+            if pixel_values is None:
+                 print("Error: Processor output missing 'pixel_values'.")
+                 return None
+
             if hasattr(self.clip_model, 'get_image_features'):
-                 emb = self.clip_model.get_image_features(**inputs)
+                 emb = self.clip_model.get_image_features(pixel_values=pixel_values)
             else:
                  print("Warning: Loaded vision model has no get_image_features. Attempting standard forward.")
-                 outputs = self.clip_model(**inputs)
-                 if hasattr(outputs, 'image_embeds'): emb = outputs.image_embeds
-                 elif hasattr(outputs, 'pooler_output'): emb = outputs.pooler_output
-                 else: emb = outputs.last_hidden_state.mean(dim=1)
-        return emb.detach().to(device='cpu', dtype=torch.float32)
+                 # Basic fallback
+                 try:
+                      outputs = self.clip_model(pixel_values=pixel_values)
+                      if hasattr(outputs, 'image_embeds'): emb = outputs.image_embeds
+                      elif hasattr(outputs, 'pooler_output'): emb = outputs.pooler_output
+                      else: emb = outputs.last_hidden_state.mean(dim=1) # Last resort guess
+                 except Exception as e_fwd:
+                      print(f"Error during fallback forward pass: {e_fwd}")
+                      return None
+
+        # Detach, move to CPU, and convert to Float32 for the MLP head
+        final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
+
+        # --- Add L2 Normalization (Consistent with generate_embeddings v3.1.2+) ---
+        if final_emb.ndim == 2 and final_emb.shape[0] > 0: # Batch of embeddings
+            final_emb_norm = torch.linalg.norm(final_emb, dim=1, keepdim=True)
+            final_emb = final_emb / (final_emb_norm + 1e-8)
+        elif final_emb.ndim == 1: # Single embedding
+            final_emb_norm = torch.linalg.norm(final_emb)
+            final_emb = final_emb / (final_emb_norm + 1e-8)
+        # --- End L2 Normalization ---
+
+        return final_emb
+
 
     def get_clip_emb_tiled(self, raw_pil_image, tiling=False):
         target_size = self.proc_size
@@ -139,11 +221,16 @@ class BasePipeline:
                  raw_resized = raw_pil_image.resize(new_size, Image.Resampling.LANCZOS)
             else: raw_resized = raw_pil_image
             try:
-                 crops = F.five_crop(raw_resized, (target_size, target_size))
-                 img_list.extend(crops); print(f"DEBUG: Using {len(img_list)} tiles.")
+                crops = F.five_crop(raw_resized, (target_size, target_size))
+                img_list.extend(crops)
+                print(f"DEBUG: Using {len(img_list)} tiles.")
             except Exception as e:
-                 print(f"Error during five_crop: {e}. Falling back."); img_list = [raw_pil_image]
-        else: img_list = [raw_pil_image]
+                print(f"Error during five_crop: {e}. Falling back.")
+                img_list = [raw_pil_image]
+        else:  # If tiling is False OR image is too small
+            img_list = [raw_pil_image]
+        # --- End Tiling Logic ---
+        # This part gets the embeddings for the images in img_list
         return self.get_clip_emb(img_list)
 
     # _load_model_generic needs access to embed_ver from config
@@ -273,7 +360,7 @@ class CityClassifierPipeline(BasePipeline):
         print(f"CityClassifier: Pipeline init ok (Labels: {self.labels})")
 
     # v1.5.3: Added debug print for raw tile predictions
-    def __call__(self, raw, default=True, tiling=True, tile_strat="mean"):
+    def __call__(self, raw, default=True, tiling=False, tile_strat="mean"):
         # Get embeddings (potentially tiled)
         emb = self.get_clip_emb_tiled(raw, tiling=tiling) # emb shape: [num_tiles, features]
 
@@ -305,16 +392,13 @@ class CityClassifierPipeline(BasePipeline):
         # --- END ADDED DEBUG PRINT ---
 
         # Format the prediction (includes tile combination logic from format_pred method below)
-        # This combines the 'pred' tensor based on tile_strat if needed
         formatted_output = self.format_pred(
-            pred,                            # Pass the raw predictions tensor
-            labels=self.labels,              # Pass the loaded labels
-            drop_default=(not default),      # Pass the flag to drop the default class
-            # Determine the strategy: combine only if tiling was on AND we got multiple tile results
-            tile_strategy=tile_strat if tiling and num_tiles_pred > 1 else "raw"
+            pred,
+            labels=self.labels,
+            drop_default=(not default),
+            # Pass the strategy correctly, only combine if tiling was on AND we got multiple tile results
+            tile_strategy=tile_strat if tiling and pred.shape[0] > 1 else "raw" # Check actual pred shape
         )
-
-        # Return the final formatted dictionary (e.g., {'Bad Anatomy': 0.1, 'Good Anatomy': 0.9})
         return formatted_output
 
     def format_pred(self, pred, labels, drop_default=False, tile_strategy="mean"):

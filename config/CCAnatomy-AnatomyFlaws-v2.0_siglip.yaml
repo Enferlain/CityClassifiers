@@ -2,13 +2,13 @@
 model:
   base: "CCAnatomy-AnatomyFlaws"
   # Let's use a new revision name now to avoid confusion!
-  rev:  "v2.4_adamw_siglip_focal" # New revision name
+  rev:  "v2.6_adoptao_siglip_focal_pad" # New revision name
   arch: class            # <--- Ensure this says 'class'
   clip: SIGLIP2-SO400M-512
 
 train:
   lr:    5e-5     # Start with a potentially lower LR for stability
-  steps: 30000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
+  steps: 50000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
   batch: 32        # Increase batch size slightly if VRAM allows? (optional)
 
   # Optimizer specific args (can be overridden by command line)
