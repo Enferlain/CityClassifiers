@@ -39,14 +39,14 @@ def get_embed_params(ver):
     # Add new embedding types here as needed
     embed_configs = {
         "CLIP": {"features": 768, "hidden": 1024},
-        "CLIP-Anatomy": {"features": 768, "hidden": 1024},
-        "SIGLIP2-SO400M-512": {"features": 1152, "hidden": 1280},
-        "SIGLIP2-SO400M-512_NoCrop": {"features": 1152, "hidden": 1280},
-        "SIGLIP2-SO400M-512_FitPad": {"features": 1152, "hidden": 1280},
-        # --- ADD THIS LINE ---
+        "siglip2_so400m_patch16_512": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_512_AvgCrop": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_512_FitPad": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_512_CenterCrop": {"features": 1152, "hidden": 1280},
-        # --- END ADD ---
-        # "NaflexSigLIP_FitPad": {"features": 1024, "hidden": 1280}, # Example for Naflex
+        "siglip2_so400m_patch16_naflex_NaflexResize": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_AvgCrop": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_FitPad": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_CenterCrop": {"features": 1152, "hidden": 1280},
         "META": {"features": 1024, "hidden": 1280},
     }
     if ver in embed_configs:
@@ -57,8 +57,8 @@ def get_embed_params(ver):
         raise ValueError(f"Unknown embedding version '{ver}'. Please add it to get_embed_params in utils.py.")
 # --- End Parameter Dictionary ---
 
-
 # --- Argument Parsing and Config Loading ---
+# Version 2.3.1: Added smarter base_vision_model lookup
 def parse_and_load_args():
     """Parses command line args and merges with YAML config."""
     parser = argparse.ArgumentParser(description="Train aesthetic predictor/classifier")
@@ -74,23 +74,20 @@ def parse_and_load_args():
     parser.add_argument("--data_root", type=str, default="data", help="Root directory for datasets.")
     parser.add_argument("--wandb_project", type=str, default="city-classifiers", help="Weights & Biases project name.")
 
-    # Optimizer Choice - Add more choices as needed
+    # Optimizer Choice
     parser.add_argument('--optimizer', type=str, default='AdamW',
                         choices=['AdamW', 'FMARSCropV3ExMachina', 'ADOPT', 'ADOPTScheduleFree', 'ADOPTAOScheduleFree'],
                         help='Optimizer to use.')
-    # Loss Function Choice - ADDED
+    # Loss Function Choice
     parser.add_argument('--loss_function', type=str, default=None,
                         choices=['crossentropy', 'focal', 'l1', 'mse'],
                         help="Loss function ('crossentropy'/'focal' for class, 'l1'/'mse' for score). Default based on arch.")
 
     # Optimizer Hyperparameters (allow override via command line, primarily set in YAML)
-    # Set defaults to None here, they will be populated from YAML or code defaults later
     parser.add_argument('--lr', type=float, default=None, help="Learning rate (override YAML).")
     parser.add_argument('--betas', type=float, nargs='+', default=None, help="Optimizer betas (override YAML).")
     parser.add_argument('--eps', type=float, default=None, help='Optimizer epsilon (override YAML).')
     parser.add_argument('--weight_decay', type=float, default=None, help='Optimizer weight decay (override YAML).')
-    # Add other specific optimizer params if frequent command line overrides are needed
-    # parser.add_argument('--gamma', type=float, default=None, help='Gamma for MARS (override YAML).')
 
     # Parse known args first
     args = parser.parse_args()
@@ -106,47 +103,74 @@ def parse_and_load_args():
     model_conf = conf.get("model", {})
     args.base = model_conf.get("base", "unknown_model")
     args.rev = model_conf.get("rev", "v0.0")
-    args.arch = model_conf.get("arch", "class") # Default to class if not specified
-    args.embed_ver = model_conf.get("embed_ver", "CLIP") # Default to CLIP
-    args.name = f"{args.base}-{args.rev}" # Generate full name
-    # Read optional attention params for PredictorModel
-    args.num_attn_heads = model_conf.get("num_attn_heads", 8) # Default from PredictorModel
-    args.attn_dropout = model_conf.get("attn_dropout", 0.1) # Default from PredictorModel
+    args.arch = model_conf.get("arch", "class")
+    args.embed_ver = model_conf.get("embed_ver", "CLIP")
+    args.name = f"{args.base}-{args.rev}"
+    args.num_attn_heads = model_conf.get("num_attn_heads", 8)
+    args.attn_dropout = model_conf.get("attn_dropout", 0.1)
 
-    # Vision model lookup
-    default_vision_models = {
-        "CLIP": "openai/clip-vit-large-patch14-336",
-        "SIGLIP2-SO400M-512": "google/siglip2-so400m-patch16-512",
-        "SIGLIP2-SO400M-512_NoCrop": "google/siglip2-so400m-patch16-512",
-        "SIGLIP2-SO400M-512_CenterCrop": "google/siglip2-so400m-patch16-512",
-        "SIGLIP2-SO400M-512_FitPad": "google/siglip2-so400m-patch16-512",
-        "NaflexSigLIP_FitPad": "google/siglip-naflex-so400m-patch14-384" } # Add more
-    args.base_vision_model = model_conf.get("base_vision_model", default_vision_models.get(args.embed_ver))
-    if not args.base_vision_model: print(f"Warning: Could not determine base_vision_model for embed_ver '{args.embed_ver}'.")
+    # --- Vision model lookup ---
+    # Try getting base_vision_model explicitly from YAML first
+    args.base_vision_model = model_conf.get("base_vision_model")
+
+    # If not found in YAML, try inferring from embed_ver using the LONGEST matching key
+    if not args.base_vision_model:
+        # Dictionary mapping BASE embed versions (or common prefixes) to HF model names
+        # Keys should ideally be distinct prefixes
+        default_vision_models = {
+            "CLIP": "openai/clip-vit-large-patch14-336",
+            "siglip2_so400m_patch16_512": "google/siglip2-so400m-patch16-512",
+            # Ensure this key is distinct enough or checked correctly
+            "siglip-naflex": "google/siglip2-so400m-patch16-naflex",
+            "META": "facebook/metaclip-h14-fullcc2.5b"
+            # Add other BASE identifiers here
+        }
+
+        found_model = None
+        l_embed_ver = args.embed_ver.lower() if args.embed_ver else ""
+        best_match_key = None
+
+        # Find the longest matching prefix key (This logic should work with better keys)
+        for key in default_vision_models.keys():
+            if l_embed_ver.startswith(key.lower()):
+                if best_match_key is None or len(key) > len(best_match_key):
+                    best_match_key = key
+
+        if best_match_key:
+            found_model = default_vision_models[best_match_key]
+            print(
+                f"DEBUG: Inferred base_vision_model '{found_model}' from embed_ver '{args.embed_ver}' using longest matching base key '{best_match_key}'")
+        else:
+            print(
+                f"Warning: Could not automatically determine base_vision_model for embed_ver '{args.embed_ver}'. Please specify it in the YAML config.")
+
+        args.base_vision_model = found_model
+
+        # Add a warning if we still couldn't find it
+        if not args.base_vision_model:
+            print(f"Warning: Could not automatically determine base_vision_model for embed_ver '{args.embed_ver}'. Please specify it in the YAML config.")
 
     # Training params (YAML overrides defaults, command line overrides YAML if provided)
     train_conf = conf.get("train", {})
     args.lr = args.lr if args.lr is not None else float(train_conf.get("lr", 1e-4))
     args.steps = int(train_conf.get("steps", 100000))
     args.batch = int(train_conf.get("batch", 4))
-    args.loss_function = args.loss_function if args.loss_function is not None else train_conf.get("loss_function") # Get from YAML if not cmd line
+    args.loss_function = args.loss_function if args.loss_function is not None else train_conf.get("loss_function")
     args.optimizer = args.optimizer if args.optimizer != parser.get_default("optimizer") else train_conf.get("optimizer", args.optimizer)
     args.betas = args.betas if args.betas is not None else tuple(map(float, train_conf.get("betas", []))) or None
     args.eps = args.eps if args.eps is not None else train_conf.get("eps")
     args.weight_decay = args.weight_decay if args.weight_decay is not None else train_conf.get("weight_decay")
-    args.cosine = bool(train_conf.get("cosine", True)) # Scheduler option
-    args.warmup_steps = int(train_conf.get("warmup_steps", 0)) # Scheduler option
+    args.cosine = bool(train_conf.get("cosine", True))
+    args.warmup_steps = int(train_conf.get("warmup_steps", 0))
 
     # Populate other optimizer hyperparams from YAML if not set via command line
-    # Use getattr to avoid errors if args don't exist for certain optimizers
     optimizer_specific_args = ['gamma', 'r_sf', 'wlpow_sf', 'state_precision', 'weight_decouple', 'stable_weight_decay', 'adaptive_clip', 'adaptive_clip_eps', 'adaptive_clip_type', 'debias_beta2', 'use_beta2_warmup', 'beta2_warmup_initial', 'beta2_warmup_steps', 'mars_gamma', 'use_muon_pp', 'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd', 'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step', 'spam_clipping_type']
     for arg_name in optimizer_specific_args:
          if not hasattr(args, arg_name) or getattr(args, arg_name) is None:
-              setattr(args, arg_name, train_conf.get(arg_name)) # Set from YAML if missing/None
+              setattr(args, arg_name, train_conf.get(arg_name))
 
     # Set coded defaults for optimizer hyperparams if still None
-    # (Keep the block setting defaults for betas, eps, weight_decay, gamma, r_sf, wlpow_sf as before)
-    if args.betas is None: args.betas = (0.9, 0.999) # AdamW default
+    if args.betas is None: args.betas = (0.9, 0.999)
     if args.eps is None: args.eps = 1e-8 if args.optimizer.lower() == 'adamw' else 1e-6
     if args.weight_decay is None: args.weight_decay = 0.0
     if args.gamma is None and 'mars' in args.optimizer.lower(): args.gamma = 0.005
@@ -159,21 +183,20 @@ def parse_and_load_args():
         if labels_conf:
             args.labels = {str(k): v.get("name", str(k)) for k, v in labels_conf.items()}
             try: args.num_labels = max(int(k) for k in labels_conf.keys()) + 1
-            except: args.num_labels = 0 # Should ideally error?
+            except: args.num_labels = 0
             weights = [1.0] * args.num_labels
             for k_str, label_conf in labels_conf.items():
                 try: weights[int(k_str)] = float(label_conf.get("loss", 1.0))
                 except: pass
             args.weights = weights
         else:
-             args.num_labels = model_conf.get("outputs", 2) # Default if no labels section
+             args.num_labels = model_conf.get("outputs", 2)
              args.labels = None; args.weights = None
     else: # Score
         args.num_labels = 1; args.labels = None; args.weights = None
 
     # Validate inputs
     assert args.arch in ["score", "class"], f"Unknown arch '{args.arch}'"
-    # Add validation for loss function choice vs arch?
     if args.arch == "score" and args.loss_function not in [None, 'l1', 'mse']:
          print(f"Warning: Loss '{args.loss_function}' specified for score arch. Using default L1.")
          args.loss_function = 'l1'

@@ -1,18 +1,17 @@
 model:
   base: "AnatomyFlaws"
-  # Let's use a new revision name now to avoid confusion!
-  rev:  "v3.2_avg_attn_fl" # New revision name
+  rev:  "v3.3_naflex_attn_fl" # New revision name
   arch: class            # <--- Ensure this says 'class'
-  embed_ver: siglip2_so400m_patch16_512_AvgCrop
+  embed_ver: siglip2_so400m_patch16_naflex_NaflexResize
 
 train:
   lr:    1e-4     # Start with a potentially lower LR for stability
-  steps: 50000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
+  steps: 100000    # Increase steps for a larger dataset (e.g., ~25-30 epochs for 1100 samples/batch 1)
   batch: 32        # Increase batch size slightly if VRAM allows? (optional)
 
   # Optimizer specific args (can be overridden by command line)
   optimizer: ADOPTAOScheduleFree # Specify default optimizer
-  loss_function: focal
+  loss_function: crossentropy
   betas: [0.9, 0.999] # Default ADOPT betas
   weight_decay: 1e-3  # Start with some weight decay
   eps: 1e-6           # Default ADOPT eps

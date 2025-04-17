@@ -1,6 +1,4 @@
-# Version: 1.6.0
-# Desc: Consistent fit-pad preprocessing, explicit config path for all pipelines,
-#       loads attention params from config, cleaner formatting, tiling default false for classifier.
+# Version: 1.7.0 (Adds dynamic preprocessing selection)
 
 import os
 import json
@@ -20,6 +18,44 @@ except ImportError as e:
     print(f"Error importing PredictorModel or get_embed_params: {e}")
     print("Ensure model.py and utils.py are in the same directory or accessible.")
     raise
+
+# --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
+# Copied from generate_embeddings.py - simplified slightly for inference use
+def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
+    """
+    Resizes image preserving aspect ratio to have close to target_patches,
+    ensuring dimensions are multiples of patch_size by flooring.
+    (Inference version - doesn't return patch count)
+    """
+    original_width, original_height = img_pil.size
+    if original_width <= 0 or original_height <= 0: return None
+
+    aspect_ratio = original_width / original_height
+
+    ideal_patch_w_f = math.sqrt(target_patches * aspect_ratio)
+    ideal_patch_h_f = math.sqrt(target_patches / aspect_ratio)
+
+    ideal_width_f = ideal_patch_w_f * patch_size
+    ideal_height_f = ideal_patch_h_f * patch_size
+
+    new_width = math.floor(ideal_width_f / patch_size) * patch_size
+    new_height = math.floor(ideal_height_f / patch_size) * patch_size
+
+    if new_width == 0: new_width = patch_size
+    if new_height == 0: new_height = patch_size
+
+    # Calculate resulting patches (for debugging/verification)
+    num_patches_w = new_width // patch_size
+    num_patches_h = new_height // patch_size
+    total_patches = num_patches_w * num_patches_h
+    print(f"  DEBUG Inf NaflexResize(v4): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_width}x{new_height}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})")
+
+    if total_patches > target_patches: # Should not happen with floor, but good sanity check
+        print(f"  ERROR Inf: Calculated patches ({total_patches}) exceed target ({target_patches})!")
+        return None # Return None if calculation seems wrong
+
+    img_resized = img_pil.resize((int(new_width), int(new_height)), Image.Resampling.LANCZOS)
+    return img_resized
 
 # --- Preprocessing Function ---
 # (Ensure this is IDENTICAL to the one in generate_embeddings.py)
@@ -127,6 +163,11 @@ class BasePipeline:
         if self.config is None: raise ValueError("Failed to load configuration.")
         # --- End Config Loading ---
 
+        # --- Store Embed Version ---
+        self.embed_ver = self.config.get("model", {}).get("embed_ver", "unknown")
+        print(f"DEBUG BasePipeline: Found embed_ver: {self.embed_ver}")
+        # --- End Store Embed Version ---
+
         # --- Vision Model Setup ---
         self.base_vision_model_name = self.config.get("model", {}).get("base_vision_model")
         if not self.base_vision_model_name:
@@ -139,6 +180,24 @@ class BasePipeline:
         self.proc_size = 512 # Default, updated in _init_vision_model
         self._init_vision_model()
         # --- End Vision Model Setup ---
+
+        # <<< START NEW: Select Preprocessing Function >>>
+        self.preprocess_func = None
+        if "NaflexResize" in self.embed_ver or "naflex" in self.embed_ver.lower(): # Check if it's a NaFlex embedding
+            print("DEBUG BasePipeline: Selecting NaFlex resize preprocessing.")
+            self.preprocess_func = preprocess_naflex_resize
+        elif "FitPad" in self.embed_ver: # Check if it's FitPad
+            print("DEBUG BasePipeline: Selecting FitPad preprocessing.")
+            self.preprocess_func = preprocess_fit_pad
+        # Add elif for CenterCrop if needed
+        # elif "CenterCrop" in self.embed_ver:
+        #     print("DEBUG BasePipeline: Selecting CenterCrop preprocessing.")
+        #     self.preprocess_func = preprocess_center_crop # Assuming this exists
+        else:
+            # Default fallback (or raise error)
+            print(f"DEBUG BasePipeline: Unknown embed_ver '{self.embed_ver}'. Defaulting to FitPad preprocessing.")
+            self.preprocess_func = preprocess_fit_pad
+        # <<< END NEW >>>
 
         # --- Predictor Head Setup (Loaded in subclasses) ---
         self.model = None
@@ -210,89 +269,158 @@ class BasePipeline:
             print(f"Error initializing vision model {model_name}: {e}")
             raise
 
+    # --- Step 3: Modify _preprocess_images ---
     def _preprocess_images(self, img_list: list[Image.Image]) -> list[Image.Image] | None:
-        """Applies fit-and-pad preprocessing to a list of PIL images."""
+        """Applies the selected preprocessing function to a list of PIL images."""
+        if not self.preprocess_func:
+             print("ERROR: Preprocessing function not selected in pipeline init.")
+             return None
+
         processed_imgs = []
         for img_pil in img_list:
             try:
-                 img_padded = preprocess_fit_pad(img_pil, target_size=self.proc_size)
-                 if img_padded: processed_imgs.append(img_padded)
-                 else: print("Warning: Preprocessing returned None for an image.")
-            except Exception as e_pad:
-                 print(f"Error during fit-and-pad in inference: {e_pad}. Skipping image.")
-        return processed_imgs if processed_imgs else None
+                img_processed = None
+                # Check which function we stored and call it appropriately
+                if self.preprocess_func == preprocess_fit_pad:
+                    # FitPad needs target_size from the processor/model
+                    img_processed = self.preprocess_func(img_pil, target_size=self.proc_size)
+                elif self.preprocess_func == preprocess_naflex_resize:
+                    # NaFlex resize (v4) uses defaults for target_patches/patch_size
+                    img_processed = self.preprocess_func(img_pil)
+                # Add elif for other functions if needed
+                # elif self.preprocess_func == preprocess_center_crop:
+                #     img_processed = self.preprocess_func(img_pil, target_size=self.proc_size)
+                else:
+                    # Fallback for safety, though should be set in init
+                    print(f"Warning: Unknown preprocess_func {self.preprocess_func.__name__}, trying basic call.")
+                    img_processed = self.preprocess_func(img_pil) # Attempt basic call
 
+                if img_processed:
+                     processed_imgs.append(img_processed)
+                else:
+                     print(f"Warning: Preprocessing function {self.preprocess_func.__name__} returned None for an image.")
+            except Exception as e_prep:
+                 # Include function name in error
+                 print(f"Error during {getattr(self.preprocess_func, '__name__', 'unknown preprocessing')} in inference: {e_prep}. Skipping image.")
+                 import traceback
+                 traceback.print_exc() # Add traceback here for debugging
+        return processed_imgs if processed_imgs else None
+    # --- End Modify _preprocess_images ---
+
+    # --- Keep get_clip_emb ---
+    # It now correctly calls the modified _preprocess_images
     def get_clip_emb(self, img_list: list[Image.Image]) -> torch.Tensor | None:
-        """Applies fit-and-pad, uses processor for normalization, gets embeddings, and L2 normalizes."""
         if not isinstance(img_list, list): img_list = [img_list]
 
-        # Preprocess: Fit and Pad
+        # Preprocess using the dynamically selected function via _preprocess_images
         processed_imgs = self._preprocess_images(img_list)
         if not processed_imgs:
             print("Error: No images left after preprocessing.")
             return None
 
-        # Process with Hugging Face Processor (Normalization + Tensor Conversion)
+        # Process with Hugging Face Processor
+        inputs = None
         try:
+            # --- Calculate actual_num_patches (Simplified) ---
+            actual_num_patches = 256 # Default fallback
+            if self.preprocess_func == preprocess_naflex_resize and processed_imgs:
+                w, h = processed_imgs[0].size
+                p = 16 # Assuming patch size 16
+                num_patches = (w // p) * (h // p)
+                print(f"DEBUG get_clip_emb: Calculated actual_num_patches = {num_patches}")
+                actual_num_patches = num_patches
+            # --- End Calculation ---
+
+            # --- v1.7.9: Call processor simply ---
+            # Let it generate the potentially wrong size mask (256)
+            print("DEBUG: Calling self.proc() with default args.")
             inputs = self.proc(images=processed_imgs, return_tensors="pt")
+            # --- End Change ---
+
+            # --- v1.7.9: Extract inputs AND create correct mask ---
             pixel_values = inputs.get("pixel_values")
+            attention_mask_from_processor = inputs.get("pixel_attention_mask") # Might be size 256
+            spatial_shapes = inputs.get("spatial_shapes")
+
             if pixel_values is None: raise ValueError("Processor did not return 'pixel_values'.")
-            # Move to target device and set dtype for vision model computation
+            if spatial_shapes is None: raise ValueError("Processor did not return 'spatial_shapes'.") # Need this
+
+            # Manually create the correct attention mask
+            print(f"DEBUG: Creating manual attention mask of size {actual_num_patches}.")
+            # Shape should be [BatchSize=1, NumPatches] for _prepare_4d_attention_mask
+            final_attention_mask = torch.ones((1, actual_num_patches), dtype=torch.long, device=self.device)
+
+            # Move tensors to device
             pixel_values = pixel_values.to(device=self.device, dtype=self.clip_dtype)
+            spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
+            # --- End Extract and Mask Creation ---
+
         except Exception as e:
-            print(f"Error processing padded images with HF processor: {e}")
+            print(f"Error processing images with HF processor: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
         # Get Embeddings from Vision Model
+        emb = None
         with torch.no_grad():
             try:
-                if hasattr(self.clip_model, 'get_image_features'):
+                # --- v1.7.9: Call vision_model with manually created mask ---
+                if hasattr(self.clip_model, 'vision_model'):
+                     vision_outputs = self.clip_model.vision_model(
+                         pixel_values=pixel_values,
+                         attention_mask=final_attention_mask, # <<< Use corrected mask
+                         spatial_shapes=spatial_shapes
+                     )
+                     emb = vision_outputs.pooler_output
+                # --- End Change ---
+                elif hasattr(self.clip_model, 'get_image_features'): # Fallback for non-Siglip2?
+                     print("Warning: Calling get_image_features as vision_model attribute not found.")
                      emb = self.clip_model.get_image_features(pixel_values=pixel_values)
-                else: # Fallback
-                     print("Warning: Vision model lacks get_image_features. Using forward pass.")
-                     outputs = self.clip_model(pixel_values=pixel_values)
-                     if hasattr(outputs, 'image_embeds'): emb = outputs.image_embeds
-                     elif hasattr(outputs, 'pooler_output'): emb = outputs.pooler_output
-                     else: emb = outputs.last_hidden_state.mean(dim=1)
+                else: # Generic fallback if needed
+                     print("Warning: Neither vision_model nor get_image_features found. Using direct call.")
+                     emb = self.clip_model(pixel_values=pixel_values).pooler_output # Or appropriate attr
+
+                     if emb is None: raise ValueError("Failed to get embedding from vision model outputs.")
             except Exception as e_fwd:
-                 print(f"Error during vision model forward pass: {e_fwd}")
-                 return None
+                print(f"Error during vision model forward pass: {e_fwd}")
+                import traceback
+                traceback.print_exc()
+                return None
 
-        # Post-process: Detach, CPU, FP32 for MLP head, Normalize
-        final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
-        if final_emb.numel() == 0: return None # Handle empty tensor case
+            # --- Post-processing ---
+            if emb is None:
+                print("Error: Embedding is None after model forward pass.")
+                return None
 
-        try:
-            if final_emb.ndim >= 1: # Ensure tensor is not empty/scalar
-                norm_dim = 1 if final_emb.ndim == 2 else 0
-                emb_norm = torch.linalg.norm(final_emb, dim=norm_dim, keepdim=True)
-                # Prevent division by zero
-                safe_norm = emb_norm.clamp(min=1e-8)
-                final_emb = final_emb / safe_norm
-        except Exception as e_norm:
-             print(f"Error during L2 normalization: {e_norm}")
-             return None # Or return unnormalized? Normalization failure is concerning.
+            final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
+            norm = torch.linalg.norm(final_emb, dim=-1, keepdim=True).clamp(min=1e-8)
+            final_emb = final_emb / norm
 
-        return final_emb
+            return final_emb
 
+    # --- Keep get_clip_emb_tiled ---
+    # Note: Tiling logic might need adjustment if using NaFlex, but focusing on tiling=False for now.
     def get_clip_emb_tiled(self, raw_pil_image: Image.Image, tiling: bool = False) -> torch.Tensor | None:
         """Generates embeddings, potentially using 5-crop tiling."""
-        # For fit-pad models, tiling is discouraged, default should be False in pipeline __call__.
-        # If tiling is forced True, this will process 5 padded versions of the *same* image.
         img_list = []
         if tiling:
-            print("DEBUG: Tiling requested. Generating 5 padded views.")
-            # Apply fit-pad first to get the base 512x512 padded image
-            base_padded_img = self._preprocess_images([raw_pil_image])
-            if not base_padded_img: return None # Preprocessing failed
-            # Create 5 identical copies (no actual cropping needed/useful here)
-            img_list = [base_padded_img[0]] * 5
+            # Tiling with NaFlex might not be standard. What should happen here?
+            # For now, let's just process the single image even if tiling=True for NaFlex.
+            if self.preprocess_func == preprocess_naflex_resize:
+                 print("DEBUG: Tiling requested with NaFlex, processing single view instead.")
+                 img_list = [raw_pil_image]
+            else:
+                 # Original FitPad tiling logic (might need review)
+                 print("DEBUG: Tiling requested. Generating 5 padded views.")
+                 base_padded_img = self._preprocess_images([raw_pil_image])
+                 if not base_padded_img: return None
+                 img_list = [base_padded_img[0]] * 5
         else:
-            # Preprocess the single image (fit-pad happens in get_clip_emb)
+             # Process single image (preprocessing happens in get_clip_emb)
              img_list = [raw_pil_image]
 
-        # Get embeddings for the single image or the 5 identical padded images
-        return self.get_clip_emb(img_list)
+        return self.get_clip_emb(img_list) # Calls the updated get_clip_emb
 
     def _load_predictor_head(self, required_outputs: int | None = None):
         """Loads the MLP head model state dict using config."""

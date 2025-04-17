@@ -26,7 +26,7 @@ def parse_gen_args():
     parser.add_argument('--model_name', type=str, default=DEFAULT_MODEL_ID, help=f"Vision model name from Hugging Face. Default: {DEFAULT_MODEL_ID}")
     parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'], help="Precision for model computation (default: fp32).")
     # --- NEW: Preprocessing Mode ---
-    parser.add_argument('--preprocess_mode', type=str, default='fit_pad', choices=['fit_pad', 'center_crop', 'avg_crop'],
+    parser.add_argument('--preprocess_mode', type=str, default='fit_pad', choices=['fit_pad', 'center_crop', 'avg_crop', 'naflex_resize'],
                         help="Image preprocessing method before embedding (default: fit_pad).")
     # --- Modified: Resize Factor only for avg_crop ---
     parser.add_argument('--resize_factor_avg_crop', type=float, default=2.0,
@@ -35,6 +35,55 @@ def parse_gen_args():
     return parser.parse_args()
 
 # --- Preprocessing Functions ---
+
+# --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
+def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
+    """
+    Resizes image preserving aspect ratio to have close to target_patches,
+    ensuring dimensions are multiples of patch_size by flooring.
+    """
+    original_width, original_height = img_pil.size
+    if original_width <= 0 or original_height <= 0: return None
+
+    aspect_ratio = original_width / original_height
+
+    # 1. Calculate ideal float dimensions for target_patches
+    # target_patches ≈ (new_width / patch_size) * (new_height / patch_size)
+    # target_patches ≈ (sqrt(target_patches * aspect_ratio) * patch_size / patch_size) * (sqrt(target_patches / aspect_ratio) * patch_size / patch_size)
+    # Let's derive ideal float patch counts first
+    ideal_patch_w_f = math.sqrt(target_patches * aspect_ratio)
+    ideal_patch_h_f = math.sqrt(target_patches / aspect_ratio)
+
+    # Ideal float dimensions
+    ideal_width_f = ideal_patch_w_f * patch_size
+    ideal_height_f = ideal_patch_h_f * patch_size
+
+    # 2. Adjust dimensions DOWN to the nearest multiple of patch_size (use floor)
+    # This ensures we never exceed target_patches
+    new_width = math.floor(ideal_width_f / patch_size) * patch_size
+    new_height = math.floor(ideal_height_f / patch_size) * patch_size
+
+    # Ensure we don't get zero dimensions (if target_patches is too small)
+    if new_width == 0: new_width = patch_size
+    if new_height == 0: new_height = patch_size
+
+    # Calculate resulting patches
+    num_patches_w = new_width // patch_size
+    num_patches_h = new_height // patch_size
+    total_patches = num_patches_w * num_patches_h
+
+    print(
+        f"  DEBUG NaflexResize(v4.1): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_width}x{new_height}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})")
+
+    # Check if patches exceed target (shouldn't happen with floor)
+    if total_patches > target_patches:
+        print(f"  ERROR: Calculated patches ({total_patches}) exceed target ({target_patches})! Check logic.")
+        # Optionally return None or raise error here if needed
+
+    img_resized = img_pil.resize((int(new_width), int(new_height)), Image.Resampling.LANCZOS)
+
+    # <<< RETURN TOTAL PATCHES TOO >>>
+    return img_resized, total_patches
 
 def preprocess_fit_pad(img_pil, target_size=512, fill_color=(0, 0, 0)):
     """Resizes image to fit, pads to target size."""
@@ -124,34 +173,63 @@ def init_vision_model(model_name, device, dtype):
 # --- Embedding Functions ---
 
 @torch.no_grad()
-def get_single_view_embedding(processed_img_pil, processor, model, device, dtype):
+def get_single_view_embedding(processed_img_pil, actual_num_patches, processor, model, device,
+                              dtype):  # <<< Added actual_num_patches arg
     """Gets embedding for a *single, already preprocessed* image."""
-    if processed_img_pil is None: return None
+    # <<< No need to check processed_img_pil is None here, happens before call >>>
+    # if processed_img_pil is None: return None
     try:
-        # Processor only does normalization + tensor conversion now
-        inputs = processor(images=[processed_img_pil], return_tensors="pt")
-        pixel_values = inputs.get("pixel_values")
-        if pixel_values is None: raise ValueError("Processor didn't return pixel_values.")
-        pixel_values = pixel_values.to(device=device, dtype=dtype)
+        # --- v4.1: Pass actual_num_patches to processor ---
+        processor_kwargs = {"max_num_patches": actual_num_patches}
+        inputs = processor(images=[processed_img_pil], return_tensors="pt", **processor_kwargs)
+        # --- End v4.1 Change ---
 
-        # Get features
+        # Extract inputs (same as before)
+        pixel_values = inputs.get("pixel_values")
+        attention_mask = inputs.get("pixel_attention_mask")
+        spatial_shapes = inputs.get("spatial_shapes")
+
+        if pixel_values is None: raise ValueError("Processor didn't return pixel_values.")
+
+        # Move tensors (same as before)
+        pixel_values = pixel_values.to(device=device, dtype=dtype)
+        if attention_mask is not None:
+            # <<< Ensure mask shape matches actual_num_patches >>>
+            if attention_mask.shape[-1] != actual_num_patches:
+                print(
+                    f"WARNING: Attention mask shape {attention_mask.shape} != actual_num_patches {actual_num_patches}. Check processor call.")
+            attention_mask = attention_mask.to(device=device)
+        if spatial_shapes is not None:
+            spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)
+
+        # Get features using the correct arguments (same as before)
         if hasattr(model, 'get_image_features'):
-            embedding_tensor = model.get_image_features(pixel_values=pixel_values)
-        else: # Fallback
+            embedding_tensor = model.get_image_features(
+                pixel_values=pixel_values,
+                pixel_attention_mask=attention_mask,
+                spatial_shapes=spatial_shapes
+            )
+        else:
             print("Warning: Model lacks get_image_features. Using forward pass.")
-            outputs = model(pixel_values=pixel_values)
+            # Note: The direct forward call might also need attention_mask and spatial_shapes depending on the model.
+            # This fallback might break for Siglip2.
+            outputs = model(pixel_values=pixel_values) # Simplified fallback
             if hasattr(outputs, 'image_embeds'): embedding_tensor = outputs.image_embeds
             elif hasattr(outputs, 'pooler_output'): embedding_tensor = outputs.pooler_output
-            else: embedding_tensor = outputs.last_hidden_state.mean(dim=1)
+            else: embedding_tensor = outputs.last_hidden_state.mean(dim=1) # Generic fallback
 
-        # Normalize & Convert
+        # Normalize & Convert (same as before)
         norm = torch.linalg.norm(embedding_tensor, dim=-1, keepdim=True).clamp(min=1e-8)
         normalized_embedding_tensor = embedding_tensor / norm
         embedding = normalized_embedding_tensor.cpu().to(torch.float32).numpy().squeeze()
         return embedding
+
     except Exception as e:
         img_name = getattr(processed_img_pil, 'filename', 'UNKNOWN_PREPROCESSED')
-        print(f"Error during single view embedding generation for {img_name}: {e}")
+        # Print traceback for better debugging
+        import traceback
+        print(f"Error during single view embedding generation for {img_name}:")
+        traceback.print_exc() # Print the full traceback to see where the error occurs
         return None
 
 @torch.no_grad()
@@ -224,7 +302,8 @@ if __name__ == "__main__":
     # --- Determine Output Directory ---
     model_name_safe = args.model_name.split('/')[-1].replace('-', '_') # Make safer for dir names
     # Add preprocessing mode to directory name
-    mode_suffix_map = {'fit_pad': "FitPad", 'center_crop': "CenterCrop", 'avg_crop': "AvgCrop"}
+    mode_suffix_map = {'fit_pad': "FitPad", 'center_crop': "CenterCrop",
+                       'avg_crop': "AvgCrop", 'naflex_resize': "NaflexResize"} # <-- Add naflex_resize
     mode_suffix = mode_suffix_map.get(args.preprocess_mode, "UnknownMode")
     output_subdir_name = f"{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
     final_output_dir = os.path.join(args.output_dir_root, output_subdir_name)
@@ -254,15 +333,50 @@ if __name__ == "__main__":
                 raw_img_pil = Image.open(img_path).convert("RGB")
 
                 # --- Apply Chosen Preprocessing and Get Embedding ---
+                processed_img_for_embedding = None
+                actual_num_patches = None # <<< Initialize patch count variable
                 if args.preprocess_mode == 'fit_pad':
                     processed_img = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
                     embedding_result = get_single_view_embedding(processed_img, processor, vision_model, TARGET_DEV, COMPUTE_DTYPE)
                 elif args.preprocess_mode == 'center_crop':
                     processed_img = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
                     embedding_result = get_single_view_embedding(processed_img, processor, vision_model, TARGET_DEV, COMPUTE_DTYPE)
-                elif args.preprocess_mode == 'avg_crop':
+                elif args.preprocess_mode == 'naflex_resize':
+                    # <<< v4.1: Get image AND patch count >>>
+                    resize_output = preprocess_naflex_resize(raw_img_pil)  # Get the tuple first
+                    # print(
+                    #    f"DEBUG: Output of preprocess_naflex_resize: {type(resize_output)}, Value: {resize_output}")  # Check the output type
+                    if isinstance(resize_output, tuple) and len(resize_output) == 2:
+                        processed_img_for_embedding, actual_num_patches = resize_output  # Unpack the tuple
+                        # print(
+                        #    f"DEBUG: Unpacked - Type of processed_img_for_embedding: {type(processed_img_for_embedding)}")
+                        # print(f"DEBUG: Unpacked - Value of actual_num_patches: {actual_num_patches}")
+                    else:
+                        print("ERROR: preprocess_naflex_resize did not return a tuple of (image, patches)!")
+                        processed_img_for_embedding = None
+                        actual_num_patches = None
+
+                if args.preprocess_mode == 'avg_crop':
                     embedding_result = get_avg_crop_embedding(raw_img_pil, processor, vision_model, TARGET_DEV, COMPUTE_DTYPE,
                                                              target_size=model_image_size, resize_factor=args.resize_factor_avg_crop)
+                elif processed_img_for_embedding is not None and actual_num_patches is not None:  # Make sure both exist for naflex
+                    # <<< v4.1: Pass actual_num_patches if available (needed for naflex) >>>
+                    num_patches_for_processor = actual_num_patches  # Use the unpacked value directly
+                    print(
+                        f"DEBUG: Calling get_single_view_embedding with image type {type(processed_img_for_embedding)} and patch count {num_patches_for_processor}")
+                    embedding_result = get_single_view_embedding(
+                        processed_img_for_embedding,  # Should be PIL image
+                        num_patches_for_processor,  # Should be int (972)
+                        processor,
+                        vision_model,
+                        TARGET_DEV,
+                        COMPUTE_DTYPE
+                    )
+                    # --- End v4.1 Change ---
+                else:
+                    # Handle cases where preprocessing failed or mode is invalid
+                    print(f"Warning: Preprocessing failed or invalid mode for {fname}. Skipping embedding.")
+                    embedding_result = None
                 # --- End Embedding Logic ---
 
                 # Save the result
