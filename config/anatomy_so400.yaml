@@ -1,0 +1,74 @@
+# config/Template-AnatomyFlaws-vX.Y.yaml
+
+# --- Model Identification & Type ---
+model:
+  base: "AnatomyFlaws"     # Base name for the model concept (e.g., AnatomyFlaws, Aesthetics)
+  rev: "v5.0_fl_softmax_FitPad"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
+  arch: class             # Model architecture: 'class' or 'score'
+  embed_ver: "siglip2_so400m_patch16_512_FitPad" # Embedding version key (must match keys/prefixes in utils.py)
+                           # Examples:
+                           #   "CLIP"
+                           #   "siglip2_so400m_patch16_512_FitPad"
+                           #   "siglip2_so400m_patch16_512_CenterCrop"
+                           #   "siglip2_so400m_patch16_naflex_NaflexResize"
+                           #   "facebook/dinov2-large_TODO" # Need to define DINOv2 keys/params in utils.py
+  base_vision_model: null  # (Optional) Explicit HF model name (e.g., google/siglip2-so400m-patch16-512)
+                           # If null/missing, utils.py will try to infer from embed_ver.
+
+# --- PredictorModel v2 Architecture Parameters ---
+predictor_params:
+  # features: auto         # Input embedding size - Usually determined automatically from embed_ver via utils.py
+  hidden_dim: 1280         # Dimension of the main hidden MLP layers. Default based on embed_ver in utils.py if missing.
+  num_classes: 2          # Output neurons. Auto-determined: 1 for score, labels count for class. Explicitly set for BCE w/ >1 class.
+  use_attention: true     # Use the initial MultiheadAttention layer? true or false
+  num_attn_heads: 8        # Number of attention heads (if use_attention=true). Must be divisor of features dim.
+  attn_dropout: 0.218        # Dropout rate for attention layer (if use_attention=true). [0.0 - 1.0]
+  num_res_blocks: 1        # Number of ResBlocks in the MLP head. [0, 1, 2, ...]
+  dropout_rate: 0.218        # Dropout rate in the MLP 'down' block. [0.0 - 1.0]
+  output_mode: softmax     # Final activation. Auto-determined based on arch/loss_function if missing.
+                           # Options: 'linear', 'sigmoid', 'softmax', 'tanh_scaled'
+
+# --- Training Parameters ---
+train:
+  lr: 1e-4                 # Initial learning rate
+  steps: 50000            # Total number of training steps
+  batch: 32                # Training batch size per device
+  optimizer: "ADOPTAOScheduleFree" # Optimizer choice.
+                           # Options: "AdamW", "FMARSCropV3ExMachina", "ADOPT", "ADOPTScheduleFree", "ADOPTAOScheduleFree" (if installed)
+  loss_function: "focal"   # Loss function name.
+                           # Options: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll'.
+                           # If null/missing, defaults: FocalLoss for class, L1Loss for score.
+  precision: "fp32"        # Training precision. Options: "fp32", "fp16", "bf16"
+  val_split_count: 100      # Samples PER CLASS for validation set (0 to disable). Recommended: ~50-100 if data allows.
+  seed: 218                # Random seed for validation split shuffle.
+  num_workers: 0           # Dataloader workers (0 usually best for small .npy loads).
+  preload_data: true       # Preload dataset embeddings to RAM? true or false
+
+  # -- Scheduler Options (ignored if using ScheduleFree optimizers) --
+  cosine: false             # Use CosineAnnealingLR scheduler? true or false
+  warmup_steps: 0          # Number of linear warmup steps (if cosine=false). Set > 0 to enable.
+
+  # -- Optimizer Hyperparameters (Defaults vary by optimizer type if not specified) --
+  betas: [0.9, 0.999]      # Optimizer betas (tuple/list of 2 floats)
+  eps: 1e-6                # Optimizer epsilon (float)
+  weight_decay: 1e-3       # Optimizer weight decay (float)
+
+  # -- Optional: Specific Optimizer Args (Only relevant if using that optimizer) --
+  focal_loss_gamma: 2.0    # Gamma value for Focal Loss (if loss_function='focal')
+  gamma: 0.005             # Gamma for FMARSCrop (float)
+  r_sf: 0.0                # R value for ScheduleFree (float)
+  wlpow_sf: 2.0            # Weight LR Power for ScheduleFree (float)
+  state_precision: parameter # Precision for optimizer state in ScheduleFree (parameter or float32)
+  adaptive_clip: 1.0       # Adaptive clipping threshold for ADOPT/FMARS/ScheduleFree variants
+  adaptive_clip_eps: 1e-3  # Epsilon for adaptive clipping
+  # ... etc. Add other specific optimizer params from utils.py's list if needed ...
+
+# --- Data / Labels (Only relevant for Classifier) ---
+labels: # Define classes and optional loss weights
+  0: # Folder name should match the key
+    name: "Bad Anatomy"  # Display name for this class
+    loss: 1.0           # Optional: Loss weight multiplier for this class (default 1.0)
+  1:
+    name: "Good Anatomy"
+    loss: 1.0
+  # Add more classes if needed (e.g., 2: ...)

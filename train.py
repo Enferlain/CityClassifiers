@@ -151,62 +151,122 @@ def setup_dataloaders(args):
     return dataset, train_loader, val_loader
 
 def setup_model_criterion(args, dataset):
-    """Sets up the model and criterion based on args."""
-    criterion = None
-    model = None
-    loss_function_name = getattr(args, 'loss_function', None) # Get loss func name from args/config
+    """Sets up the model and criterion based on explicit args using PredictorModel v2."""
+    print("DEBUG setup_model_criterion: Setting up model and criterion...")
 
+    # --- Get Model Parameters from Args ---
     embed_params = get_embed_params(args.embed_ver)
+    features = embed_params['features']
+    hidden_dim = getattr(args, 'hidden_dim', embed_params.get('hidden', 1280))
+    arch = args.arch
+    loss_function_name = getattr(args, 'loss_function') # Assume it's set by parse_and_load_args
+    use_attention = getattr(args, 'use_attention', True)
+    num_attn_heads = getattr(args, 'num_attn_heads', 8)
+    attn_dropout = getattr(args, 'attn_dropout', 0.1)
+    num_res_blocks = getattr(args, 'num_res_blocks', 1)
+    dropout_rate = getattr(args, 'dropout_rate', 0.1)
+    # --- Read EXPLICIT output_mode from args (set via YAML/cmd line) ---
+    output_mode = getattr(args, 'output_mode', None)
+    if output_mode is None: raise ValueError("predictor_params.output_mode must be explicitly set.")
+    output_mode = output_mode.lower()
+    args.output_mode = output_mode
 
-    if args.arch == "score":
-        num_outputs = 1
-        # Select scorer loss function
-        if loss_function_name == 'l1':
-            print("Using L1Loss for scorer.")
-            criterion = nn.L1Loss(reduction='mean')
-        elif loss_function_name == 'mse':
-            print("Using MSELoss (L2) for scorer.")
-            criterion = nn.MSELoss(reduction='mean')
-        else: # Default for scorer
-            print("Defaulting to L1Loss for scorer.")
-            criterion = nn.L1Loss(reduction='mean')
+    num_classes = 1
+    criterion = None
+    class_weights = None # Logic to load weights remains same
 
-    elif args.arch == "class":
-        num_outputs = getattr(args, 'num_labels', None) or dataset.num_labels
-        if getattr(args, 'num_labels', None) and args.num_labels != dataset.num_labels:
-             print(f"Warning: Label count mismatch! Config/Args: {args.num_labels}, Dataset: {dataset.num_labels}. Using dataset value.")
-             args.num_labels = dataset.num_labels # Update args to match dataset
+    # --- Determine Criterion (Allowing non-standard pairings) ---
+    if loss_function_name == 'l1':
+        print("DEBUG: Setting criterion to L1Loss.")
+        criterion = nn.L1Loss(reduction='mean')
+        num_classes = 1
+        # Suggest 'tanh_scaled' or 'sigmoid' but don't enforce
+        if output_mode not in ['tanh_scaled', 'sigmoid', 'linear']: print(f"Warning: L1Loss typically paired with scaled output, got '{output_mode}'.")
 
-        # Select classifier loss function
-        if loss_function_name == 'focal':
-            print("Using Focal Loss (gamma=2.0) for classifier.")
-            criterion = FocalLoss(gamma=getattr(args, 'focal_loss_gamma', 2.0))
-            # Note: Basic FocalLoss here ignores class weights from args.weights
-        elif loss_function_name == 'crossentropy':
-            print("Using CrossEntropyLoss for classifier.")
-            weights = None
-            if args.weights and len(args.weights) == num_outputs:
-                weights = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32)
-                print(f"Class weights: {args.weights}")
-            elif args.weights:
-                print(f"Warning: Mismatch weights ({len(args.weights)}) vs labels ({num_outputs}). Ignoring weights.")
-            criterion = nn.CrossEntropyLoss(weight=weights)
-        else: # Default for classifier
-            print("Defaulting to CrossEntropyLoss for classifier.")
-            criterion = nn.CrossEntropyLoss() # No weights by default
+    elif loss_function_name == 'mse':
+        print("DEBUG: Setting criterion to MSELoss.")
+        criterion = nn.MSELoss(reduction='mean')
+        num_classes = 1
+        # Suggest 'tanh_scaled' or 'linear' but don't enforce
+        if output_mode not in ['tanh_scaled', 'linear', 'sigmoid']: print(f"Warning: MSELoss typically paired with linear/scaled output, got '{output_mode}'.")
+
+    elif loss_function_name == 'focal':
+        print("DEBUG: Setting criterion to FocalLoss.")
+        criterion = FocalLoss(gamma=getattr(args, 'focal_loss_gamma', 2.0))
+        num_classes = getattr(args, 'num_labels', 2)
+        # Warn if output is not linear, but allow it
+        if output_mode != 'linear': print(f"Warning: FocalLoss usually expects output_mode='linear', but got '{output_mode}'. Training with non-logit input.")
+
+    elif loss_function_name == 'crossentropy':
+        print("DEBUG: Setting criterion to CrossEntropyLoss.")
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        num_classes = getattr(args, 'num_labels', 2)
+        # Warn if output is not linear, but allow it
+        if output_mode != 'linear': print(f"Warning: CrossEntropyLoss usually expects output_mode='linear', but got '{output_mode}'. Training with non-logit input.")
+
+    elif loss_function_name == 'bce':
+        print("DEBUG: Setting criterion to BCEWithLogitsLoss.")
+        criterion = nn.BCEWithLogitsLoss()
+        num_classes = getattr(args, 'num_classes', 1)
+        # Warn if output is not linear, but allow it
+        if output_mode != 'linear': print(f"Warning: BCEWithLogitsLoss usually expects output_mode='linear', but got '{output_mode}'. Training with non-logit input.")
+        if num_classes != 1: print(f"Warning: BCEWithLogitsLoss used with num_classes={num_classes}. Ensure targets are correct.")
+
+    elif loss_function_name == 'nll':
+        print("DEBUG: Setting criterion to NLLLoss (expects LogSoftmax input).")
+        # --- FIX: Handle Weights Correctly ---
+        num_classes = getattr(args, 'num_labels', 2) # NLL needs num_classes >= 2
+        if args.weights and len(args.weights) == num_classes:
+             class_weights = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32) # Create tensor correctly
+             print(f"DEBUG: Using NLLLoss with weights: {args.weights}")
+        elif args.weights:
+             print(f"Warning: NLLLoss weight mismatch. Ignoring weights.")
+        # --- END FIX ---
+        criterion = nn.NLLLoss(weight=class_weights)
+
+        # --- FIX: NLL needs Logits from model, LogSoftmax applied before loss ---
+        # Force output_mode to linear
+        if output_mode != 'linear':
+             print(f"Warning: loss_function='nll' selected, but output_mode was '{output_mode}'. Forcing output_mode='linear'. NLLLoss expects LogSoftmax input, which will be applied in train loop.")
+             output_mode = 'linear'
+             args.output_mode = 'linear' # Update args for model instantiation
+        # --- END FIX ---
+
+        args.loss_function = 'nll' # Update args for config saving
 
     else:
-        raise ValueError(f"Unknown model architecture '{args.arch}'")
+        raise ValueError(f"Unknown loss_function '{loss_function_name}' specified in config.")
 
-    # Instantiate the model
-    # Pass attention params from args if they exist, otherwise defaults in PredictorModel apply
-    model_init_kwargs = embed_params.copy()
-    model_init_kwargs["outputs"] = num_outputs
-    if hasattr(args, 'num_attn_heads'): model_init_kwargs['num_attn_heads'] = args.num_attn_heads
-    if hasattr(args, 'attn_dropout'): model_init_kwargs['attn_dropout'] = args.attn_dropout
+    # --- Final check on num_classes consistency ---
+    config_num_classes = getattr(args, 'num_classes', None)
+    if config_num_classes is not None and config_num_classes != num_classes:
+        print(f"Warning: predictor_params.num_classes ({config_num_classes}) seems inconsistent with loss function expectation ({num_classes}). Using {num_classes}.")
+    # Use the num_classes determined by the loss function logic
+    args.num_classes = num_classes
 
-    model = PredictorModel(**model_init_kwargs)
+    # --- Instantiate the Enhanced Model ---
+    print(f"DEBUG: Instantiating PredictorModel v2 with num_classes={num_classes}, output_mode='{output_mode}'")
+    model = PredictorModel(
+        features=features,
+        hidden_dim=hidden_dim,
+        num_classes=num_classes, # Use determined num_classes
+        use_attention=use_attention,
+        num_attn_heads=num_attn_heads,
+        attn_dropout=attn_dropout,
+        num_res_blocks=num_res_blocks,
+        dropout_rate=dropout_rate,
+        output_mode=output_mode # Pass explicit output_mode from config
+    )
     model.to(TARGET_DEV)
+
+    # --- Store parameters back to args ---
+    args.features = features
+    args.hidden_dim = hidden_dim
+    # args.num_classes already updated
+    args.use_attention = use_attention
+    args.num_res_blocks = num_res_blocks
+    args.dropout_rate = dropout_rate
+    # args.output_mode already updated
 
     return model, criterion
 
@@ -400,21 +460,140 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                 progress.update(args.batch)
                 continue
 
-            # --- Prepare Target Tensor ---
+            # v2.2.1: Corrected logic for BCE/CE/Focal target shapes and dtypes
+            target_val_from_batch = batch.get("val") # Get original tensor first
+            if target_val_from_batch is None:
+                print(f"Error: 'val' is None in batch at step {current_step}. Skipping.")
+                progress.update(args.batch); continue
+
+            val = None # Define val outside try block
             try:
+                # --- Score Architecture ---
                 if args.arch == "score":
-                    # Scorer needs Float target, shape [B]
-                    val = val.to(TARGET_DEV, dtype=torch.float32).squeeze()
-                    if val.ndim != 1: raise ValueError(f"Scorer target shape {val.shape} != 1D")
+                    # Needs Float target, usually shape [B] to match model output
+                    val = target_val_from_batch.to(TARGET_DEV, dtype=torch.float32)
+                    # Ensure shape is [B] if model output is [B]
+                    # (Check y_pred shape *after* model call, before loss)
+                    if val.ndim == 2 and val.shape[1] == 1:
+                        val = val.squeeze(1)
+                    elif val.ndim != 1:
+                        val = val.squeeze() # General squeeze if needed
+                    # Final check might be needed after y_pred is known
+
+                # --- Class Architecture ---
                 elif args.arch == "class":
-                    # Classifier needs Long target, shape [B]
-                    val = val.squeeze().to(dtype=torch.long, device=TARGET_DEV) # Squeeze first, then convert
-                    if val.ndim != 1: raise ValueError(f"Classifier target shape {val.shape} != 1D")
+                    if isinstance(criterion, nn.BCEWithLogitsLoss):
+                        # BCE expects Float target with shape matching input (usually [B] for num_classes=1)
+                        val = target_val_from_batch.to(dtype=torch.float32, device=TARGET_DEV)
+                        if val.ndim == 2 and val.shape[1] == 1:
+                            val = val.squeeze(1) # [B, 1] -> [B]
+                        elif val.ndim != 1: # Handle other cases like [B] or maybe errors
+                            val = val.squeeze()
+                        if val.ndim != 1: # Final check for 1D
+                             raise ValueError(f"BCE target shape error. Expected 1D [B], got {val.shape}")
+
+                    else:  # CrossEntropy / Focal
+                        # Expects Long target with shape [B]
+                        val = target_val_from_batch.squeeze().to(dtype=torch.long, device=TARGET_DEV)
+                        if val.ndim != 1: # Final check for 1D
+                            raise ValueError(f"CE/Focal target shape error. Expected 1D [B], got {val.shape}")
+
+                else: # Should not happen if arch is validated earlier
+                     raise ValueError(f"Unknown args.arch '{args.arch}' during target prep.")
+
             except Exception as e:
                 print(f"Error processing target tensor 'val' at step {current_step}: {e}")
                 print(f"  Original val shape: {batch.get('val').shape}, dtype: {batch.get('val').dtype}")
                 progress.update(args.batch); continue
             # --- End Target Prep ---
+
+            # --- Get Model Prediction ---
+            # Do this *after* initial target checks, but *before* final shape check/loss
+            y_pred_for_loss = None
+            try:
+                 with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
+                     y_pred = model(emb) # Prediction on device
+
+                 # Prepare prediction shape to match target shape expected by loss
+                 # For num_classes=1 (BCE/Score), model outputs [B] after squeeze in forward.
+                 # For num_classes>1 (CE/Focal), model outputs [B, C].
+                 # BCE/L1/MSE expect [B] input if target is [B].
+                 # CE/Focal expect [B, C] input if target is [B].
+
+                 if isinstance(criterion, nn.BCEWithLogitsLoss):
+                      y_pred_for_loss = y_pred # Expects [B] from model
+                 elif isinstance(criterion, (nn.L1Loss, nn.MSELoss)):
+                      y_pred_for_loss = y_pred # Expects [B] from model (assuming Tanh scaled output)
+                 else: # CrossEntropy / Focal
+                      y_pred_for_loss = y_pred # Expects [B, C] from model
+
+                 if y_pred_for_loss is None: raise ValueError("y_pred_for_loss is None") # Safety
+
+            except Exception as e_pred:
+                 print(f"Error during model prediction at step {current_step}: {e_pred}")
+                 progress.update(args.batch); continue
+            # --- End Model Prediction ---
+
+            # --- Final Shape Check ---
+            if val is None: # Safety check
+                 print(f"Error: Target tensor 'val' is None before loss calculation. Skipping.")
+                 progress.update(args.batch); continue
+
+            # --- FIX: Add NLLLoss to the expected mismatch check ---
+            if y_pred_for_loss.shape != val.shape:
+                 # Specific check for losses expecting [B, C] input and [B] target
+                 if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss)): # <<< ADDED NLLLoss HERE
+                      if y_pred_for_loss.ndim == 2 and val.ndim == 1 and y_pred_for_loss.shape[0] == val.shape[0]:
+                           # This shape mismatch IS EXPECTED for CE/Focal/NLL ([B, C] vs [B])
+                           pass # Don't print error
+                      else:
+                            # Other mismatches ARE errors for CE/Focal/NLL
+                            print(f"ERROR: Shape mismatch before {type(criterion).__name__} loss! Input: {y_pred_for_loss.shape}, Target: {val.shape}. Skipping step.")
+                            progress.update(args.batch); continue
+                 else:
+                      # For other losses (BCE, L1, MSE), shapes MUST match
+                      print(f"ERROR: Shape mismatch before {type(criterion).__name__} loss! Input: {y_pred_for_loss.shape}, Target: {val.shape}. Skipping step.")
+                      progress.update(args.batch); continue
+            # --- End Final Shape Check ---
+
+            # --- Loss Calculation & Backward Pass ---
+            try:
+                 with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
+                     # y_pred_for_loss should have shape [B, C] and contain linear logits
+                     # Target 'val' should have shape [B] and contain Long class indices
+
+                     loss_input = y_pred_for_loss.to(torch.float32) # Ensure float32 logits
+
+                     # --- FIX: Apply LogSoftmax for NLLLoss ---
+                     if isinstance(criterion, nn.NLLLoss):
+                          # NLLLoss requires log-probabilities! Apply LogSoftmax.
+                          print("DEBUG train_loop: Applying LogSoftmax before NLLLoss.")
+                          loss_input = F.log_softmax(loss_input, dim=-1)
+                     # --- END FIX ---
+                     # Other losses (CE, Focal, BCE) work directly on logits (y_pred_for_loss)
+                     # L1/MSE might need specific output modes handled earlier or need y_pred here
+
+                     # Pass log-probabilities (for NLL) or logits (for others) to criterion
+                     loss = criterion(loss_input, val)
+
+                 if torch.isnan(loss) or torch.isinf(loss):
+                     print(f"Warning: NaN or Inf loss detected at step {current_step}. Skipping step.")
+                     progress.update(args.batch)
+                     continue
+
+                 optimizer.zero_grad(set_to_none=True)
+                 scaler.scale(loss).backward()
+                 scaler.step(optimizer)
+                 scaler.update()
+
+                 if scheduler is not None:
+                     scheduler.step()
+
+            except Exception as e_loss:
+                 print(f"Error during loss calculation or backward pass at step {current_step}: {e_loss}")
+                 print(f"  Input shape: {y_pred_for_loss.shape}, Target shape: {val.shape}, Target dtype: {val.dtype}")
+                 progress.update(args.batch); continue
+            # --- End Loss & Backward ---
 
             if emb.shape[0] != val.shape[0]:
                 print(f"Error: Batch size mismatch emb ({emb.shape[0]}) vs val ({val.shape[0]}). Skipping.")

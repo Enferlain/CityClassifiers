@@ -12,3 +12,4 @@ torchao
 triton-windows
 matplotlib
 bitsandbytes
+sentencepiece

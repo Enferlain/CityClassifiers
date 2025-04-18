@@ -1,8 +1,8 @@
 model:
   base: "AnatomyFlaws"
-  rev:  "v3.3_naflex_attn_fl" # New revision name
+  rev:  "v3.7_so400_attn_fl" # New revision name
   arch: class            # <--- Ensure this says 'class'
-  embed_ver: siglip2_so400m_patch16_naflex_NaflexResize
+  embed_ver: siglip2_so400m_patch16_512_FitPad
 
 train:
   lr:    1e-4     # Start with a potentially lower LR for stability

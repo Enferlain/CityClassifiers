@@ -106,12 +106,21 @@ def parse_and_load_args():
     args.arch = model_conf.get("arch", "class")
     args.embed_ver = model_conf.get("embed_ver", "CLIP")
     args.name = f"{args.base}-{args.rev}"
-    args.num_attn_heads = model_conf.get("num_attn_heads", 8)
-    args.attn_dropout = model_conf.get("attn_dropout", 0.1)
-
-    # --- Vision model lookup ---
-    # Try getting base_vision_model explicitly from YAML first
     args.base_vision_model = model_conf.get("base_vision_model")
+    # Predictor Params Merging (using predictor_params section from YAML)
+    predictor_conf = conf.get("predictor_params", {}) # Look in predictor_params first
+    if not predictor_conf: predictor_conf = conf.get("model", {}) # Fallback to model section? (Maybe remove this fallback)
+
+    # <<< ADD these lines to read from YAML, respecting command line defaults >>>
+    # Use getattr to check if command-line arg exists and is different from default
+    # If cmd line wasn't used, use the YAML value (defaulting to True if missing in YAML)
+    args.use_attention = getattr(args, 'use_attention', predictor_conf.get("use_attention", True))
+    args.num_attn_heads = getattr(args, 'num_attn_heads', predictor_conf.get("num_attn_heads", 8))
+    args.attn_dropout = getattr(args, 'attn_dropout', predictor_conf.get("attn_dropout", 0.1))
+    args.hidden_dim = getattr(args, 'hidden_dim', predictor_conf.get("hidden_dim", None)) # Handle None, default set later
+    args.num_res_blocks = getattr(args, 'num_res_blocks', predictor_conf.get("num_res_blocks", 1))
+    args.dropout_rate = getattr(args, 'dropout_rate', predictor_conf.get("dropout_rate", 0.1))
+    args.output_mode = predictor_conf.get("output_mode", None) # Read from YAML, default None (will raise error if missing)
 
     # If not found in YAML, try inferring from embed_ver using the LONGEST matching key
     if not args.base_vision_model:
@@ -177,6 +186,10 @@ def parse_and_load_args():
     if args.r_sf is None and 'schedulefree' in args.optimizer.lower(): args.r_sf = 0.0
     if args.wlpow_sf is None and 'schedulefree' in args.optimizer.lower(): args.wlpow_sf = 2.0
 
+    args.val_split_count = args.val_split_count\
+        if hasattr(args, 'val_split_count') and args.val_split_count != parser.get_default("val_split_count") \
+        else int(train_conf.get("val_split_count", 0))
+
     # Labels/Weights for classifier
     labels_conf = conf.get("labels", {})
     if args.arch == "class":
@@ -200,51 +213,84 @@ def parse_and_load_args():
     if args.arch == "score" and args.loss_function not in [None, 'l1', 'mse']:
          print(f"Warning: Loss '{args.loss_function}' specified for score arch. Using default L1.")
          args.loss_function = 'l1'
-    if args.arch == "class" and args.loss_function not in [None, 'crossentropy', 'focal']:
-         print(f"Warning: Loss '{args.loss_function}' specified for class arch. Using default CrossEntropy.")
-         args.loss_function = 'crossentropy'
+
+    # Add 'bce' to the list of valid class losses
+    valid_class_losses = [None, 'crossentropy', 'focal', 'bce', 'nll']
+    if args.arch == "class" and args.loss_function not in valid_class_losses:
+         print(f"Warning: Loss '{args.loss_function}' specified for class arch is not in {valid_class_losses}. Defaulting to FocalLoss.")
+         # Default to FocalLoss is probably safer than CrossEntropy now
+         args.loss_function = 'focal'
 
     return args
 
+# --- Updated write_config Function ---
+# Version 2.3.1: Saves enhanced PredictorModel v2 parameters
 def write_config(args):
-    """Writes the final training configuration to a JSON file."""
-    # Determine embed params based on the version string
+    """Writes the final training configuration, including enhanced model params, to a JSON file."""
+    # Determine embed params based on the version string (used for defaults/consistency)
     try: embed_params = get_embed_params(args.embed_ver)
-    except ValueError as e: print(f"Error: {e}"); embed_params = {"features": 0, "hidden": 0} # Handle error case
+    except ValueError as e: print(f"Error: {e}"); embed_params = {"features": 0, "hidden": 0}
 
     # Consolidate config dictionary
     conf = {
+        # --- Model Identification & Type ---
         "model": {
-            "base": args.base,
-            "rev": args.rev,
-            "arch": args.arch,
-            "embed_ver": args.embed_ver,
-            "base_vision_model": args.base_vision_model,
-            "num_attn_heads": getattr(args, 'num_attn_heads', None), # Store attention params if used
-            "attn_dropout": getattr(args, 'attn_dropout', None),
+            "base": getattr(args, 'base', 'unknown_model'),
+            "rev": getattr(args, 'rev', 'v0.0'),
+            "arch": getattr(args, 'arch', 'class'), # score or class
+            "embed_ver": getattr(args, 'embed_ver', 'unknown'), # e.g., FitPad, NaFlex
+            "base_vision_model": getattr(args, 'base_vision_model', None), # HF name
         },
+        # --- PredictorModel v2 Architecture Parameters ---
+        "predictor_params": {
+             # Renamed from model_params for clarity
+             # Use getattr with defaults matching PredictorModel.__init__ if args might be missing
+            "features": getattr(args, 'features', embed_params.get('features')), # Input embedding size
+            "hidden_dim": getattr(args, 'hidden_dim', embed_params.get('hidden')), # MLP hidden size
+            "num_classes": getattr(args, 'num_classes', 2), # Number of output neurons
+            "use_attention": getattr(args, 'use_attention', True), # Use attention layer?
+            "num_attn_heads": getattr(args, 'num_attn_heads', 8), # Attention heads
+            "attn_dropout": getattr(args, 'attn_dropout', 0.1), # Attention dropout
+            "num_res_blocks": getattr(args, 'num_res_blocks', 1), # Number of ResBlocks
+            "dropout_rate": getattr(args, 'dropout_rate', 0.1), # MLP dropout rate
+            "output_mode": getattr(args, 'output_mode', 'linear') # Final activation/output type
+        },
+        # --- Training Parameters ---
         "train": {
-            "lr": args.lr, "steps": args.steps, "batch": args.batch,
-            "optimizer": args.optimizer, "loss_function": args.loss_function,
-            "precision": args.precision, "val_split_count": args.val_split_count,
+            "lr": getattr(args, 'lr', 1e-4),
+            "steps": getattr(args, 'steps', 100000),
+            "batch": getattr(args, 'batch', 4),
+            "optimizer": getattr(args, 'optimizer', 'AdamW'),
+            "loss_function": getattr(args, 'loss_function', None), # Name of the loss used
+            "precision": getattr(args, 'precision', 'fp32'),
+            "val_split_count": getattr(args, 'val_split_count', 0),
             # Store relevant optimizer hyperparams
-            "betas": args.betas, "eps": args.eps, "weight_decay": args.weight_decay,
-            "cosine": args.cosine, "warmup_steps": args.warmup_steps,
-            # Add others as needed from args, checking if they exist first
-            **{k: v for k, v in vars(args).items() if k in ['gamma', 'r_sf', 'wlpow_sf', 'state_precision', 'weight_decouple', 'stable_weight_decay', 'adaptive_clip', 'adaptive_clip_eps', 'adaptive_clip_type', 'debias_beta2', 'use_beta2_warmup', 'beta2_warmup_initial', 'beta2_warmup_steps', 'mars_gamma', 'use_muon_pp', 'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd', 'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step', 'spam_clipping_type'] and v is not None}
+            "betas": getattr(args, 'betas', None),
+            "eps": getattr(args, 'eps', None),
+            "weight_decay": getattr(args, 'weight_decay', None),
+            "cosine": getattr(args, 'cosine', True),
+            "warmup_steps": getattr(args, 'warmup_steps', 0),
+            # Add others as needed (ensure they exist in args)
+            **{k: v for k, v in vars(args).items() if k in [
+                'gamma', 'r_sf', 'wlpow_sf', 'state_precision', 'weight_decouple',
+                'stable_weight_decay', 'adaptive_clip', 'adaptive_clip_eps',
+                'adaptive_clip_type', 'debias_beta2', 'use_beta2_warmup',
+                'beta2_warmup_initial', 'beta2_warmup_steps', 'mars_gamma', 'use_muon_pp',
+                'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd',
+                'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step',
+                'spam_clipping_type', 'focal_loss_gamma' # Added focal gamma
+                ] and hasattr(args, k) and getattr(args, k) is not None}
         },
-        "labels": args.labels if args.arch == "class" else None,
-        "model_params": { # Params passed to PredictorModel constructor
-            "features": embed_params["features"],
-            "hidden": embed_params["hidden"],
-            "outputs": args.num_labels
-        }
+        # --- Labels (Only relevant for Classifier) ---
+        "labels": getattr(args, 'labels', None) if getattr(args, 'arch', 'class') == "class" else None,
+        # Removed old model_params section to avoid duplication
     }
     os.makedirs(SAVE_FOLDER, exist_ok=True)
     config_path = f"{SAVE_FOLDER}/{args.name}.config.json"
     try:
         with open(config_path, "w") as f:
-            f.write(json.dumps(conf, indent=2, default=lambda x: repr(x))) # Use repr for non-serializable
+            # Use default=repr for things json can't handle directly (like tuples)
+            f.write(json.dumps(conf, indent=2, default=repr))
         print(f"Saved training config to {config_path}")
     except Exception as e:
         print(f"Error saving config file {config_path}: {e}")
@@ -382,23 +428,56 @@ class ModelWrapper:
                      continue
 
                 # --- Prediction and Loss ---
-                with torch.amp.autocast(device_type=self.device, enabled=autocast_enabled, dtype=amp_dtype):
-                    y_pred = self.model(emb) # Model forward pass
+                loss = torch.tensor(0.0, device=self.device)  # Initialize loss
+                try:  # Add try/except around prediction and loss calc
+                    with torch.amp.autocast(device_type=self.device, enabled=autocast_enabled, dtype=amp_dtype):
+                        y_pred = self.model(emb)  # Model forward pass
 
-                    # Prepare prediction shape for loss function
-                    if self.num_labels == 1 and y_pred.ndim == 2 and y_pred.shape[1] == 1:
-                         y_pred_for_loss = y_pred.squeeze(1) # [B, 1] -> [B] for L1/MSE
-                    else:
-                         y_pred_for_loss = y_pred # Shape [B, C] for CE/Focal
+                        # Prepare prediction shape if needed (ensure y_pred is defined)
+                        y_pred_for_loss = y_pred
+                        if isinstance(self.criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)):
+                            # These expect [B] input if num_classes=1
+                            if y_pred.ndim == 2 and y_pred.shape[1] == 1:
+                                y_pred_for_loss = y_pred.squeeze(1)
+                        # CE/Focal/NLL expect [B, C] input, so no squeeze needed here for y_pred
 
-                    # Ensure prediction is Float32 for stable loss calculation
+                    # Ensure prediction is Float32 for stability/activation
                     y_pred_final = y_pred_for_loss.to(torch.float32)
 
-                    # Calculate loss, ensuring target dtype matches loss function expectation
+                    # --- Calculate loss with Correct Target Dtypes ---
                     if isinstance(self.criterion, (torch.nn.CrossEntropyLoss, FocalLoss)):
-                        loss = self.criterion(y_pred_final, val) # val is Long
-                    else: # L1/MSE etc.
-                        loss = self.criterion(y_pred_final, val.to(y_pred_final.dtype)) # val needs to be Float
+                        # Expects logits [B, C] and Long target [B]
+                        # Ensure val is Long
+                        loss = self.criterion(y_pred_final, val.long())
+
+                    elif isinstance(self.criterion, nn.NLLLoss):
+                        # Expects LogSoftmax input [B, C] and Long target [B]
+                        print("DEBUG eval: Applying LogSoftmax before NLLLoss.")
+                        log_probs = F.log_softmax(y_pred_final, dim=-1)
+                        # Ensure val is Long
+                        loss = self.criterion(log_probs, val.long())
+
+                    elif isinstance(self.criterion, nn.BCEWithLogitsLoss):
+                        # Expects logits [B] and Float target [B]
+                        # Ensure val is Float and shape [B]
+                        if val.ndim != 1: val = val.squeeze()  # Make sure val is [B]
+                        loss = self.criterion(y_pred_final, val.float())
+
+                    elif isinstance(self.criterion, (nn.L1Loss, nn.MSELoss)):
+                        # Expects prediction [B] and Float target [B]
+                        # Ensure val is Float and shape [B]
+                        if val.ndim != 1: val = val.squeeze()  # Make sure val is [B]
+                        loss = self.criterion(y_pred_final, val.float())
+                    else:
+                        print(f"Warning: Unknown criterion type {type(self.criterion)} in validation loop.")
+                    # --- End Loss Calculation ---
+
+                except Exception as e_loss:
+                    print(f"Error during validation prediction/loss calculation: {e_loss}")
+                    print(
+                        f"  Input emb shape: {emb.shape}, Target val shape: {val.shape}, Target val dtype: {val.dtype}")
+                    # Handle error, maybe set loss to NaN or skip accumulation?
+                    loss = torch.tensor(float('nan'), device=self.device)  # Set loss to NaN on error
                 # --- End Prediction and Loss ---
 
                 # --- Accumulate Loss ---
