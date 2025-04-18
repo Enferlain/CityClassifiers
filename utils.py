@@ -11,6 +11,8 @@ from tqdm import tqdm
 from safetensors.torch import save_file, load_file # Added load_file
 import shutil # Added for removing old best checkpoints
 
+from losses import GHMC_Loss
+
 # --- Constants ---
 LOSS_MEMORY = 500 # How many recent steps' training loss to average for display
 LOG_EVERY_N = 100 # How often to log metrics and check validation
@@ -215,7 +217,7 @@ def parse_and_load_args():
          args.loss_function = 'l1'
 
     # Add 'bce' to the list of valid class losses
-    valid_class_losses = [None, 'crossentropy', 'focal', 'bce', 'nll']
+    valid_class_losses = [None, 'crossentropy', 'focal', 'bce', 'nll', 'ghm']
     if args.arch == "class" and args.loss_function not in valid_class_losses:
          print(f"Warning: Loss '{args.loss_function}' specified for class arch is not in {valid_class_losses}. Defaulting to FocalLoss.")
          # Default to FocalLoss is probably safer than CrossEntropy now
@@ -468,8 +470,19 @@ class ModelWrapper:
                         # Ensure val is Float and shape [B]
                         if val.ndim != 1: val = val.squeeze()  # Make sure val is [B]
                         loss = self.criterion(y_pred_final, val.float())
-                    else:
-                        print(f"Warning: Unknown criterion type {type(self.criterion)} in validation loop.")
+
+                        # <<< ADD THIS GHM BLOCK >>>
+                    elif isinstance(self.criterion, GHMC_Loss):
+                        # GHMC Loss expects logits [B, C] and Long target [B] (like CE/Focal)
+                        print("DEBUG eval: Calculating GHMC_Loss.")
+                        # Ensure val is Long
+                        loss = self.criterion(y_pred_final, val.long())
+                    # <<< END GHM BLOCK >>>
+
+                    else:  # Fallback for truly unknown
+                        print(
+                            f"Warning: Unknown criterion type {type(self.criterion)} in validation loop. Loss not calculated.")
+                        loss = torch.tensor(float('nan'), device=self.device)  # Set loss to NaN if unknown
                     # --- End Loss Calculation ---
 
                 except Exception as e_loss:

@@ -49,7 +49,7 @@ def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
     num_patches_w = new_width // patch_size
     num_patches_h = new_height // patch_size
     total_patches = num_patches_w * num_patches_h
-    print(f"  DEBUG Inf NaflexResize(v4): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_width}x{new_height}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})")
+    # print(f"  DEBUG Inf NaflexResize(v4): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_width}x{new_height}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})")
 
     if total_patches > target_patches: # Should not happen with floor, but good sanity check
         print(f"  ERROR Inf: Calculated patches ({total_patches}) exceed target ({target_patches})!")
@@ -325,7 +325,7 @@ class BasePipeline:
         # --- v1.7.11: Check Model Type ---
         # Check the actual loaded model's class name
         is_siglip2_model = "Siglip2Model" in self.clip_model.__class__.__name__
-        print(f"DEBUG get_clip_emb: Detected Model Type: {'Siglip2Model' if is_siglip2_model else 'Standard Siglip/Other'}")
+        # print(f"DEBUG get_clip_emb: Detected Model Type: {'Siglip2Model' if is_siglip2_model else 'Standard Siglip/Other'}")
         # --- End Check ---
 
         # Process with Hugging Face Processor
@@ -342,14 +342,14 @@ class BasePipeline:
                 if self.preprocess_func == preprocess_naflex_resize and processed_imgs:
                     w, h = processed_imgs[0].size; p = 16
                     num_patches = (w // p) * (h // p)
-                    print(f"DEBUG get_clip_emb: Calculated actual_num_patches = {num_patches} for Siglip2")
+                    # print(f"DEBUG get_clip_emb: Calculated actual_num_patches = {num_patches} for Siglip2")
                     actual_num_patches = num_patches
                 else: # Other preprocess for Siglip2 might need different logic or use default
                     print(f"DEBUG get_clip_emb: Siglip2 model detected but not NaFlexResize. Using default patches {actual_num_patches}.")
 
                 # Call processor - Try Plan H approach again, maybe it depends on processor type?
                 # Or just call normally and create mask manually if needed. Let's try normal call + manual mask first.
-                print("DEBUG: Calling self.proc() for Siglip2.")
+                # print("DEBUG: Calling self.proc() for Siglip2.")
                 inputs = self.proc(images=processed_imgs, return_tensors="pt")
 
                 # Extract all parts
@@ -361,7 +361,7 @@ class BasePipeline:
                 if spatial_shapes is None: raise ValueError("Siglip2 processor didn't return spatial_shapes.") # Required for Siglip2
 
                 # Manually create the correct attention mask
-                print(f"DEBUG: Creating manual attention mask of size {actual_num_patches} for Siglip2.")
+                # print(f"DEBUG: Creating manual attention mask of size {actual_num_patches} for Siglip2.")
                 attention_mask = torch.ones((1, actual_num_patches), dtype=torch.long, device=self.device)
 
                 # Move tensors
@@ -369,7 +369,7 @@ class BasePipeline:
                 spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
 
             else: # Standard Siglip Model
-                print("DEBUG: Calling self.proc() for standard Siglip.")
+                # print("DEBUG: Calling self.proc() for standard Siglip.")
                 inputs = self.proc(images=processed_imgs, return_tensors="pt")
                 pixel_values = inputs.get("pixel_values")
                 if pixel_values is None: raise ValueError("Standard Siglip processor didn't return pixel_values.")
@@ -401,7 +401,7 @@ class BasePipeline:
                         # Standard SiglipVisionModel likely only takes pixel_values
                         pass # No extra args needed
 
-                    print(f"DEBUG: Calling vision_model ({vision_model_component.__class__.__name__}) with keys: {list(model_call_kwargs.keys())}")
+                    # print(f"DEBUG: Calling vision_model ({vision_model_component.__class__.__name__}) with keys: {list(model_call_kwargs.keys())}")
                     vision_outputs = vision_model_component(**model_call_kwargs)
                     emb = vision_outputs.pooler_output
                 # --- Fallbacks (keep as before) ---
@@ -688,7 +688,7 @@ class CityClassifierPipeline(BasePipeline):
              # Let's assume the loaded pipeline knows the model's output_mode? Access self.model.output_mode?
              final_score = scalar_value
              if hasattr(self, 'model') and self.model.output_mode == 'linear':
-                  print("DEBUG format_pred: Applying sigmoid to linear output for probability display.")
+                  # print("DEBUG format_pred: Applying sigmoid to linear output for probability display.")
                   final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
              elif hasattr(self, 'model') and self.model.output_mode == 'tanh_scaled':
                   final_score = scalar_value # Already scaled 0-1
@@ -713,7 +713,7 @@ class CityClassifierPipeline(BasePipeline):
              # Apply softmax here if output was linear for probability display?
              probabilities = pred_to_format # Assume already probabilities if output_mode was softmax
              if hasattr(self, 'model') and self.model.output_mode == 'linear':
-                  print("DEBUG format_pred: Applying softmax to linear output for probability display.")
+                  # print("DEBUG format_pred: Applying softmax to linear output for probability display.")
                   probabilities = F.softmax(pred_to_format, dim=-1)
 
              for k in range(num_classes_model):

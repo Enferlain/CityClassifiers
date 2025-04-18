@@ -10,6 +10,7 @@ import math
 import torch.nn as nn               # <--- Added nn import
 import torch.nn.functional as F     # <--- Added functional import
 
+from losses import GHMC_Loss
 # --- Local Imports ---
 # Assuming utils.py is in the same directory or accessible
 from utils import (
@@ -32,6 +33,7 @@ else:
 
 try:
     from optimizer.fmarscrop import FMARSCropV3ExMachina
+    from optimizer.adabelief import AdaBelief
     from optimizer.adopt import ADOPT
     from optimizer.schedulefree import (
         ScheduleFreeWrapper, ADOPTScheduleFree, ADOPTAOScheduleFree
@@ -41,6 +43,7 @@ try:
 except ImportError as e:
     print(f"Warning: Custom optimizer import failed ({e}). Check dependencies. Only AdamW/standard torch optims available.")
     FMARSCropV3ExMachina = None
+    AdaBelief = None  # Add this line
     ADOPT = None
     ScheduleFreeWrapper = None
     ADOPTScheduleFree = None
@@ -234,6 +237,24 @@ def setup_model_criterion(args, dataset):
 
         args.loss_function = 'nll' # Update args for config saving
 
+    # <<< ADD GHM BLOCK >>>
+    elif loss_function_name == 'ghm':
+        print("DEBUG: Setting criterion to GHMC_Loss.")
+        # Get optional GHM parameters from config/args
+        ghm_bins = getattr(args, 'ghm_bins', 10)
+        ghm_momentum = getattr(args, 'ghm_momentum', 0.75)
+        criterion = GHMC_Loss(bins=ghm_bins, momentum=ghm_momentum, reduction='mean')
+        num_classes = getattr(args, 'num_labels', 2) # GHM expects >= 2 classes currently
+        if num_classes < 2:
+             raise ValueError("GHMC_Loss currently requires num_classes >= 2.")
+        # Validation: GHM requires linear output (logits)
+        if output_mode != 'linear':
+             raise ValueError(f"GHMC_Loss requires output_mode='linear', but got '{output_mode}' in config.")
+        args.loss_function = 'ghm' # Update args
+        # Handle weights? GHMC doesn't directly take class weights, it harmonizes gradients.
+        if args.weights: print("Warning: Class weights specified but GHMC_Loss does not use them directly.")
+    # <<< END GHM BLOCK >>>
+
     else:
         raise ValueError(f"Unknown loss_function '{loss_function_name}' specified in config.")
 
@@ -323,6 +344,41 @@ def setup_optimizer_scheduler(args, model):
             print("  Falling back to AdamW.")
             optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr))  # Fallback
 
+    # <<< --- ADD THIS ELIF BLOCK for AdaBelief --- >>>
+    elif optimizer_name == 'adabelief' and AdaBelief is not None:
+        print("Instantiating AdaBelief Optimizer...")
+        # Gather args, using AdaBelief's defaults if not specified in args/YAML
+        adabelief_args = {
+            'lr': float(args.lr), # Should be very low (e.g., 1e-7) from config
+            'betas': tuple(getattr(args, 'betas', (0.9, 0.999))),
+            'weight_decay': float(getattr(args, 'weight_decay', 0.0)),
+            'eps': float(getattr(args, 'eps', 1e-16)), # AdaBelief default is 1e-16, maybe use 1e-8 from args? Let's use args.eps if specified.
+            'weight_decouple': bool(getattr(args, 'weight_decouple', True)), # Default True
+            'fixed_decay': bool(getattr(args, 'fixed_decay', False)), # Default False
+            'rectify': bool(getattr(args, 'rectify', False)), # Default False (Consider True? Like RAdam?)
+            'ams_bound': bool(getattr(args, 'ams_bound', False)), # Default False
+            'adanorm': bool(getattr(args, 'adanorm', False)), # Default False
+            'adam_debias': bool(getattr(args, 'adam_debias', False)), # Default False
+            'cautious': bool(getattr(args, 'cautious', False)), # cautious mode
+        }
+        # Filter out None values only if constructor can't handle them (most args have defaults)
+        # adabelief_args = {k: v for k, v in adabelief_args.items() if v is not None} # Probably not needed
+
+        # Ensure correct types
+        if not isinstance(adabelief_args['betas'], tuple) or len(adabelief_args['betas']) != 2:
+             print(f"Warning: Invalid betas {adabelief_args['betas']}, using default (0.9, 0.999).")
+             adabelief_args['betas'] = (0.9, 0.999)
+
+        try:
+             optimizer = AdaBelief(model.parameters(), **adabelief_args)
+             # AdaBelief manages its own step size adaptations, no external scheduler needed
+             is_schedule_free = False # Treat it like schedule-free
+        except Exception as e_optim:
+             print(f"ERROR: Failed to instantiate AdaBelief: {e_optim}")
+             print("Falling back to AdamW.")
+             optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr)) # Fallback
+             is_schedule_free = False # AdamW needs scheduler
+
     elif optimizer_name == 'adoptaoschedulefree' and ADOPTAOScheduleFree is not None:
         # Gather args specifically for ADOPTAOScheduleFree
         adopt_args = {k: getattr(args, k) for k in [
@@ -365,9 +421,12 @@ def setup_optimizer_scheduler(args, model):
 
     # --- Scheduler Setup ---
     if not is_schedule_free:
-        if getattr(args, 'cosine', True): # Default to cosine if not schedule free
+        if getattr(args, 'cosine', True): # Check if cosine is enabled in config
             print("Using CosineAnnealingLR Scheduler.")
-            t_max_steps = max(1, int(args.steps / args.batch))
+            t_max_steps = max(1, int(args.steps / args.batch)) # Or just args.steps? Check CosineAnnealingLR docs for T_max units
+            # Use args.steps for T_max as it represents total iterations more clearly
+            # t_max_steps = args.steps
+            print(f"  Setting T_max = {t_max_steps} steps for CosineAnnealingLR.")
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max_steps)
         elif getattr(args, 'warmup_steps', 0) > 0:
             print("Using LinearLR Warmup Scheduler.")
@@ -542,7 +601,7 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
             # --- FIX: Add NLLLoss to the expected mismatch check ---
             if y_pred_for_loss.shape != val.shape:
                  # Specific check for losses expecting [B, C] input and [B] target
-                 if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss)): # <<< ADDED NLLLoss HERE
+                 if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)):
                       if y_pred_for_loss.ndim == 2 and val.ndim == 1 and y_pred_for_loss.shape[0] == val.shape[0]:
                            # This shape mismatch IS EXPECTED for CE/Focal/NLL ([B, C] vs [B])
                            pass # Don't print error

@@ -3,7 +3,7 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"     # Base name for the model concept (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v5.0_fl_softmax_FitPad"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
+  rev: "v5.3_adabeleif_fl_sigmoid_FitPad"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
   arch: class             # Model architecture: 'class' or 'score'
   embed_ver: "siglip2_so400m_patch16_512_FitPad" # Embedding version key (must match keys/prefixes in utils.py)
                            # Examples:
@@ -21,22 +21,22 @@ predictor_params:
   hidden_dim: 1280         # Dimension of the main hidden MLP layers. Default based on embed_ver in utils.py if missing.
   num_classes: 2          # Output neurons. Auto-determined: 1 for score, labels count for class. Explicitly set for BCE w/ >1 class.
   use_attention: true     # Use the initial MultiheadAttention layer? true or false
-  num_attn_heads: 8        # Number of attention heads (if use_attention=true). Must be divisor of features dim.
+  num_attn_heads: 16        # Number of attention heads (if use_attention=true). Must be divisor of features dim.
   attn_dropout: 0.218        # Dropout rate for attention layer (if use_attention=true). [0.0 - 1.0]
-  num_res_blocks: 1        # Number of ResBlocks in the MLP head. [0, 1, 2, ...]
+  num_res_blocks: 3        # Number of ResBlocks in the MLP head. [0, 1, 2, ...]
   dropout_rate: 0.218        # Dropout rate in the MLP 'down' block. [0.0 - 1.0]
-  output_mode: softmax     # Final activation. Auto-determined based on arch/loss_function if missing.
+  output_mode: sigmoid     # Final activation. Auto-determined based on arch/loss_function if missing.
                            # Options: 'linear', 'sigmoid', 'softmax', 'tanh_scaled'
 
 # --- Training Parameters ---
 train:
-  lr: 1e-4                 # Initial learning rate
-  steps: 50000            # Total number of training steps
+  lr: 1e-4                # Initial learning rate
+  steps: 300000            # Total number of training steps
   batch: 32                # Training batch size per device
-  optimizer: "ADOPTAOScheduleFree" # Optimizer choice.
-                           # Options: "AdamW", "FMARSCropV3ExMachina", "ADOPT", "ADOPTScheduleFree", "ADOPTAOScheduleFree" (if installed)
+  optimizer: "AdaBelief" # Optimizer choice.
+                           # Options: "AdamW", "FMARSCropV3ExMachina", "AdaBelief", "ADOPT", "ADOPTScheduleFree", "ADOPTAOScheduleFree" (from machina fork of easy trainer)
   loss_function: "focal"   # Loss function name.
-                           # Options: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll'.
+                           # Options: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll', 'ghm'.
                            # If null/missing, defaults: FocalLoss for class, L1Loss for score.
   precision: "fp32"        # Training precision. Options: "fp32", "fp16", "bf16"
   val_split_count: 100      # Samples PER CLASS for validation set (0 to disable). Recommended: ~50-100 if data allows.
@@ -45,12 +45,12 @@ train:
   preload_data: true       # Preload dataset embeddings to RAM? true or false
 
   # -- Scheduler Options (ignored if using ScheduleFree optimizers) --
-  cosine: false             # Use CosineAnnealingLR scheduler? true or false
-  warmup_steps: 0          # Number of linear warmup steps (if cosine=false). Set > 0 to enable.
+  cosine: true             # Use CosineAnnealingLR scheduler? true or false
+  warmup_steps: 10000      # Number of linear warmup steps (if cosine=false). Set > 0 to enable.
 
   # -- Optimizer Hyperparameters (Defaults vary by optimizer type if not specified) --
   betas: [0.9, 0.999]      # Optimizer betas (tuple/list of 2 floats)
-  eps: 1e-6                # Optimizer epsilon (float)
+  eps: 1e-8                # Optimizer epsilon (float)
   weight_decay: 1e-3       # Optimizer weight decay (float)
 
   # -- Optional: Specific Optimizer Args (Only relevant if using that optimizer) --
