@@ -253,21 +253,24 @@ class BasePipeline:
             if hasattr(self.proc, 'image_processor'):
                  image_processor = self.proc.image_processor
                  print(f"  DEBUG Inference: Original image processor config: {image_processor}")
-                 if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
+#                 if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
                  if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
-                 if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False # Let normalization handle scaling
+#                 if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False # Let normalization handle scaling
                  if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True # Keep normalization
                  print(f"  DEBUG Inference: Modified image processor config: {image_processor}")
             else:
                  print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
 
-            # Determine model's expected input size
-            self.proc_size = 512 # Default
+            # Determine model's expected input size (for non-naflex modes like FitPad)
+            self.proc_size = 512  # Default
             if hasattr(self.proc, 'image_processor') and hasattr(self.proc.image_processor, 'size'):
-                 proc_sz = self.proc.image_processor.size
-                 if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("height", 512)) # Use height or crop size
-                 elif isinstance(proc_sz, int): self.proc_size = int(proc_sz)
-            # print(f"  Determined processor target size: {self.proc_size}") # Already printed below essentially
+                proc_sz = self.proc.image_processor.size
+                if isinstance(proc_sz, dict):
+                    # Use height for square or potentially non-square standard sizes
+                    self.proc_size = int(proc_sz.get("height", 512))
+                elif isinstance(proc_sz, int):
+                    self.proc_size = int(proc_sz)
+            # print(f"  Determined processor target size (for FitPad/CenterCrop): {self.proc_size}")
 
         except Exception as e:
             print(f"Error initializing vision model {model_name}: {e}")
@@ -311,145 +314,173 @@ class BasePipeline:
         return processed_imgs if processed_imgs else None
     # --- End Modify _preprocess_images ---
 
-    # --- Keep get_clip_emb ---
-    # It now correctly calls the modified _preprocess_images
+    # Version 1.7.2: Handle NaFlex Proc1024 via direct processor call
     def get_clip_emb(self, img_list: list[Image.Image]) -> torch.Tensor | None:
+        """
+        Generates embeddings for a list of PIL images.
+        - Handles NaFlex by calling processor directly with max_num_patches=1024.
+        - Handles FitPad/CenterCrop via manual preprocessing then processor call.
+        """
         if not isinstance(img_list, list): img_list = [img_list]
-
-        # Preprocess using the dynamically selected function via _preprocess_images
-        processed_imgs = self._preprocess_images(img_list)
-        if not processed_imgs:
-            print("Error: No images left after preprocessing.")
+        if not img_list:
+            print("Error: Empty image list provided to get_clip_emb.")
             return None
 
-        # --- v1.7.11: Check Model Type ---
-        # Check the actual loaded model's class name
+        # --- Check Model Type and Preprocessing Mode ---
         is_siglip2_model = "Siglip2Model" in self.clip_model.__class__.__name__
-        # print(f"DEBUG get_clip_emb: Detected Model Type: {'Siglip2Model' if is_siglip2_model else 'Standard Siglip/Other'}")
-        # --- End Check ---
+        # Determine preprocessing based on embed_ver stored during init
+        is_naflex_mode = "Naflex" in self.embed_ver  # Simple check, adjust if naming changes
 
-        # Process with Hugging Face Processor
-        inputs = None
+        model_call_kwargs = {}  # Initialize
         pixel_values = None
         attention_mask = None
         spatial_shapes = None
-        actual_num_patches = 256 # Default
 
         try:
-            # --- v1.7.11: Processor call and input extraction based on type ---
-            if is_siglip2_model:
-                # Calculate actual_num_patches for Siglip2/Naflex
-                if self.preprocess_func == preprocess_naflex_resize and processed_imgs:
-                    w, h = processed_imgs[0].size; p = 16
-                    num_patches = (w // p) * (h // p)
-                    # print(f"DEBUG get_clip_emb: Calculated actual_num_patches = {num_patches} for Siglip2")
-                    actual_num_patches = num_patches
-                else: # Other preprocess for Siglip2 might need different logic or use default
-                    print(f"DEBUG get_clip_emb: Siglip2 model detected but not NaFlexResize. Using default patches {actual_num_patches}.")
+            # --- NaFlex Mode: Use Processor Logic @ 1024 ---
+            if is_siglip2_model and is_naflex_mode:
+                # print(f"DEBUG get_clip_emb: Using Processor NaFlex logic (target 1024 patches).")
+                # Call processor directly on the raw PIL images
+                inputs = self.proc(
+                    images=img_list,  # Process the whole batch if multiple images provided
+                    return_tensors="pt",
+                    max_num_patches=1024  # <<< Override target length
+                )
 
-                # Call processor - Try Plan H approach again, maybe it depends on processor type?
-                # Or just call normally and create mask manually if needed. Let's try normal call + manual mask first.
-                # print("DEBUG: Calling self.proc() for Siglip2.")
-                inputs = self.proc(images=processed_imgs, return_tensors="pt")
-
-                # Extract all parts
+                # Extract outputs directly from processor
                 pixel_values = inputs.get("pixel_values")
-                attention_mask_from_processor = inputs.get("pixel_attention_mask") # May be wrong size (256)
+                attention_mask = inputs.get("pixel_attention_mask")  # Processor provides correct mask
                 spatial_shapes = inputs.get("spatial_shapes")
 
-                if pixel_values is None: raise ValueError("Siglip2 processor didn't return pixel_values.")
-                if spatial_shapes is None: raise ValueError("Siglip2 processor didn't return spatial_shapes.") # Required for Siglip2
+                if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
+                if attention_mask is None: raise ValueError("Processor didn't return 'pixel_attention_mask'.")
+                if spatial_shapes is None: raise ValueError("Processor didn't return 'spatial_shapes'.")
 
-                # Manually create the correct attention mask
-                # print(f"DEBUG: Creating manual attention mask of size {actual_num_patches} for Siglip2.")
-                attention_mask = torch.ones((1, actual_num_patches), dtype=torch.long, device=self.device)
+                # Verify sequence length
+                if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
+                    print(
+                        f"ERROR: Inference NaFlex Processor output sequence length is not 1024! Got {pixel_values.shape[1]}.")
+                    return None
 
-                # Move tensors
-                pixel_values = pixel_values.to(device=self.device, dtype=self.clip_dtype)
-                spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
+                # Prepare args for model call
+                model_call_kwargs = {
+                    "pixel_values": pixel_values.to(device=self.device, dtype=self.clip_dtype),
+                    "attention_mask": attention_mask.to(device=self.device),
+                    "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
+                }
 
-            else: # Standard Siglip Model
-                # print("DEBUG: Calling self.proc() for standard Siglip.")
+            # --- FitPad / CenterCrop / Other Modes: Manual Preprocessing ---
+            else:
+                # print(f"DEBUG get_clip_emb: Using manual preprocessing ({self.embed_ver}).")
+                # Preprocess using the selected manual function (e.g., FitPad)
+                # Note: _preprocess_images applies the function stored in self.preprocess_func
+                processed_imgs = self._preprocess_images(img_list)
+                if not processed_imgs:
+                    print("Error: No images left after manual preprocessing.")
+                    return None
+
+                # Call processor on the *already preprocessed* images
                 inputs = self.proc(images=processed_imgs, return_tensors="pt")
-                pixel_values = inputs.get("pixel_values")
-                if pixel_values is None: raise ValueError("Standard Siglip processor didn't return pixel_values.")
-                # Don't need attention_mask or spatial_shapes for standard SiglipModel forward pass
-                pixel_values = pixel_values.to(device=self.device, dtype=self.clip_dtype)
-            # --- End Conditional Logic ---
+                pixel_values_from_proc = inputs.get("pixel_values")
+                if pixel_values_from_proc is None: raise ValueError("Processor didn't return 'pixel_values'.")
+
+                pixel_values = pixel_values_from_proc.to(device=self.device, dtype=self.clip_dtype)
+                model_call_kwargs = {"pixel_values": pixel_values}
+
+                # Pass mask if available (e.g., for standard SigLIP if processor adds one)
+                # This is less relevant now since resize/pad are done manually, but keep for safety
+                attention_mask_from_processor = inputs.get("pixel_attention_mask")
+                if attention_mask_from_processor is not None:
+                    model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=self.device)
+
+                # No spatial_shapes needed for non-NaFlex models typically
+                # If needed for a future standard model, logic would go here.
 
         except Exception as e:
-            print(f"Error processing images with HF processor: {e}")
+            print(f"Error processing images with HF processor in inference: {e}")
             import traceback
             traceback.print_exc()
             return None
 
-        # Get Embeddings from Vision Model
+        # --- Get Embeddings from Vision Model (Common Logic) ---
         emb = None
         with torch.no_grad():
             try:
-                # --- v1.7.11: Conditional Model Call ---
                 vision_model_component = getattr(self.clip_model, 'vision_model', None)
                 if vision_model_component:
-                    # Prepare args based on model type
-                    model_call_kwargs = {"pixel_values": pixel_values}
-                    if is_siglip2_model:
-                        # Siglip2VisionModel expects 'attention_mask' and 'spatial_shapes'
-                        if attention_mask is not None: model_call_kwargs["attention_mask"] = attention_mask
-                        if spatial_shapes is not None: model_call_kwargs["spatial_shapes"] = spatial_shapes
-                        else: raise ValueError("spatial_shapes is None, cannot call Siglip2VisionModel.") # Should have failed earlier
-                    else:
-                        # Standard SiglipVisionModel likely only takes pixel_values
-                        pass # No extra args needed
-
-                    # print(f"DEBUG: Calling vision_model ({vision_model_component.__class__.__name__}) with keys: {list(model_call_kwargs.keys())}")
+                    # print(f"DEBUG Inference: Calling vision_model...")
                     vision_outputs = vision_model_component(**model_call_kwargs)
                     emb = vision_outputs.pooler_output
-                # --- Fallbacks (keep as before) ---
                 elif hasattr(self.clip_model, 'get_image_features'):
-                     print("Warning: Calling get_image_features as vision_model attribute not found.")
-                     emb = self.clip_model.get_image_features(pixel_values=pixel_values)
-                else: # Generic fallback if needed
-                     print("Warning: Neither vision_model nor get_image_features found. Using direct call.")
-                     emb = self.clip_model(pixel_values=pixel_values).pooler_output # Or appropriate attr
+                    # print("Warning: Calling get_image_features in inference.")
+                    # get_image_features might only expect pixel_values for some models
+                    kwargs_for_get = {"pixel_values": model_call_kwargs["pixel_values"]}
+                    emb = self.clip_model.get_image_features(**kwargs_for_get)
+                else:
+                    raise AttributeError("Model has neither 'vision_model' nor 'get_image_features'.")
 
-                     if emb is None: raise ValueError("Failed to get embedding from vision model outputs.")
+                if emb is None: raise ValueError("Failed to get embedding from model call.")
+
             except Exception as e_fwd:
-                print(f"Error during vision model forward pass: {e_fwd}")
+                print(f"Error during vision model forward pass in inference: {e_fwd}")
                 import traceback
                 traceback.print_exc()
                 return None
 
-            # --- Post-processing ---
-            if emb is None:
-                print("Error: Embedding is None after model forward pass.")
-                return None
-
+            # --- Post-processing (Common Logic) ---
             final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
             norm = torch.linalg.norm(final_emb, dim=-1, keepdim=True).clamp(min=1e-8)
             final_emb = final_emb / norm
 
             return final_emb
 
-    # --- Keep get_clip_emb_tiled ---
-    # Note: Tiling logic might need adjustment if using NaFlex, but focusing on tiling=False for now.
+    # Version 1.7.4: Corrected five_crop argument name
     def get_clip_emb_tiled(self, raw_pil_image: Image.Image, tiling: bool = False) -> torch.Tensor | None:
         """Generates embeddings, potentially using 5-crop tiling."""
         img_list = []
+        # Check if embed_ver indicates NaFlex mode
+        is_naflex_mode = "Naflex" in self.embed_ver
+
         if tiling:
-            # Tiling with NaFlex might not be standard. What should happen here?
-            # For now, let's just process the single image even if tiling=True for NaFlex.
-            if self.preprocess_func == preprocess_naflex_resize:
+            # If tiling is requested BUT it's NaFlex mode, process single view instead
+            if is_naflex_mode:
                  print("DEBUG: Tiling requested with NaFlex, processing single view instead.")
                  img_list = [raw_pil_image]
             else:
-                 # Original FitPad tiling logic (might need review)
-                 print("DEBUG: Tiling requested. Generating 5 padded views.")
-                 base_padded_img = self._preprocess_images([raw_pil_image])
-                 if not base_padded_img: return None
-                 img_list = [base_padded_img[0]] * 5
+                 # Original FitPad tiling logic
+                 # We need _preprocess_images for the base padded view if using 5-crop
+                 base_padded_img_list = self._preprocess_images([raw_pil_image]) # Returns a list
+                 if not base_padded_img_list:
+                     print("Error: Preprocessing failed for tiling base image.")
+                     return None
+                 base_padded_img_tensor = TF.to_tensor(base_padded_img_list[0])
+
+                 # Use TF.five_crop - needs tensor input, returns tuple of tensors
+                 # Size for five_crop should be the CLIP input size (self.proc_size)
+                 crop_size = [self.proc_size, self.proc_size] # e.g., [512, 512]
+                 try:
+                      # Ensure image is large enough for the crop size
+                      if base_padded_img_tensor.shape[1] < crop_size[0] or base_padded_img_tensor.shape[2] < crop_size[1]:
+                            print(f"Warning: Image ({base_padded_img_tensor.shape}) smaller than crop size ({crop_size}). Using original padded image.")
+                            img_list = base_padded_img_list
+                      else:
+                            # <<< CORRECTED ARGUMENT NAME HERE >>>
+                            tiled_crops_tensors = TF.five_crop(base_padded_img_tensor, size=crop_size)
+                            # Convert tensors back to PIL images for get_clip_emb processing
+                            img_list = [TF.to_pil_image(crop) for crop in tiled_crops_tensors]
+                            # print(f"DEBUG: Generated {len(img_list)} tiled crops.")
+                 except Exception as e_tile:
+                      print(f"Error during five_crop tiling: {e_tile}. Falling back to single view.")
+                      img_list = base_padded_img_list # Fallback
+
         else:
-             # Process single image (preprocessing happens in get_clip_emb)
+             # Process single image (preprocessing happens inside get_clip_emb)
              img_list = [raw_pil_image]
+
+        # Ensure img_list contains PIL images
+        if not all(isinstance(img, Image.Image) for img in img_list):
+             print("Error: img_list does not contain PIL images before get_clip_emb.")
+             return None
 
         return self.get_clip_emb(img_list) # Calls the updated get_clip_emb
 
@@ -658,7 +689,7 @@ class CityClassifierPipeline(BasePipeline):
                 val = 0.0
                 try:
                     if   tile_strategy == "mean":   val = torch.mean(tile_scores).item()
-                    elif tile_strategy == "median": val = torch.median(tile_scores).values.item() # Get median value
+                    elif tile_strategy == "median": val = torch.median(tile_scores).item() # Get median value
                     elif tile_strategy == "max":    val = torch.max(tile_scores).item()
                     elif tile_strategy == "min":    val = torch.min(tile_scores).item()
                     else: raise NotImplementedError(f"Invalid strategy '{tile_strategy}'")
