@@ -46,6 +46,8 @@ def get_embed_params(ver):
         "siglip2_so400m_patch16_512_FitPad": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_512_CenterCrop": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_naflex_NaflexResize": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_NaflexResize_Pad1024": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_Naflex_Proc1024": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_naflex_AvgCrop": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_naflex_FitPad": {"features": 1152, "hidden": 1280},
         "siglip2_so400m_patch16_naflex_CenterCrop": {"features": 1152, "hidden": 1280},

@@ -4,6 +4,7 @@
 import os
 import torch
 import torchvision.transforms.functional as F # Needed for AvgCrop's five_crop
+import torch.nn.functional as torch_func
 from PIL import Image
 from tqdm import tqdm
 import numpy as np
@@ -135,9 +136,9 @@ def init_vision_model(model_name, device, dtype):
         if hasattr(processor, 'image_processor'):
              image_processor = processor.image_processor
              print(f"  DEBUG: Original processor config: {image_processor}")
-             if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
+#             if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
              if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
-             if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False
+#            if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False
              if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True
              print(f"  DEBUG: Modified processor config: {image_processor}")
         else: print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
@@ -162,7 +163,7 @@ def init_vision_model(model_name, device, dtype):
         raise
 
 
-# --- Unified Embedding Function ---
+# Version 4.1.2 (TEMPORARY SANITY CHECK): Use processor's logic for NaFlex with max_num_patches=1024
 @torch.no_grad()
 def get_embedding(
     raw_img_pil: Image.Image,
@@ -172,11 +173,13 @@ def get_embedding(
     device,
     dtype, # Compute dtype
     model_image_size: int, # Standard size for non-Naflex
-    resize_factor_avg_crop: float = 2.0
+    resize_factor_avg_crop: float = 2.0,
+    # target_length: int = 1024 # We don't need manual target_length for this check
 ) -> np.ndarray | None:
     """
     Generates embedding for a single raw PIL image using the specified mode.
-    Handles FitPad, CenterCrop, NaFlexResize, and AvgCrop.
+    Handles FitPad, CenterCrop.
+    ** TEMPORARY: For naflex_resize mode, uses processor's internal logic targeting max 1024 patches.**
     Returns normalized float32 numpy embedding or None on error.
     """
     img_name = getattr(raw_img_pil, 'filename', 'UNKNOWN') # For error logging
@@ -184,120 +187,109 @@ def get_embedding(
     try:
         # --- Determine Model Type ---
         is_siglip2_model = "Siglip2Model" in model.__class__.__name__
-        print(f"DEBUG get_embedding: Model Type: {'Siglip2' if is_siglip2_model else 'Standard Siglip/Other'}")
+        # print(f"DEBUG get_embedding: Model Type: {'Siglip2' if is_siglip2_model else 'Standard Siglip/Other'}")
 
         # --- Handle AvgCrop Separately ---
         if preprocess_mode == 'avg_crop':
-            print(f"DEBUG get_embedding: Using AvgCrop logic for {img_name}")
-            # This needs separate implementation as it involves multiple model calls
-            # Paste or implement the get_avg_crop_embedding logic here
-            # For now, just return None to indicate it needs implementation
-            print("ERROR: AvgCrop embedding generation not fully implemented in unified function yet.")
-            return None # Placeholder
-
-        # --- Preprocessing for other modes ---
-        processed_img_pil = None
-        actual_num_patches = None # Only set by NaFlex
-
-        if preprocess_mode == 'fit_pad':
-            processed_img_pil = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
-        elif preprocess_mode == 'center_crop':
-            processed_img_pil = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
-        elif preprocess_mode == 'naflex_resize':
-            # This function now returns (image, patch_count)
-            resize_output, patches = preprocess_naflex_resize(raw_img_pil)
-            if resize_output is not None:
-                processed_img_pil = resize_output
-                actual_num_patches = patches
-        else: # Should not happen if args are validated, but good practice
-            print(f"ERROR get_embedding: Invalid preprocess_mode '{preprocess_mode}' for non-AvgCrop.")
-            return None
-
-        if processed_img_pil is None:
-            print(f"Warning get_embedding: Preprocessing returned None for {img_name}. Skipping.")
-            return None
-
-        # --- Calculate patch count if not already known (for non-Naflex) ---
-        if actual_num_patches is None:
-            w, h = processed_img_pil.size; p = 16 # Assume patch size 16
-            num_patches_w = w // p; num_patches_h = h // p
-            actual_num_patches = num_patches_w * num_patches_h
-            print(f"DEBUG get_embedding: Calculated num_patches={actual_num_patches} for {preprocess_mode}")
-        # Ensure actual_num_patches has a valid integer value
-        if not isinstance(actual_num_patches, int) or actual_num_patches <= 0:
-             print(f"ERROR get_embedding: Invalid calculated patch count ({actual_num_patches}) for {img_name}.")
+             print("ERROR: AvgCrop embedding generation not fully implemented in unified function yet.")
              return None
 
-        # --- Processor Call ---
-        print(f"DEBUG get_embedding: Calling processor...")
-        inputs = processor(images=[processed_img_pil], return_tensors="pt")
-        print("DEBUG get_embedding: Processor call finished.")
+        # --- START: TEMPORARY NaFlex Handling (Processor Logic @ 1024) ---
+        if is_siglip2_model and preprocess_mode == 'naflex_resize':
+             print("DEBUG get_embedding: SANITY CHECK - Using Processor NaFlex logic (target max 1024 patches).")
+             # Call processor directly, overriding max_num_patches
+             # Processor will handle resize, patching, padding to 1024, mask generation
+             try:
+                  inputs = processor(
+                      images=[raw_img_pil],
+                      return_tensors="pt",
+                      max_num_patches=1024 # <<< Force target 1024
+                      # patch_size=16 # Should use processor's default
+                  )
+             except Exception as e_proc:
+                  print(f"Error calling processor directly for NaFlex sanity check: {e_proc}")
+                  return None
 
-        # --- Extract Tensors & Prepare Model Args ---
-        pixel_values = inputs.get("pixel_values")
-        if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
-        pixel_values = pixel_values.to(device=device, dtype=dtype)
+             # Extract outputs directly from processor
+             pixel_values = inputs.get("pixel_values")
+             attention_mask = inputs.get("pixel_attention_mask") # Use the processor's mask
+             spatial_shapes = inputs.get("spatial_shapes")
 
-        model_call_kwargs = {"pixel_values": pixel_values}
+             if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
+             if attention_mask is None: raise ValueError("Processor didn't return 'pixel_attention_mask'.")
+             if spatial_shapes is None: raise ValueError("Processor didn't return 'spatial_shapes'.")
 
-        if is_siglip2_model:
-            # Siglip2 needs attention_mask and spatial_shapes
-            # Let's try letting the processor handle the mask size now based on input?
-            attention_mask = inputs.get("pixel_attention_mask")
-            spatial_shapes = inputs.get("spatial_shapes")
+             # Check shapes (expect pixel_values/mask sequence length = 1024)
+             # print(f"DEBUG NaFlex Proc1024: pixel_values shape: {pixel_values.shape}")
+             # print(f"DEBUG NaFlex Proc1024: attention_mask shape: {attention_mask.shape}")
+             # print(f"DEBUG NaFlex Proc1024: spatial_shapes: {spatial_shapes}")
+             if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
+                  print(f"ERROR: Processor output sequence length is not 1024! Got {pixel_values.shape[1]}. Check processor logic.")
+                  return None
 
-            if attention_mask is None: raise ValueError("Processor didn't return 'pixel_attention_mask' for Siglip2.")
-            if spatial_shapes is None: raise ValueError("Processor didn't return 'spatial_shapes' for Siglip2.")
+             # Prepare args for model call
+             model_call_kwargs = {
+                 "pixel_values": pixel_values.to(device=device, dtype=dtype),
+                 "attention_mask": attention_mask.to(device=device), # Use processor mask
+                 "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device) # Use processor shapes
+             }
 
-            # Check if mask size matches calculated patches (it should now if processor works)
-            if attention_mask.shape[-1] != actual_num_patches:
-                print(f"WARNING get_embedding: Processor mask size {attention_mask.shape[-1]} != calculated patches {actual_num_patches}. Using calculated size for model call.")
-                # Override with manually created mask if size mismatch persists
-                attention_mask = torch.ones((1, actual_num_patches), dtype=torch.long, device=device)
-            else:
-                print(f"DEBUG get_embedding: Using processor-generated mask size {attention_mask.shape[-1]}.")
-                attention_mask = attention_mask.to(device=device)
+        # --- END: TEMPORARY NaFlex Handling ---
+        else: # --- Standard Handling for FitPad, CenterCrop, etc. ---
+            processed_img_pil = None
+            if preprocess_mode == 'fit_pad':
+                processed_img_pil = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
+            elif preprocess_mode == 'center_crop':
+                processed_img_pil = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
+            else: # Should not happen if NaFlex was handled above
+                print(f"ERROR get_embedding: Invalid preprocess_mode '{preprocess_mode}'.")
+                return None
 
-            spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)
-            model_call_kwargs["attention_mask"] = attention_mask
-            model_call_kwargs["spatial_shapes"] = spatial_shapes
-        else: # Standard Siglip
-             # Try passing the mask if the processor provides one (e.g., for FitPad=1024)
-             attention_mask = inputs.get("pixel_attention_mask")
-             if attention_mask is not None:
-                  print(f"DEBUG get_embedding: Passing processor mask size {attention_mask.shape[-1]} to Standard Siglip.")
-                  model_call_kwargs["attention_mask"] = attention_mask.to(device=device)
-             else:
-                   print("DEBUG get_embedding: No mask from processor for Standard Siglip.")
+            if processed_img_pil is None:
+                print(f"Warning get_embedding: Preprocessing returned None for {img_name}. Skipping.")
+                return None
 
-        # --- Model Call ---
+            # Standard processor call (no override needed)
+            inputs = processor(images=[processed_img_pil], return_tensors="pt")
+            pixel_values_from_proc = inputs.get("pixel_values")
+            if pixel_values_from_proc is None: raise ValueError("Processor didn't return 'pixel_values'.")
+
+            # Basic handling for non-NaFlex models
+            pixel_values = pixel_values_from_proc.to(device=device, dtype=dtype)
+            model_call_kwargs = {"pixel_values": pixel_values}
+            attention_mask_from_processor = inputs.get("pixel_attention_mask")
+            if attention_mask_from_processor is not None:
+                  model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=device)
+        # --- End Standard Handling ---
+
+
+        # --- Model Call (Common Logic) ---
         emb = None
         vision_model_component = getattr(model, 'vision_model', None)
 
         if vision_model_component:
-            print(f"DEBUG get_embedding: Calling vision_model ({vision_model_component.__class__.__name__}) with keys: {list(model_call_kwargs.keys())}")
+            # Debug prints can be helpful here too
+            # print(f"DEBUG get_embedding: Calling vision_model ... with keys: {list(model_call_kwargs.keys())}")
             vision_outputs = vision_model_component(**model_call_kwargs)
             emb = vision_outputs.pooler_output
         elif hasattr(model, 'get_image_features'): # Fallback
-             print(f"DEBUG get_embedding: Falling back to get_image_features.")
-             # get_image_features usually only takes pixel_values
              emb = model.get_image_features(pixel_values=model_call_kwargs["pixel_values"])
         else:
             raise AttributeError("Model has neither 'vision_model' nor 'get_image_features'.")
 
         if emb is None: raise ValueError("Failed to get embedding from model call.")
 
-        # --- Normalize & Convert ---
-        # Use float() for norm calculation for stability, then divide original tensor
+        # --- Normalize & Convert (Common Logic) ---
         norm = torch.linalg.norm(emb.detach().float(), dim=-1, keepdim=True).clamp(min=1e-8)
-        normalized_embedding_tensor = emb / norm.to(emb.dtype) # Divide original tensor by norm cast back to its dtype
+        normalized_embedding_tensor = emb / norm.to(emb.dtype)
         embedding_result_np = normalized_embedding_tensor.cpu().to(torch.float32).numpy().squeeze()
         return embedding_result_np
 
     except Exception as e:
-        print(f"\nError during get_embedding for {img_name} (Mode: {preprocess_mode}):")
+        print(f"\nError during get_embedding (v4.1.2 SANITY CHECK) for {img_name} (Mode: {preprocess_mode}):")
         traceback.print_exc()
         return None
+# --- End Unified Embedding Function ---
 
 
 # --- Main Execution Logic ---
@@ -306,7 +298,6 @@ if __name__ == "__main__":
 
     # --- Setup Compute Precision ---
     COMPUTE_DTYPE = DEFAULT_PRECISION_MAP.get(args.precision, torch.float32)
-    # ... (Hardware checks for bf16/fp16) ...
     if COMPUTE_DTYPE != torch.float32 and TARGET_DEV == 'cpu':
         print(f"Warning: {args.precision} requested on CPU. Using float32.")
         COMPUTE_DTYPE = torch.float32
@@ -314,17 +305,22 @@ if __name__ == "__main__":
          print("Warning: bf16 not supported. Using float32.")
          COMPUTE_DTYPE = torch.float32
 
-    # --- Initialize Model ---
+    # --- Initialize Model & Processor ---
+    # <<< NOTE: Initialize processor normally here! Override happens in get_embedding call >>>
     processor, vision_model, model_image_size = init_vision_model(args.model_name, TARGET_DEV, COMPUTE_DTYPE)
 
     # --- Determine Output Directory ---
     model_name_safe = args.model_name.split('/')[-1].replace('-', '_')
+    # <<< NEW: Naming for this sanity check mode >>>
+    proc_suffix = "_Proc1024" if args.preprocess_mode == 'naflex_resize' else ""
     mode_suffix_map = {'fit_pad': "FitPad", 'center_crop': "CenterCrop",
-                       'avg_crop': "AvgCrop", 'naflex_resize': "NaflexResize"}
+                       'avg_crop': "AvgCrop", 'naflex_resize': f"Naflex{proc_suffix}"} # Name it like "Naflex_Proc1024"
     mode_suffix = mode_suffix_map.get(args.preprocess_mode, "UnknownMode")
     output_subdir_name = f"{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
     final_output_dir = os.path.join(args.output_dir_root, output_subdir_name)
     print(f"\nSelected Preprocessing Mode: {args.preprocess_mode}")
+    if args.preprocess_mode == 'naflex_resize':
+         print("  (SANITY CHECK: Using Processor logic with max_num_patches=1024)")
     print(f"Embeddings will be saved in: {final_output_dir}")
 
     # --- Process Source Folders ---
@@ -354,6 +350,7 @@ if __name__ == "__main__":
                     continue # Skip this image
 
                 # --- Call unified embedding function ---
+                # target_length=1024 is now the default in get_embedding v4.1.1
                 embedding_result = get_embedding(
                     raw_img_pil=raw_img_pil,
                     preprocess_mode=args.preprocess_mode,

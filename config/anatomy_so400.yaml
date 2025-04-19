@@ -3,16 +3,16 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"     # Base name for the model concept (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v5.3_adabeleif_fl_sigmoid_FitPad"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
+  rev: "v5.7_adabeleif_fl_sigmoid_naflex1024"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
   arch: class             # Model architecture: 'class' or 'score'
-  embed_ver: "siglip2_so400m_patch16_512_FitPad" # Embedding version key (must match keys/prefixes in utils.py)
+  embed_ver: "siglip2_so400m_patch16_naflex_Naflex_Proc1024" # Embedding version key (must match keys/prefixes in utils.py)
                            # Examples:
                            #   "CLIP"
                            #   "siglip2_so400m_patch16_512_FitPad"
                            #   "siglip2_so400m_patch16_512_CenterCrop"
                            #   "siglip2_so400m_patch16_naflex_NaflexResize"
                            #   "facebook/dinov2-large_TODO" # Need to define DINOv2 keys/params in utils.py
-  base_vision_model: null  # (Optional) Explicit HF model name (e.g., google/siglip2-so400m-patch16-512)
+  base_vision_model: "google/siglip2-so400m-patch16-naflex"  # (Optional) Explicit HF model name (e.g., google/siglip2-so400m-patch16-512)
                            # If null/missing, utils.py will try to infer from embed_ver.
 
 # --- PredictorModel v2 Architecture Parameters ---
@@ -30,7 +30,7 @@ predictor_params:
 
 # --- Training Parameters ---
 train:
-  lr: 1e-4                # Initial learning rate
+  lr: 1e-5                # Initial learning rate
   steps: 300000            # Total number of training steps
   batch: 32                # Training batch size per device
   optimizer: "AdaBelief" # Optimizer choice.
@@ -45,7 +45,7 @@ train:
   preload_data: true       # Preload dataset embeddings to RAM? true or false
 
   # -- Scheduler Options (ignored if using ScheduleFree optimizers) --
-  cosine: true             # Use CosineAnnealingLR scheduler? true or false
+  cosine: false             # Use CosineAnnealingLR scheduler? true or false
   warmup_steps: 10000      # Number of linear warmup steps (if cosine=false). Set > 0 to enable.
 
   # -- Optimizer Hyperparameters (Defaults vary by optimizer type if not specified) --
