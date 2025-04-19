@@ -1,0 +1,114 @@
+# config/Template-AnatomyFlaws-vX.Y.yaml
+
+# --- Model Identification & Type ---
+model:
+  base: "AnatomyFlaws"  # Base name (e.g., AnatomyFlaws, Aesthetics)
+  rev: "v6.0_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
+  arch: class                # Model architecture: 'class' or 'score'
+
+  # --- Embedding Configuration ---
+  # Key used by utils.get_embed_params to determine 'features' and 'hidden_dim' defaults.
+  # MUST match a key defined in utils.py: get_embed_params.
+  embed_ver: "vit_large_patch14_dinov2.lvd142m_FitPad" # Or "facebook_dinov2_giant_FitPad", "siglip2_so400m_patch16_naflex_Naflex_Proc1024", etc.
+
+  # Explicitly specify the base vision model used for embeddings (Recommended!).
+  # If null/missing, utils.py will attempt to infer it from embed_ver (may be unreliable).
+  base_vision_model: "timm/vit_large_patch14_dinov2.lvd142m" # Or "facebook/dinov2-giant", "google/siglip2-so400m-patch16-naflex", etc.
+
+# --- PredictorModel v2 Architecture Parameters ---
+predictor_params:
+  # features: (int) - Input embedding size. Typically determined automatically via 'embed_ver'.
+  #                  Only specify here if you need to manually override the value from get_embed_params.
+  # hidden_dim: (int) - Dimension of the main hidden MLP layers. Defaults based on 'embed_ver' if missing.
+  hidden_dim: 1280
+  # num_classes: (int) - Output neurons. Set by training script based on 'arch' and 'labels'. Do not set here unless needed for specific BCE cases.
+  use_attention: true      # Use the initial MultiheadAttention layer? (true/false)
+  num_attn_heads: 16       # Number of attention heads (if use_attention=true). Must be divisor of features dim.
+  attn_dropout: 0.218      # Dropout rate for attention layer (if use_attention=true). [0.0 - 1.0]
+  num_res_blocks: 3        # Number of ResBlocks in the MLP head. [0, 1, 2, ...]
+  dropout_rate: 0.218      # Dropout rate in the MLP 'down' block. [0.0 - 1.0]
+  # output_mode MUST be specified. Determines the final activation.
+  # Choose based on your loss function and task requirements.
+  output_mode: sigmoid     # Options: 'linear', 'sigmoid', 'softmax', 'tanh_scaled'
+
+# --- Training Parameters ---
+train:
+  # --- Core Settings ---
+  lr: 1e-4                   # Initial learning rate (float)
+  steps: 300000              # Total number of training steps (int)
+  batch: 32                  # Training batch size per device (int)
+  precision: "fp32"          # Training precision (string: "fp32", "fp16", "bf16")
+
+  # --- Loss Function ---
+  loss_function: "focal"     # Loss function name (string).
+                             # Options: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll', 'ghm'.
+                             # Ensure this matches the predictor_params.output_mode!
+  focal_loss_gamma: 2.0      # Example: Gamma for Focal Loss (float, only used if loss_function='focal')
+  # ghm_bins: 10             # Example: Bins for GHM Loss
+  # ghm_momentum: 0.75       # Example: Momentum for GHM Loss
+
+  # --- Optimizer ---
+  # Name MUST be lowercase and match a key in optimizer.OPTIMIZERS dictionary (or 'adamw').
+  optimizer: "adabelief"       # Optimizer choice (string).
+
+  # -- Optimizer Hyperparameters --
+  # Only specify args here IF you want to OVERRIDE the optimizer's own internal defaults.
+  # train.py will dynamically pass any args here matching the chosen optimizer's __init__ signature.
+  # Example overrides (check optimizer's code for valid args and defaults):
+  betas: [0.9, 0.999]        # List/tuple of 2 floats
+  eps: 1e-8                  # Float
+  weight_decay: 1e-3         # Float
+  # weight_decouple: true    # Example for AdaBelief/AdamW variants
+  rectify: true              # Example for AdaBelief
+  adaptive_clip: 1.0         # Example for ADOPT variants
+  adaptive_clip_eps: 1e-3    # Example for ADOPT variants
+  gamma: 0.005               # Example for MARS variants
+  r_sf: 0.0                  # R value for ScheduleFree (float)
+  wlpow_sf: 2.0              # Weight LR Power for ScheduleFree (float)
+  state_precision: parameter # Precision for optimizer state in ScheduleFree (parameter or float32)
+  # ... etc ...
+
+  # --- Scheduler ---
+  # Ignored if using a ScheduleFree optimizer (name contains 'schedulefree').
+  # Specify scheduler by name (lowercase, matching optimizer.SCHEDULERS or standard torch names).
+  scheduler_name: "RexAnnealingWarmRestarts" # Options: e.g., "CosineAnnealingWarmRestarts", "RexAnnealingWarmRestarts", "CosineAnnealingLR", "LinearLR", "None"
+
+  # -- Scheduler Arguments --
+  # For CUSTOM schedulers (from optimizer folder), prefix args with 'scheduler_'.
+  # Check the scheduler's __init__ signature for valid args.
+  scheduler_gamma: 0.95                     # Example for CosineAnnealingWarmRestarts
+  scheduler_cycle_multiplier: 3.0           # Example for CosineAnnealingWarmRestarts (restart count)
+  scheduler_first_cycle_max_steps: 100000   # Example for CosineAnnealingWarmRestarts (restart after x steps)
+  scheduler_min_lr: 1e-7                    # Example for CosineAnnealingWarmRestarts
+  # scheduler_warmup_steps: 5000              # Example for CosineAnnealingWarmRestarts (used by scheduler internally)
+  # scheduler_d: 0.9                        # Example for RexAnnealingWarmRestarts
+
+
+  # -- Arguments for STANDARD torch schedulers --
+  # Used if scheduler_name is 'CosineAnnealingLR' or 'LinearLR'.
+  # scheduler_t_max: 100000 # Optional override for CosineAnnealingLR T_max (defaults to train.steps)
+  # scheduler_eta_min: 0    # Optional override for CosineAnnealingLR eta_min (defaults to 0)
+  # warmup_steps: 0         # Use this for LinearLR warmup (if scheduler_name='LinearLR')
+
+  # --- Data & Other ---
+  val_split_count: 100       # Samples PER CLASS for validation set (int, 0 to disable).
+  seed: 218                  # Random seed for validation split shuffle (int).
+  num_workers: 0             # Dataloader workers (int).
+  preload_data: true         # Preload dataset embeddings to RAM? (true/false)
+  nsave: 10000               # Save model every N steps (int, 0 to disable periodic).
+
+# --- Data Root (Can be overridden by command line) ---
+data_root: "data"
+
+# --- Logging (Can be overridden by command line) ---
+wandb_project: "city-classifiers"
+
+# --- Labels (Only relevant for 'class' architecture) ---
+labels: # Define classes and optional loss weights
+  0: # Folder name MUST match the key (as string)
+    name: "Bad Anatomy"  # Display name for this class
+    loss: 1.0            # Optional: Loss weight multiplier for this class (default 1.0)
+  1:
+    name: "Good Anatomy"
+    loss: 1.0
+  # Add more classes if needed (e.g., '2': ...)

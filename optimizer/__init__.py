@@ -1,5 +1,5 @@
 
-from typing import Dict, List
+from typing import Dict, List, Type
 from optimizer.optimizer_utils import OPTIMIZER
 
 from optimizer.adabelief import AdaBelief
@@ -30,6 +30,11 @@ from optimizer.shampoo import ScalableShampoo
 from optimizer.adam import AdamW8bitAO, AdamW4bitAO, AdamWfp8AO
 from .distributed_shampoo.distributed_shampoo import DistributedShampoo
 # from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree # missing?
+
+# --- Imports for Schedulers ---
+from torch.optim.lr_scheduler import LRScheduler # Base type
+from .CosineAnnealingWarmRestarts import CosineAnnealingWarmRestarts
+from .RexAnnealingWarmRestarts import RexAnnealingWarmRestarts
 
 OPTIMIZER_LIST: List[OPTIMIZER] = [
     ADOPT,
@@ -84,3 +89,14 @@ OPTIMIZER_LIST: List[OPTIMIZER] = [
 ]
 
 OPTIMIZERS: Dict[str, OPTIMIZER] = {str(f"{optimizer.__name__}".lower()): optimizer for optimizer in OPTIMIZER_LIST}
+
+# --- Scheduler Dictionary ---
+SCHEDULER_LIST: List[Type[LRScheduler]] = [
+    # Add all CUSTOM scheduler classes here
+    CosineAnnealingWarmRestarts,
+    RexAnnealingWarmRestarts,
+    # ... etc ...
+]
+SCHEDULERS: Dict[str, Type[LRScheduler]] = {
+    scheduler.__name__.lower(): scheduler for scheduler in SCHEDULER_LIST
+}

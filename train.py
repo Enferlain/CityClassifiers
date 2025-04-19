@@ -1,4 +1,5 @@
 # Version: 2.2.0 (Refactored for Clarity and Loss Selection)
+import inspect
 import os
 import sys
 import torch
@@ -20,36 +21,28 @@ from utils import (
 from dataset import EmbeddingDataset
 from model import PredictorModel
 
-# --- Optimizer Imports ---
-# Add the directory containing 'train.py' to the path for optimizer imports
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-optimizer_dir_path = os.path.join(current_script_dir, 'optimizer')
-if os.path.isdir(optimizer_dir_path):
-    print(f"Adding optimizer directory to sys.path: {current_script_dir}")
-    if current_script_dir not in sys.path:
-        sys.path.insert(0, current_script_dir)
-else:
-    print(f"Warning: Optimizer directory not found at {optimizer_dir_path}")
-
+# --- Attempt to import our custom optimizers ---
 try:
-    from optimizer.fmarscrop import FMARSCropV3ExMachina
-    from optimizer.adabelief import AdaBelief
-    from optimizer.adopt import ADOPT
-    from optimizer.schedulefree import (
-        ScheduleFreeWrapper, ADOPTScheduleFree, ADOPTAOScheduleFree
-    )
-    print("Imported custom optimizers.")
-    optimizers_available = True
+    # Make sure the optimizer directory is in the path if needed
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Assuming 'optimizer' folder is directly inside the folder containing train.py
+    optimizer_dir_path = os.path.join(current_script_dir, 'optimizer')
+    if os.path.isdir(optimizer_dir_path) and current_script_dir not in sys.path:
+         # Add the directory containing train.py, which should allow 'import optimizer'
+         sys.path.insert(0, current_script_dir)
+
+         # <<< Import BOTH dictionaries >>>
+    from optimizer import OPTIMIZERS, SCHEDULERS
+
+    print(f"Successfully imported custom optimizers: {list(OPTIMIZERS.keys())}")
+    print(f"Successfully imported custom schedulers: {list(SCHEDULERS.keys())}")
+    custom_modules_available = True
 except ImportError as e:
-    print(f"Warning: Custom optimizer import failed ({e}). Check dependencies. Only AdamW/standard torch optims available.")
-    FMARSCropV3ExMachina = None
-    AdaBelief = None  # Add this line
-    ADOPT = None
-    ScheduleFreeWrapper = None
-    ADOPTScheduleFree = None
-    ADOPTAOScheduleFree = None
-    optimizers_available = False
-# --- End Optimizer Imports ---
+    print(
+        f"Warning: Custom optimizer/scheduler import failed ({e}). Check optimizer/__init__.py. Standard torch modules only.")
+    OPTIMIZERS = {}
+    SCHEDULERS = {}  # Define as empty dicts if import fails
+    custom_modules_available = False
 
 # --- Global Settings ---
 TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -291,149 +284,190 @@ def setup_model_criterion(args, dataset):
 
     return model, criterion
 
+# Version 2.4.0: Dynamic Optimizer & Scheduler Loading
 def setup_optimizer_scheduler(args, model):
-    """Sets up the optimizer and scheduler based on args."""
+    """
+    Sets up the optimizer and scheduler based on args.
+    Dynamically loads custom optimizers/schedulers from OPTIMIZERS/SCHEDULERS dicts.
+    Uses inspect to gather relevant arguments from args object.
+    """
     optimizer = None
     scheduler = None
     is_schedule_free = False
     optimizer_name = getattr(args, 'optimizer', 'AdamW').lower()
-    print(f"Using optimizer: {optimizer_name}")
 
-    # --- Optimizer Selection Logic ---
-    if optimizer_name == 'adamw':
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=float(args.lr), betas=tuple(getattr(args, 'betas', (0.9, 0.999))),
-            weight_decay=float(getattr(args, 'weight_decay', 0.0)), eps=float(getattr(args, 'eps', 1e-8)),
-        )
-    elif optimizer_name == 'fmarscropv3exmachina' and FMARSCropV3ExMachina is not None:
-        print("Instantiating FMARSCropV3ExMachina...")
-        # +++ START ADDED BLOCK +++
+    print(f"Attempting to setup optimizer: {optimizer_name}")
+
+    # --- Dynamic Optimizer Loading ---
+    if optimizer_name in OPTIMIZERS:
+        optimizer_class = OPTIMIZERS[optimizer_name]
+        print(f"Found optimizer class: {optimizer_class.__name__}")
+
         try:
-            # Gather necessary args from the 'args' object (set by config/defaults)
-            fmarscrop_args = {
-                'lr': float(args.lr),
-                'betas': tuple(getattr(args, 'betas', (0.99, 0.95))),  # Default specific to FMARS
-                'eps': float(getattr(args, 'eps', 1e-6)),
-                'weight_decay': float(getattr(args, 'weight_decay', 1e-3)),
-                'gamma': float(getattr(args, 'gamma', 0.005)),
-                # Include other relevant defaults if needed by constructor
-                'eps2': float(getattr(args, 'eps2', 1e-2)),
-                'eps_floor': getattr(args, 'eps_floor', None),
-                'centralization': float(getattr(args, 'centralization', 0.0)),
-                'moment_centralization': float(getattr(args, 'moment_centralization', 0.0)),
-                'diff_mult': float(getattr(args, 'diff_mult', 1.0)),
-                'momentum_lambda': float(getattr(args, 'momentum_lambda', 2.0)),
-                'adaptive_clip': float(getattr(args, 'adaptive_clip', 1.0)),
-                'adaptive_clip_eps': float(getattr(args, 'adaptive_clip_eps', 1e-3)),
-                'adaptive_clip_type': getattr(args, 'adaptive_clip_type', 'global'),
-                'stable_weight_decay': bool(getattr(args, 'stable_weight_decay', False)),
-                'debias_beta1': bool(getattr(args, 'debias_beta1', False)),
-                'debias_beta2': bool(getattr(args, 'debias_beta2', False)),
-                'use_muon_pp': bool(getattr(args, 'use_muon_pp', False)),
-                'update_strategy': getattr(args, 'update_strategy', 'cautious'),
-                'stable_update': bool(getattr(args, 'stable_update', False)),
-                'atan2_denom': bool(getattr(args, 'atan2_denom', False)),
-                'use_orthograd': bool(getattr(args, 'use_orthograd', False)),
-            }
-            # Filter out None values ONLY if the constructor *cannot* handle them
-            # fmarscrop_args = {k: v for k, v in fmarscrop_args.items() if v is not None}
-            optimizer = FMARSCropV3ExMachina(model.parameters(), **fmarscrop_args)
-        except (TypeError, AttributeError) as e:  # Catch errors if args mismatch
-            print(f"ERROR: Failed to instantiate FMARSCropV3ExMachina. Check arguments.")
-            print(f"  Error details: {e}")
+            # Inspect the optimizer's __init__ signature
+            sig = inspect.signature(optimizer_class.__init__)
+            available_params = sig.parameters.keys()
+            # print(f"  Optimizer signature params: {list(available_params)}")
+
+            # Gather potential kwargs from args, converting types where necessary
+            potential_kwargs = {}
+            args_dict = vars(args)
+
+            for param_name in available_params:
+                if param_name in ['self', 'params', 'model', 'args', 'kwargs']: # Skip standard/generic args
+                    continue
+
+                if param_name in args_dict and args_dict[param_name] is not None:
+                    # Get the expected type from the signature if available
+                    expected_type = sig.parameters[param_name].annotation
+                    default_value = sig.parameters[param_name].default
+
+                    value = args_dict[param_name]
+
+                    # --- Type Conversion Logic ---
+                    try:
+                        if expected_type == inspect.Parameter.empty: # No type hint, use value as is
+                             potential_kwargs[param_name] = value
+                        elif expected_type == bool:
+                             potential_kwargs[param_name] = bool(value)
+                        elif expected_type == int:
+                             potential_kwargs[param_name] = int(value)
+                        elif expected_type == float:
+                             potential_kwargs[param_name] = float(value)
+                        elif expected_type == str:
+                             potential_kwargs[param_name] = str(value)
+                        elif expected_type == tuple or expected_type == list or \
+                             (hasattr(expected_type, '__origin__') and expected_type.__origin__ in [tuple, list]):
+                            # Handle tuples/lists, attempt conversion if value is list-like
+                            if isinstance(value, (list, tuple)):
+                                # Try converting elements if type hint suggests (e.g., Tuple[float, float])
+                                inner_type = float # Default assumption
+                                if hasattr(expected_type, '__args__') and expected_type.__args__:
+                                    inner_type = expected_type.__args__[0]
+                                converted_list = [inner_type(v) for v in value]
+                                potential_kwargs[param_name] = tuple(converted_list) if expected_type == tuple else converted_list
+                            else:
+                                print(f"Warning: Arg {param_name} expects {expected_type} but got {type(value)}. Skipping.")
+                        else:
+                            # Use value directly if type doesn't match known basic types
+                            potential_kwargs[param_name] = value
+                    except (ValueError, TypeError) as e_type:
+                         print(f"Warning: Could not convert arg '{param_name}' (value: {value}) to expected type {expected_type}. Error: {e_type}. Using default or skipping.")
+                         if default_value != inspect.Parameter.empty:
+                              potential_kwargs[param_name] = default_value # Use default if conversion fails
+                    # --- End Type Conversion Logic ---
+
+            print(f"  Instantiating {optimizer_class.__name__} with args: {potential_kwargs}")
+            optimizer = optimizer_class(model.parameters(), **potential_kwargs)
+
+            # Check if it's a schedule-free optimizer (simple name check for now)
+            if "schedulefree" in optimizer_name:
+                is_schedule_free = True
+
+        except Exception as e:
+            print(f"ERROR: Failed to instantiate optimizer '{optimizer_name}' dynamically: {e}")
             print("  Falling back to AdamW.")
-            optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr))  # Fallback
+            optimizer_name = 'adamw' # Force fallback
+            optimizer = None # Reset optimizer variable
+            is_schedule_free = False
 
-    # <<< --- ADD THIS ELIF BLOCK for AdaBelief --- >>>
-    elif optimizer_name == 'adabelief' and AdaBelief is not None:
-        print("Instantiating AdaBelief Optimizer...")
-        # Gather args, using AdaBelief's defaults if not specified in args/YAML
-        adabelief_args = {
-            'lr': float(args.lr), # Should be very low (e.g., 1e-7) from config
-            'betas': tuple(getattr(args, 'betas', (0.9, 0.999))),
-            'weight_decay': float(getattr(args, 'weight_decay', 0.0)),
-            'eps': float(getattr(args, 'eps', 1e-16)), # AdaBelief default is 1e-16, maybe use 1e-8 from args? Let's use args.eps if specified.
-            'weight_decouple': bool(getattr(args, 'weight_decouple', True)), # Default True
-            'fixed_decay': bool(getattr(args, 'fixed_decay', False)), # Default False
-            'rectify': bool(getattr(args, 'rectify', False)), # Default False (Consider True? Like RAdam?)
-            'ams_bound': bool(getattr(args, 'ams_bound', False)), # Default False
-            'adanorm': bool(getattr(args, 'adanorm', False)), # Default False
-            'adam_debias': bool(getattr(args, 'adam_debias', False)), # Default False
-            'cautious': bool(getattr(args, 'cautious', False)), # cautious mode
-        }
-        # Filter out None values only if constructor can't handle them (most args have defaults)
-        # adabelief_args = {k: v for k, v in adabelief_args.items() if v is not None} # Probably not needed
-
-        # Ensure correct types
-        if not isinstance(adabelief_args['betas'], tuple) or len(adabelief_args['betas']) != 2:
-             print(f"Warning: Invalid betas {adabelief_args['betas']}, using default (0.9, 0.999).")
-             adabelief_args['betas'] = (0.9, 0.999)
-
-        try:
-             optimizer = AdaBelief(model.parameters(), **adabelief_args)
-             # AdaBelief manages its own step size adaptations, no external scheduler needed
-             is_schedule_free = False # Treat it like schedule-free
-        except Exception as e_optim:
-             print(f"ERROR: Failed to instantiate AdaBelief: {e_optim}")
-             print("Falling back to AdamW.")
-             optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr)) # Fallback
-             is_schedule_free = False # AdamW needs scheduler
-
-    elif optimizer_name == 'adoptaoschedulefree' and ADOPTAOScheduleFree is not None:
-        # Gather args specifically for ADOPTAOScheduleFree
-        adopt_args = {k: getattr(args, k) for k in [
-            'lr', 'betas', 'weight_decay', 'eps', 'eps2', 'eps_floor',
-            'weight_decouple', 'stable_weight_decay',
-            'adaptive_clip', 'adaptive_clip_eps', 'adaptive_clip_type', # <--- Includes adaptive_clip_eps
-            'debias_beta2', 'use_beta2_warmup', 'beta2_warmup_initial', 'beta2_warmup_steps',
-            'mars_gamma', 'use_muon_pp', 'r', 'weight_lr_power',
-            'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd',
-            'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step', 'spam_clipping_type',
-            'state_precision'] if hasattr(args, k)}
-
-        # --- Add/Ensure this conversion exists ---
-        if 'adaptive_clip_eps' in adopt_args and adopt_args['adaptive_clip_eps'] is not None:
-             try: adopt_args['adaptive_clip_eps'] = float(adopt_args['adaptive_clip_eps'])
-             except ValueError: print(f"Warning: Could not convert adaptive_clip_eps '{adopt_args['adaptive_clip_eps']}' to float. Using default?") # Handle
-
-        # Convert types as needed
-        adopt_args['lr'] = float(adopt_args['lr'])
-        adopt_args['betas'] = tuple(adopt_args['betas'])
-        adopt_args['weight_decay'] = float(adopt_args.get('weight_decay', 0.0))
-        adopt_args['eps'] = float(adopt_args.get('eps', 1e-6))
-        adopt_args['r'] = float(adopt_args.get('r', 0.0)) # Use get for non-essential args
-        adopt_args['weight_lr_power'] = float(adopt_args.get('weight_lr_power', 2.0))
-        # Remove None values if constructor doesn't handle them
-        adopt_args = {k: v for k, v in adopt_args.items() if v is not None}
-
-        optimizer = ADOPTAOScheduleFree(model.parameters(), **adopt_args)
-        is_schedule_free = True
-    # Add elif blocks for other custom optimizers (ADOPT, ScheduleFreeWrapper) if needed...
-    else:
+    # --- Fallback / Default Optimizer ---
+    if optimizer is None:
         if optimizer_name != 'adamw':
-            print(f"Warning: Optimizer '{optimizer_name}' not found or not supported. Falling back to AdamW.")
-        # Fallback to AdamW
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=float(args.lr), betas=tuple(getattr(args, 'betas', (0.9, 0.999))),
-            weight_decay=float(getattr(args, 'weight_decay', 0.0)), eps=float(getattr(args, 'eps', 1e-8)),
-        )
-    # --- End Optimizer Selection ---
+             print(f"Warning: Optimizer '{optimizer_name}' not found in OPTIMIZERS or failed to instantiate. Falling back to AdamW.")
+        optimizer_name = 'adamw'
+        # Use defaults from args for AdamW, converting types explicitly
+        adamw_kwargs = {
+             'lr': float(getattr(args, 'lr', 1e-4)),
+             'betas': tuple(getattr(args, 'betas', (0.9, 0.999))),
+             'weight_decay': float(getattr(args, 'weight_decay', 0.0)),
+             'eps': float(getattr(args, 'eps', 1e-8)),
+        }
+        print(f"Instantiating torch.optim.AdamW with args: {adamw_kwargs}")
+        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        is_schedule_free = False # AdamW needs a scheduler
+    # --- End Fallback ---
 
     # --- Scheduler Setup ---
+    # --- Dynamic Scheduler Setup ---
     if not is_schedule_free:
-        if getattr(args, 'cosine', True): # Check if cosine is enabled in config
-            print("Using CosineAnnealingLR Scheduler.")
-            t_max_steps = max(1, int(args.steps / args.batch)) # Or just args.steps? Check CosineAnnealingLR docs for T_max units
-            # Use args.steps for T_max as it represents total iterations more clearly
-            # t_max_steps = args.steps
-            print(f"  Setting T_max = {t_max_steps} steps for CosineAnnealingLR.")
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max_steps)
-        elif getattr(args, 'warmup_steps', 0) > 0:
-            print("Using LinearLR Warmup Scheduler.")
-            warmup_iters = max(1, int(args.warmup_steps / args.batch))
-            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_iters)
-        else:
-             print("No scheduler specified or needed (not schedule-free, no cosine, no warmup).")
+        # Get desired scheduler name from config, default to standard CosineAnnealingLR if not specified
+        # Use 'scheduler_name' in YAML to avoid conflict with 'cosine' boolean flag
+        scheduler_name = getattr(args, 'scheduler_name', 'CosineAnnealingLR').lower()
+        print(f"Attempting to setup scheduler: {scheduler_name}")
+
+        scheduler_class = None
+        # Check if it's one of our custom schedulers
+        if scheduler_name in SCHEDULERS:
+            scheduler_class = SCHEDULERS[scheduler_name]
+            print(f"Found custom scheduler class: {scheduler_class.__name__}")
+            try:
+                # Inspect the scheduler's __init__ signature
+                sig = inspect.signature(scheduler_class.__init__)
+                available_params = sig.parameters.keys()
+                scheduler_kwargs = {}
+                args_dict = vars(args)
+
+                # Gather relevant arguments, looking for "scheduler_{param_name}" in args
+                for param_name in available_params:
+                    if param_name in ['self', 'optimizer', 'last_epoch', 'args', 'kwargs']: continue # Skip standard/generic
+
+                    arg_key = f"scheduler_{param_name}" # Look for prefixed arg name
+                    if arg_key in args_dict and args_dict[arg_key] is not None:
+                        expected_type = sig.parameters[param_name].annotation
+                        default_value = sig.parameters[param_name].default
+                        value = args_dict[arg_key]
+
+                        # --- Type Conversion Logic (similar to optimizer) ---
+                        try:
+                            if expected_type == inspect.Parameter.empty: scheduler_kwargs[param_name] = value
+                            elif expected_type == bool: scheduler_kwargs[param_name] = bool(value)
+                            elif expected_type == int: scheduler_kwargs[param_name] = int(value)
+                            elif expected_type == float: scheduler_kwargs[param_name] = float(value)
+                            elif expected_type == str: scheduler_kwargs[param_name] = str(value)
+                            # Add tuple/list handling if needed for schedulers
+                            else: scheduler_kwargs[param_name] = value
+                        except (ValueError, TypeError) as e_type:
+                             print(f"Warning: Could not convert scheduler arg '{param_name}' (value: {value}) to {expected_type}. Error: {e_type}. Using default or skipping.")
+                             if default_value != inspect.Parameter.empty: scheduler_kwargs[param_name] = default_value
+                        # --- End Type Conversion ---
+
+                print(f"  Instantiating {scheduler_class.__name__} with args: {scheduler_kwargs}")
+                # Instantiate with optimizer and gathered kwargs
+                scheduler = scheduler_class(optimizer, **scheduler_kwargs)
+
+            except Exception as e:
+                 print(f"ERROR: Failed to instantiate custom scheduler '{scheduler_name}': {e}")
+                 print("  Falling back to standard PyTorch schedulers.")
+                 scheduler = None # Reset to trigger fallback
+
+        # --- Fallback to Standard PyTorch Schedulers ---
+        if scheduler is None: # If custom failed or wasn't specified
+            # Use existing logic based on 'cosine' flag or 'warmup_steps'
+            scheduler_type = None
+            # Check args.cosine ONLY if scheduler_name wasn't explicitly something else
+            if getattr(args, 'cosine', True) and scheduler_name in ['cosineannealinglr', 'cosine']:
+                 scheduler_type = 'cosine'
+            elif getattr(args, 'warmup_steps', 0) > 0 and scheduler_name == 'linearlr': # Check warmup AND if linear was maybe intended
+                 scheduler_type = 'warmup'
+            elif scheduler_name not in ['cosineannealinglr', 'linearlr', 'none', None]:
+                 print(f"Warning: Scheduler '{scheduler_name}' not found in custom SCHEDULERS and doesn't match standard options. No scheduler used.")
+
+            if scheduler_type == 'cosine':
+                print("Using standard torch.optim.lr_scheduler.CosineAnnealingLR.")
+                t_max_steps = getattr(args, 'scheduler_t_max', args.steps) # Allow T_max override
+                eta_min = getattr(args, 'scheduler_eta_min', 0) # Allow eta_min override
+                print(f"  Setting T_max = {t_max_steps}, eta_min = {eta_min}")
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(t_max_steps), eta_min=float(eta_min))
+            elif scheduler_type == 'warmup':
+                print("Using standard torch.optim.lr_scheduler.LinearLR.")
+                warmup_iters = int(args.warmup_steps)
+                print(f"  Setting total_iters = {warmup_iters} for LinearLR.")
+                scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_iters)
+            elif scheduler is None: # Handles cases where no match found or name was 'none'
+                 print("No matching standard or custom scheduler specified.")
+
+    # --- Handle Schedule-Free Case ---
     else:
         print("Using a schedule-free optimizer, no scheduler will be used.")
     # --- End Scheduler Setup ---

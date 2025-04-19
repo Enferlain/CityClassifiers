@@ -1,9 +1,18 @@
 # generate_embeddings.py
-# Version: 4.1.0 (Unified get_embedding function, robust handling)
+# Version: 4.2.0 (Added TIMM DINOv2 support)
 
 import os
 import torch
-import torchvision.transforms.functional as F # Needed for AvgCrop's five_crop
+# <<< ADD TIMM IMPORT >>>
+try:
+    import timm
+    import timm.data
+    TIMM_AVAILABLE = True
+except ImportError:
+    print("Warning: timm library not found. TIMM models cannot be used.")
+    TIMM_AVAILABLE = False
+# <<< END ADD >>>
+import torchvision.transforms.functional as TF # Renamed from F to avoid conflict
 import torch.nn.functional as torch_func
 from PIL import Image
 from tqdm import tqdm
@@ -11,8 +20,9 @@ import numpy as np
 from transformers import AutoProcessor, AutoModel
 import argparse
 import math
-import shutil # Keep for potential future use
-import traceback # For detailed error printing
+import shutil
+import traceback
+
 
 # --- Constants ---
 TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,19 +31,38 @@ DEFAULT_PRECISION_MAP = {'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': 
 DEFAULT_MODEL_ID = "google/siglip-so400m-patch14-384" # Changed default for clarity
 
 # --- Argument Parsing ---
+# v4.2.0: Added dinov2_large_timm_fitpad choice
 def parse_gen_args():
     parser = argparse.ArgumentParser(description="Generate vision model embeddings for image folders.")
     parser.add_argument('--image_dir', required=True, help="Directory containing subfolders (e.g., '0', '1') with images.")
     parser.add_argument('--output_dir_root', required=True, help="Root directory to save embeddings (e.g., 'data').")
-    parser.add_argument('--model_name', type=str, default=DEFAULT_MODEL_ID, help=f"Vision model name from Hugging Face. Default: {DEFAULT_MODEL_ID}")
+    parser.add_argument('--model_name', type=str, default=DEFAULT_MODEL_ID, help=f"Vision model name from Hugging Face or TIMM. Default: {DEFAULT_MODEL_ID}")
     parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'], help="Precision for model computation (default: fp32).")
     parser.add_argument('--preprocess_mode', type=str, default='fit_pad',
-                        choices=['fit_pad', 'center_crop', 'avg_crop', 'naflex_resize'],
-                        help="Image preprocessing method before embedding (default: fit_pad).")
+                        choices=[
+                            'fit_pad',              # Manual FitPad (SigLIP HF)
+                            'center_crop',          # Manual CenterCrop (SigLIP HF)
+                            'avg_crop',             # Manual AvgCrop (NYI)
+                            'naflex_resize',        # NaFlex HF (Proc Logic @ 1024)
+                            'dinov2_large_timm_fitpad',   # DINOv2 TIMM (TIMM Transforms)
+                            'dinov2_giant_fb_fitpad'      # <<< ADDED: DINOv2 Facebook (Manual FitPad)
+                        ],
+                        help="Image preprocessing method before embedding.")
     parser.add_argument('--resize_factor_avg_crop', type=float, default=2.0,
                         help="Factor to multiply model's native size by for resizing ONLY for avg_crop mode (default: 2.0).")
     parser.add_argument('--output_dir_suffix', type=str, default="", help="Optional suffix for the output directory name.")
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # --- Validation ---
+    if args.preprocess_mode == 'dinov2_large_fb_fitpad' and not TIMM_AVAILABLE:
+         parser.error("preprocess_mode 'dinov2_large_fb_fitpad' requires 'timm'.")
+    if args.preprocess_mode == 'dinov2_large_fb_fitpad' and not args.model_name.startswith('timm/'):
+         print(f"Warning: Mode 'dinov2_large_fb_fitpad' expects a TIMM model (timm/...), got '{args.model_name}'.")
+    if args.preprocess_mode == 'dinov2_giant_fb_fitpad' and not args.model_name.startswith('facebook/dinov2'):
+         print(f"Warning: Mode 'dinov2_giant_fb_fitpad' expects a Facebook DINOv2 model (facebook/dinov2-...), got '{args.model_name}'.")
+
+    return args
 
 # --- Preprocessing Functions ---
 
@@ -164,124 +193,169 @@ def init_vision_model(model_name, device, dtype):
 
 
 # --- Unified Embedding Function ---
-# Version 4.1.5: Permanent NaFlex uses Processor Logic @ 1024. Removed manual resize/pad.
+# Version 4.2.1: Added Facebook DINOv2 FitPad logic
 @torch.no_grad()
 def get_embedding(
     raw_img_pil: Image.Image,
     preprocess_mode: str,
-    processor,
-    model,
+    model_info: dict, # Bundle containing model, processor/transforms, type
     device,
     dtype,
-    model_image_size: int,
-    resize_factor_avg_crop: float = 2.0,
+    model_image_size: int, # Size needed for manual preprocess modes
+    # resize_factor_avg_crop: float = 2.0, # Removed avg_crop for now
 ) -> np.ndarray | None:
     """
-    Generates embedding for a single raw PIL image using the specified mode.
-    - NaFlex mode now uses processor's internal logic targeting max 1024 patches.
-    - FitPad/CenterCrop use manual resize then processor call.
+    Generates embedding for a single raw PIL image using the specified mode
+    and the provided model_info bundle.
     Returns normalized float32 numpy embedding or None on error.
     """
     img_name = getattr(raw_img_pil, 'filename', 'UNKNOWN')
+    model_type = model_info.get("type", "hf") # Default to Hugging Face
 
     try:
-        is_siglip2_model = "Siglip2Model" in model.__class__.__name__
-        model_call_kwargs = {} # Initialize outside conditional blocks
+        emb = None # Initialize embedding variable
+        do_l2_normalize = False # Flag to normalize at the end
 
-        # --- NaFlex Handling (Processor Logic @ 1024) ---
-        if is_siglip2_model and preprocess_mode == 'naflex_resize':
-            # print(f"DEBUG get_embedding: Using Processor NaFlex logic (target max 1024 patches) for {img_name}.")
-            try:
-                inputs = processor(
-                    images=[raw_img_pil],
-                    return_tensors="pt",
-                    max_num_patches=1024 # <<< Override target length
-                )
-            except Exception as e_proc:
-                print(f"Error calling processor directly for NaFlex: {e_proc}")
-                return None
+        # --- TIMM Model Handling (e.g., DINOv2 TIMM) ---
+        if model_type == "timm" and preprocess_mode == 'dinov2_large_timm_fitpad':
+            timm_model = model_info.get("model")
+            timm_transforms = model_info.get("transforms")
+            if timm_model is None or timm_transforms is None:
+                 raise ValueError("TIMM model/transforms missing for dinov2_large_timm_fitpad.")
 
-            # Extract outputs directly from processor
-            pixel_values = inputs.get("pixel_values")
-            attention_mask = inputs.get("pixel_attention_mask")
-            spatial_shapes = inputs.get("spatial_shapes")
+            input_tensor = timm_transforms(raw_img_pil).unsqueeze(0).to(device=device, dtype=dtype)
+            output = timm_model(input_tensor) # Pooled features [1, D]
+            emb = output
+            do_l2_normalize = True # Normalize DINOv2 output
 
-            if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
-            if attention_mask is None: raise ValueError("Processor didn't return 'pixel_attention_mask'.")
-            if spatial_shapes is None: raise ValueError("Processor didn't return 'spatial_shapes'.")
+        # --- Hugging Face Model Handling (SigLIP or Facebook DINOv2) ---
+        elif model_type == "hf":
+            processor = model_info.get("processor")
+            model = model_info.get("model")
+            if processor is None or model is None:
+                 raise ValueError("HF processor or model missing.")
 
-            # Quick check on sequence length - should now be consistently 1024
-            if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
-                 print(f"ERROR: NaFlex Processor output sequence length is not 1024! Got {pixel_values.shape[1]}.")
-                 return None
+            model_call_kwargs = {}
+            is_siglip2_model = "Siglip2Model" in model.__class__.__name__
+            is_dinov2_model = "Dinov2Model" in model.__class__.__name__
 
-            # Prepare args for model call
-            model_call_kwargs = {
-                "pixel_values": pixel_values.to(device=device, dtype=dtype),
-                "attention_mask": attention_mask.to(device=device),
-                "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)
-            }
+            # --- HF NaFlex Mode (Processor Logic @ 1024) ---
+            if is_siglip2_model and preprocess_mode == 'naflex_resize':
+                # print(f"DEBUG get_embedding [HF/NaFlex]: Using Processor logic (target 1024).")
+                try:
+                    inputs = processor(images=[raw_img_pil], return_tensors="pt", max_num_patches=1024)
+                except Exception as e_proc: # ... (error handling) ...
+                    return None
 
-        # --- FitPad / CenterCrop Handling ---
-        elif preprocess_mode in ['fit_pad', 'center_crop']:
-            processed_img_pil = None
-            if preprocess_mode == 'fit_pad':
-                # print(f"DEBUG get_embedding: Using manual FitPad preprocess for {img_name}.")
+                pixel_values = inputs.get("pixel_values")
+                attention_mask = inputs.get("pixel_attention_mask")
+                spatial_shapes = inputs.get("spatial_shapes")
+
+                if pixel_values is None or attention_mask is None or spatial_shapes is None:
+                    raise ValueError("Missing required tensors from HF NaFlex processor output.")
+                if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
+                    raise ValueError(f"HF NaFlex Processor output seq len != 1024 ({pixel_values.shape[1]})")
+
+                model_call_kwargs = {
+                    "pixel_values": pixel_values.to(device=device, dtype=dtype),
+                    "attention_mask": attention_mask.to(device=device),
+                    "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)
+                }
+
+                # --- HF DINOv2 Mode (Manual FitPad + CLS Token) ---
+            elif is_dinov2_model and preprocess_mode == 'dinov2_giant_fb_fitpad':
+                # print(f"DEBUG get_embedding [HF/DINOv2]: Using manual FitPad.")
+                # Use model_image_size determined during init (should be 518)
                 processed_img_pil = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
-            elif preprocess_mode == 'center_crop':
-                # print(f"DEBUG get_embedding: Using manual CenterCrop preprocess for {img_name}.")
-                processed_img_pil = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
+                if processed_img_pil is None: return None
 
-            if processed_img_pil is None:
-                print(f"Warning get_embedding: Manual preprocessing returned None for {img_name}. Skipping.")
+                inputs = processor(images=[processed_img_pil], return_tensors="pt")
+                pixel_values = inputs.get("pixel_values")
+                if pixel_values is None: raise ValueError("HF DINOv2 Processor didn't return 'pixel_values'.")
+                # DINOv2 base forward usually doesn't need mask/shapes for fixed size input
+                model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
+                do_l2_normalize = True  # Normalize DINOv2 CLS token
+
+            # --- HF SigLIP FitPad / CenterCrop Modes ---
+            elif preprocess_mode in ['fit_pad', 'center_crop']:
+                processed_img_pil = None
+                if preprocess_mode == 'fit_pad':
+                    processed_img_pil = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
+                elif preprocess_mode == 'center_crop':
+                    processed_img_pil = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
+                if processed_img_pil is None: return None
+
+                inputs = processor(images=[processed_img_pil], return_tensors="pt")
+                pixel_values = inputs.get("pixel_values")
+                if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
+
+                model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
+                attention_mask = inputs.get("pixel_attention_mask")
+                if attention_mask is not None: model_call_kwargs["attention_mask"] = attention_mask.to(device=device)
+                # SigLIP standard models expect pooler_output, which doesn't use spatial_shapes
+
+            # --- Invalid HF Mode ---
+            else:
+                print(
+                    f"ERROR get_embedding [HF]: Invalid preprocess_mode '{preprocess_mode}' for detected HF model type.")
                 return None
 
-            # Call processor with the *already resized* image.
-            # Processor's internal resize won't trigger if size matches.
-            inputs = processor(images=[processed_img_pil], return_tensors="pt")
-            pixel_values_from_proc = inputs.get("pixel_values")
-            if pixel_values_from_proc is None: raise ValueError("Processor didn't return 'pixel_values'.")
+            # --- HF Model Call ---
+            # print(f"DEBUG get_embedding [HF]: Calling HF model ({model.__class__.__name__})...")
+            # DINOv2Model forward directly returns BaseModelOutput /w last_hidden_state
+            # Siglip2Model forward needs specific component call or get_image_features
+            if is_dinov2_model:
+                outputs = model(**model_call_kwargs)
+                last_hidden_state = outputs.last_hidden_state
+                if last_hidden_state is None: raise ValueError("DINOv2 model did not return last_hidden_state.")
+                emb = last_hidden_state[:, 0]  # Extract CLS token
+            elif is_siglip2_model:
+                vision_model_component = getattr(model, 'vision_model', None)
+                if vision_model_component:
+                    vision_outputs = vision_model_component(**model_call_kwargs)
+                    emb = vision_outputs.pooler_output  # Use pooled output
+                elif hasattr(model, 'get_image_features'):
+                    emb = model.get_image_features(
+                        **model_call_kwargs)  # Use get_image_features if vision_model missing
+                else:
+                    raise AttributeError("SigLIP Model has neither 'vision_model' nor 'get_image_features'.")
+            else:  # Other HF model types?
+                print(f"Warning: Unknown HF model type {model.__class__.__name__}. Attempting direct call.")
+                outputs = model(**model_call_kwargs)
+                emb = getattr(outputs, 'pooler_output', getattr(outputs, 'last_hidden_state', None))
+                
+                assert isinstance(emb, torch.Tensor), f"Expected emb to be a Tensor, but got {type(emb)}"
+                
+                if emb is not None and emb.ndim == 3:  # If we got LHS, try taking first token
+                    print("Warning: Got LHS from unknown model, taking CLS token [:, 0].")
+                    emb = emb[:, 0]
 
-            pixel_values = pixel_values_from_proc.to(device=device, dtype=dtype)
-            model_call_kwargs = {"pixel_values": pixel_values}
-            # Pass mask if available (e.g., for standard SigLIP if processor adds one)
-            attention_mask_from_processor = inputs.get("pixel_attention_mask")
-            if attention_mask_from_processor is not None:
-                  model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=device)
+            if emb is None: raise ValueError("Failed to get embedding from HF model call.")
 
-        # --- AvgCrop Handling (Still needs implementation) ---
-        elif preprocess_mode == 'avg_crop':
-             print("ERROR: AvgCrop embedding generation not fully implemented.")
-             return None
-        # --- Unknown Mode ---
+        # --- Invalid Mode ---
         else:
-            print(f"ERROR get_embedding: Invalid/unhandled preprocess_mode '{preprocess_mode}'.")
+            print(
+                f"ERROR get_embedding: Unknown model_type '{model_type}' or unhandled preprocess_mode '{preprocess_mode}'.")
             return None
 
-        # --- Model Call (Common Logic) ---
-        emb = None
-        vision_model_component = getattr(model, 'vision_model', None)
+        # --- Final Normalization & Conversion ---
+        if emb is None:
+            print(f"ERROR get_embedding: Embedding is None before final conversion for {img_name}.")
+            return None
 
-        if vision_model_component:
-            # print(f"DEBUG get_embedding: Calling vision_model for {img_name}...")
-            vision_outputs = vision_model_component(**model_call_kwargs)
-            emb = vision_outputs.pooler_output
-        elif hasattr(model, 'get_image_features'):
-             # print(f"DEBUG get_embedding: Calling get_image_features for {img_name}...")
-             emb = model.get_image_features(pixel_values=model_call_kwargs["pixel_values"])
-        else:
-            raise AttributeError("Model has neither 'vision_model' nor 'get_image_features'.")
+        assert isinstance(emb, torch.Tensor), f"Expected emb to be a Tensor, but got {type(emb)}"
 
-        if emb is None: raise ValueError("Failed to get embedding from model call.")
+        if do_l2_normalize:
+            # print(f"DEBUG get_embedding: L2 Normalizing final embedding.")
+            norm = torch.linalg.norm(emb.float(), dim=-1, keepdim=True).clamp(min=1e-8)
+            normalized_emb = emb / norm.to(emb.dtype)
+            emb = normalized_emb
 
-        # --- Normalize & Convert (Common Logic) ---
-        norm = torch.linalg.norm(emb.detach().float(), dim=-1, keepdim=True).clamp(min=1e-8)
-        normalized_embedding_tensor = emb / norm.to(emb.dtype)
-        embedding_result_np = normalized_embedding_tensor.cpu().to(torch.float32).numpy().squeeze()
+        embedding_result_np = emb.cpu().to(torch.float32).numpy().squeeze()
         return embedding_result_np
 
     except Exception as e:
-        print(f"\nError during get_embedding (v4.1.5) for {img_name} (Mode: {preprocess_mode}):")
+        print(f"\nError during get_embedding (v4.2.0) for {img_name} (Mode: {preprocess_mode}, Type: {model_type}):")
         traceback.print_exc()
         return None
 # --- End Unified Embedding Function ---
@@ -300,22 +374,74 @@ if __name__ == "__main__":
          print("Warning: bf16 not supported. Using float32.")
          COMPUTE_DTYPE = torch.float32
 
-    # --- Initialize Model & Processor ---
-    # Calls the updated init_vision_model which keeps processor defaults
-    processor, vision_model, model_image_size = init_vision_model(args.model_name, TARGET_DEV, COMPUTE_DTYPE)
+    # --- Initialize Model & Preprocessing Info ---
+    model_info = {} # Bundle to hold model, processor, transforms, type
+    model_image_size = 0 # Needed for manual preprocessing
+
+    # --- TIMM Model Handling ---
+    if args.model_name.startswith("timm/") and TIMM_AVAILABLE:
+         print("Detected TIMM model name.")
+         if args.preprocess_mode != 'dinov2_large_timm_fitpad':
+             exit("Error: TIMM model requires 'dinov2_large_timm_fitpad' preprocess_mode.")
+         try:
+              print(f"Initializing TIMM Model: {args.model_name}...")
+              timm_model = timm.create_model(args.model_name, pretrained=True, num_classes=0)
+              data_config = timm.data.resolve_model_data_config(timm_model)
+              timm_input_size = data_config.get('input_size')
+              if timm_input_size: model_image_size = timm_input_size[-1]
+              else: model_image_size = 224 # Fallback
+              print(f"  TIMM Input Size: {model_image_size}")
+              timm_transforms = timm.data.create_transform(**data_config, is_training=False)
+              timm_model = timm_model.to(device=TARGET_DEV, dtype=COMPUTE_DTYPE).eval()
+
+              model_info = {"type": "timm", "model": timm_model, "transforms": timm_transforms}
+         except Exception as e: # ... (error handling) ...
+              exit(1)
+
+    # --- Hugging Face Model Handling (SigLIP or FB DINOv2) ---
+    else:
+         print("Assuming Hugging Face model name.")
+         try:
+              # init_vision_model loads processor/model and determines image_size
+              processor, vision_model, hf_model_image_size = init_vision_model(args.model_name, TARGET_DEV, COMPUTE_DTYPE)
+              model_info = {"type": "hf", "processor": processor, "model": vision_model}
+              model_image_size = hf_model_image_size # Use size from HF config/processor
+
+              # Add specific check for DINOv2 FB size
+              if args.preprocess_mode == 'dinov2_giant_fb_fitpad' and model_image_size != 518:
+                   print(f"Warning: FB DINOv2 mode selected, but detected image size is {model_image_size} (expected 518). Using detected size.")
+                   # Or force it? Let's use detected for now.
+                   # model_image_size = 518
+
+         except Exception as e:
+             print(f"Error initializing Hugging Face model/processor: {e}")
+             exit(1)
 
     # --- Determine Output Directory ---
     model_name_safe = args.model_name.split('/')[-1].replace('-', '_')
-    # <<< UPDATED: Permanent Naming for Processor Logic @ 1024 >>>
-    proc_suffix = "_Proc1024" if args.preprocess_mode == 'naflex_resize' else ""
-    mode_suffix_map = {'fit_pad': "FitPad", 'center_crop': "CenterCrop",
-                       'avg_crop': "AvgCrop", 'naflex_resize': f"Naflex{proc_suffix}"} # e.g., Naflex_Proc1024
+    # Updated Naming Map
+    mode_suffix_map = {
+        'fit_pad': "FitPad",              # HF SigLIP Manual FitPad
+        'center_crop': "CenterCrop",      # HF SigLIP Manual CenterCrop
+        'avg_crop': "AvgCrop",            # NYI
+        'naflex_resize': "Naflex_Proc1024", # HF SigLIP NaFlex Processor@1024
+        'dinov2_large_timm_fitpad': "FitPad",   # TIMM DINOv2 (uses FitPad via transforms)
+        'dinov2_giant_fb_fitpad': "FitPad"      # FB DINOv2 Manual FitPad
+    }
     mode_suffix = mode_suffix_map.get(args.preprocess_mode, "UnknownMode")
-    output_subdir_name = f"{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
+    # Add prefix only if needed for clarity (HF DINOv2 vs TIMM DINOv2)
+    model_prefix = ""
+    if 'dinov2' in args.model_name and model_info["type"] == "hf":
+         model_prefix = "hf_"
+
+    output_subdir_name = f"{model_prefix}{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
     final_output_dir = os.path.join(args.output_dir_root, output_subdir_name)
-    print(f"\nSelected Preprocessing Mode: {args.preprocess_mode}")
-    if args.preprocess_mode == 'naflex_resize':
-         print("  (Using Processor logic with target max_num_patches=1024)") # Updated message
+
+    print(f"\nSelected Model: {args.model_name} ({model_info['type']} type)")
+    print(f"Selected Preprocessing Mode: {args.preprocess_mode}")
+    if args.preprocess_mode == 'naflex_resize': print("  (Using HF Processor logic with target max_num_patches=1024)")
+    if args.preprocess_mode == 'dinov2_large_timm_fitpad': print(f"  (Using TIMM transforms with input size {model_image_size})")
+    if args.preprocess_mode == 'dinov2_giant_fb_fitpad': print(f"  (Using Manual FitPad to size {model_image_size})")
     print(f"Embeddings will be saved in: {final_output_dir}")
 
     # --- Process Source Folders ---
@@ -337,24 +463,21 @@ if __name__ == "__main__":
             embedding_result = None
             try:
                 img_path = os.path.join(current_image_dir, fname)
-                # --- Load Image ---
                 try:
                     raw_img_pil = Image.open(img_path).convert("RGB")
                 except Exception as img_e:
                     print(f"\nError opening image {fname}: {img_e}. Skipping.")
-                    continue # Skip this image
+                    continue
 
                 # --- Call unified embedding function ---
-                # target_length=1024 is now the default in get_embedding v4.1.1
                 embedding_result = get_embedding(
                     raw_img_pil=raw_img_pil,
                     preprocess_mode=args.preprocess_mode,
-                    processor=processor,
-                    model=vision_model,
+                    model_info=model_info, # Pass the bundle
                     device=TARGET_DEV,
                     dtype=COMPUTE_DTYPE,
-                    model_image_size=model_image_size,
-                    resize_factor_avg_crop=args.resize_factor_avg_crop
+                    model_image_size=model_image_size, # Pass size needed for manual modes
+                    # resize_factor_avg_crop=args.resize_factor_avg_crop # Removed avg_crop
                 )
 
                 # --- Save result ---
@@ -363,7 +486,6 @@ if __name__ == "__main__":
                     output_path = os.path.join(current_output_subdir, f"{base_fname}.npy")
                     np.save(output_path, embedding_result)
                 else:
-                    # get_embedding function now handles internal errors and prints warnings
                     print(f"Info: Skipping save for {fname} as embedding generation returned None.")
 
             except Exception as e: # Catch any unexpected errors in the loop
@@ -371,7 +493,7 @@ if __name__ == "__main__":
                 print(f"  EXCEPTION TYPE: {type(e)}")
                 print(f"  EXCEPTION VALUE: {e}")
                 traceback.print_exc()
-                continue # Skip to next image
+                continue
         # --- End Image Loop ---
     # --- End Folder Loop ---
 

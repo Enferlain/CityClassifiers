@@ -13,3 +13,4 @@ triton-windows
 matplotlib
 bitsandbytes
 sentencepiece
+timm

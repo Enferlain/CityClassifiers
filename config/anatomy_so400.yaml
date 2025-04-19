@@ -3,7 +3,7 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"     # Base name for the model concept (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v5.7_adabeleif_fl_sigmoid_naflex1024"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
+  rev: "v6.0_adabeleif_fl_sigmoid_dinov2_large"  # Revision string (e.g., v4.0_FitPad_DINOv2_BCE) - Used for filenames
   arch: class             # Model architecture: 'class' or 'score'
   embed_ver: "siglip2_so400m_patch16_naflex_Naflex_Proc1024" # Embedding version key (must match keys/prefixes in utils.py)
                            # Examples:
