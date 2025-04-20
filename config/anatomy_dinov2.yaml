@@ -3,7 +3,7 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"  # Base name (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v6.0_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
+  rev: "v6.2_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
   arch: class                # Model architecture: 'class' or 'score'
 
   # --- Embedding Configuration ---
@@ -33,82 +33,92 @@ predictor_params:
 
 # --- Training Parameters ---
 train:
+  # --- Training Duration ---
+  # Specify EITHER max_train_epochs OR max_train_steps.
+  # If both are given, max_train_steps takes priority as the hard limit.
+  # If neither is given, defaults to max_train_steps = 100000.
+  max_train_epochs: null       # Total number of epochs to train for (int, or null).
+  max_train_steps: 300000      # Max total steps (batches processed) to train for (int, or null).
+
   # --- Core Settings ---
   lr: 1e-4                   # Initial learning rate (float)
-  steps: 300000              # Total number of training steps (int)
   batch: 32                  # Training batch size per device (int)
   precision: "fp32"          # Training precision (string: "fp32", "fp16", "bf16")
 
   # --- Loss Function ---
   loss_function: "focal"     # Loss function name (string).
                              # Options: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll', 'ghm'.
-                             # Ensure this matches the predictor_params.output_mode!
+                             # Default based on 'arch' if omitted (Focal for class, L1 for score).
+  # -- Loss Function Specific Arguments --
   focal_loss_gamma: 2.0      # Example: Gamma for Focal Loss (float, only used if loss_function='focal')
   # ghm_bins: 10             # Example: Bins for GHM Loss
   # ghm_momentum: 0.75       # Example: Momentum for GHM Loss
 
   # --- Optimizer ---
   # Name MUST be lowercase and match a key in optimizer.OPTIMIZERS dictionary (or 'adamw').
-  optimizer: "adabelief"       # Optimizer choice (string).
+  optimizer: "adabelief"       # Optimizer choice (string). Defaults to 'AdamW' if omitted.
 
   # -- Optimizer Hyperparameters --
   # Only specify args here IF you want to OVERRIDE the optimizer's own internal defaults.
   # train.py will dynamically pass any args here matching the chosen optimizer's __init__ signature.
   # Example overrides (check optimizer's code for valid args and defaults):
-  betas: [0.9, 0.999]        # List/tuple of 2 floats
-  eps: 1e-8                  # Float
-  weight_decay: 1e-3         # Float
-  # weight_decouple: true    # Example for AdaBelief/AdamW variants
-  rectify: true              # Example for AdaBelief
-  adaptive_clip: 1.0         # Example for ADOPT variants
-  adaptive_clip_eps: 1e-3    # Example for ADOPT variants
-  gamma: 0.005               # Example for MARS variants
-  r_sf: 0.0                  # R value for ScheduleFree (float)
-  wlpow_sf: 2.0              # Weight LR Power for ScheduleFree (float)
-  state_precision: parameter # Precision for optimizer state in ScheduleFree (parameter or float32)
-  # ... etc ...
+  betas: [0.9, 0.999]      # List/tuple of 2 floats
+  eps: 1e-8                # Float
+  weight_decay: 1e-3       # Float
+  rectify: false            # Example bool arg for AdaBelief/RAdam variants
+  weight_decouple: true    # Example bool arg for AdamW/AdaBelief variants
+  clip_threshold: 1.0      # Example float arg for CAME
 
   # --- Scheduler ---
   # Ignored if using a ScheduleFree optimizer (name contains 'schedulefree').
-  # Specify scheduler by name (lowercase, matching optimizer.SCHEDULERS or standard torch names).
-  scheduler_name: "RexAnnealingWarmRestarts" # Options: e.g., "CosineAnnealingWarmRestarts", "RexAnnealingWarmRestarts", "CosineAnnealingLR", "LinearLR", "None"
+  # Specify scheduler by name (lowercase, matching optimizer.SCHEDULERS or standard torch names like 'cosineannealinglr', 'linearlr').
+  # Use 'None' (as string or null) if no scheduler is desired.
+  scheduler_name: "RexAnnealingWarmRestarts" # Defaults to 'CosineAnnealingLR' if omitted and not schedule-free.
 
   # -- Scheduler Arguments --
   # For CUSTOM schedulers (from optimizer folder), prefix args with 'scheduler_'.
+  # For STANDARD torch schedulers, use specific args OR the generic 'scheduler_t_max' / 'scheduler_eta_min'.
   # Check the scheduler's __init__ signature for valid args.
-  scheduler_gamma: 0.95                     # Example for CosineAnnealingWarmRestarts
-  scheduler_cycle_multiplier: 3.0           # Example for CosineAnnealingWarmRestarts (restart count)
-  scheduler_first_cycle_max_steps: 100000   # Example for CosineAnnealingWarmRestarts (restart after x steps)
-  scheduler_min_lr: 1e-7                    # Example for CosineAnnealingWarmRestarts
-  # scheduler_warmup_steps: 5000              # Example for CosineAnnealingWarmRestarts (used by scheduler internally)
-  # scheduler_d: 0.9                        # Example for RexAnnealingWarmRestarts
 
+  # Example Args for CosineAnnealingWarmRestarts / RexAnnealingWarmRestarts:
+  scheduler_gamma: 0.95                     # Decay factor for max LR on restart (float)
+  scheduler_cycle_multiplier: 1.0           # Multiplier for cycle length after restart (float)
+  scheduler_first_cycle_max_steps: 100000   # Duration of first cycle in steps (int, usually == max_train_steps)
+  scheduler_min_lr: 1e-7                    # Minimum LR (float)
+  scheduler_warmup_steps: 5000              # Warmup steps *within each cycle* if scheduler supports it (int)
+  # scheduler_d: 0.9                        # Example arg specific to Rex
 
-  # -- Arguments for STANDARD torch schedulers --
-  # Used if scheduler_name is 'CosineAnnealingLR' or 'LinearLR'.
-  # scheduler_t_max: 100000 # Optional override for CosineAnnealingLR T_max (defaults to train.steps)
-  # scheduler_eta_min: 0    # Optional override for CosineAnnealingLR eta_min (defaults to 0)
-  # warmup_steps: 0         # Use this for LinearLR warmup (if scheduler_name='LinearLR')
+  # Example Args for Standard CosineAnnealingLR:
+  # scheduler_t_max: 100000 # Optional: Override T_max (defaults to max_train_steps)
+  # scheduler_eta_min: 0    # Optional: Override eta_min (defaults to 0)
+
+  # Example Args for Standard LinearLR (use scheduler_name: 'LinearLR'):
+  # warmup_steps: 5000      # <<< Use THIS key for LinearLR total warmup iterations (int)
 
   # --- Data & Other ---
   val_split_count: 100       # Samples PER CLASS for validation set (int, 0 to disable).
   seed: 218                  # Random seed for validation split shuffle (int).
   num_workers: 0             # Dataloader workers (int).
   preload_data: true         # Preload dataset embeddings to RAM? (true/false)
-  nsave: 10000               # Save model every N steps (int, 0 to disable periodic).
+  nsave: 10000               # Save periodic checkpoints every N global steps (int, 0 to disable).
+  # save_every_n_epochs: 5   # Optional: Save checkpoint at the end of every N epochs (int, 0 or null to disable).
 
-# --- Data Root (Can be overridden by command line) ---
+# --- Data Root ---
+# Location of the parent folder containing embedding folders (e.g., data/embed_ver/0/, data/embed_ver/1/)
+# Can be overridden by command line --data_root
 data_root: "data"
 
-# --- Logging (Can be overridden by command line) ---
+# --- Logging ---
+# Can be overridden by command line --wandb_project
 wandb_project: "city-classifiers"
 
 # --- Labels (Only relevant for 'class' architecture) ---
-labels: # Define classes and optional loss weights
-  0: # Folder name MUST match the key (as string)
-    name: "Bad Anatomy"  # Display name for this class
-    loss: 1.0            # Optional: Loss weight multiplier for this class (default 1.0)
-  1:
+# Define classes and optional loss weights. Folder names MUST match keys.
+labels:
+ '0': # Folder name '0'
+    name: "Bad Anatomy"  # Display name
+    loss: 1.0            # Optional loss weight
+ '1': # Folder name '1'
     name: "Good Anatomy"
     loss: 1.0
-  # Add more classes if needed (e.g., '2': ...)
+ # '2': ...e.g., '2': ...)

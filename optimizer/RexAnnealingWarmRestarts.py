@@ -140,42 +140,17 @@ class RexAnnealingWarmRestarts(LRScheduler):
     def get_lr(self) -> float:
         self._update_step()
         lrs = []
-        # <<< PRINT STEP JUST BEFORE LOOP >>>
-        step_for_log = self.optimizer.param_groups[0].get('step', self.last_epoch + 1)  # Get overall step
-
-        for i, group in enumerate(self.optimizer.param_groups):
-            # <<< PRINT GROUP STATE AT START OF LOOP >>>
-            if step_for_log % 1000 == 0:  # Print every 1000 steps to avoid spam
-                print(f"\nDEBUG get_lr Step: {step_for_log}, Group {i}:")
-                print(f"  current_cycle_step: {group['current_cycle_step']}")
-                print(f"  warmup_steps: {group['warmup_steps']}")
-                print(f"  current_cycle_max_steps: {group['current_cycle_max_steps']}")
-                print(f"  current_max_lr: {group['current_max_lr']}")
-                print(f"  min_lr: {group['min_lr']}")
-
-            lr_range = group["current_max_lr"] - group["min_lr"]
-            calculated_lr = group['min_lr']  # Default to min
-
-            if group["current_cycle_step"] < group["warmup_steps"]:
-                # <<< PRINT WARMUP CALC >>>
-                calculated_lr = lr_range * group["current_cycle_step"] / group["warmup_steps"] + group["min_lr"]
-                if step_for_log % 1000 == 0: print(f"  In Warmup -> LR: {calculated_lr}")
-                lrs.append(calculated_lr)
+        for group in self.optimizer.param_groups:
+            if group["current_max_lr"] <= group["min_lr"]:
+                lrs.append(group["min_lr"])
                 continue
-
+            lr_range = group["current_max_lr"] - group["min_lr"]
+            if group["current_cycle_step"] < group["warmup_steps"]:
+                lrs.append(lr_range * group["current_cycle_step"] / group["warmup_steps"] + group["min_lr"])
+                continue
             normalized_step = group["current_cycle_step"] - group["warmup_steps"]
-            # <<< Prevent division by zero if max_steps equals warmup_steps >>>
-            normalized_max_steps = max(1, group["current_cycle_max_steps"] - group["warmup_steps"])
+            normalized_max_steps = group["current_cycle_max_steps"] - group["warmup_steps"]
             progress = normalized_step / normalized_max_steps
-            divider = max(1e-8, (1 - self.d) + (self.d * (1 - progress)))  # Prevent division by zero
-
-            # <<< PRINT DECAY CALC >>>
-            calculated_lr = group["min_lr"] + lr_range * ((1 - progress) / divider)
-            if step_for_log % 1000 == 0:
-                print(f"  In Decay:")
-                print(f"    norm_step: {normalized_step}, norm_max: {normalized_max_steps}, progress: {progress:.4f}")
-                print(f"    divider: {divider:.4f}, decay_factor: {((1 - progress) / divider):.4f}")
-                print(f"    -> LR: {calculated_lr}")
-
-            lrs.append(calculated_lr)
+            divider = (1 - self.d) + (self.d * (1 - progress))
+            lrs.append(group["min_lr"] + lr_range * ((1 - progress) / divider))
         return lrs

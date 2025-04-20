@@ -55,20 +55,20 @@ def get_embed_params(ver):
 # --- End Parameter Dictionary ---
 
 # --- Argument Parsing and Config Loading ---
-# Version 2.4.0: Simplified optimizer arg handling, rely on dynamic loader in train.py
+# Version 2.5.0: Simplified optimizer arg handling, rely on dynamic loader, added epoch args
 def parse_and_load_args():
     """
-    Parses command line args and merges with YAML config.
+    Parses command line args and merges with YAML config. Epoch-based aware.
     Command line args take precedence over YAML.
-    Relies on train.py's dynamic optimizer loader to handle defaults
-    if args are not specified here.
     """
     parser = argparse.ArgumentParser(description="Train aesthetic predictor/classifier")
     # --- Command Line Arguments ---
-    # Basic args
     parser.add_argument("--config", required=True, help="Training config YAML file")
     parser.add_argument('--resume', help="Checkpoint (.safetensors model file) to resume from")
-    # Args that can override YAML equivalents
+    # Training Duration Overrides
+    parser.add_argument('--max_train_epochs', type=int, default=None, help="Override: Train for a specific number of epochs.")
+    parser.add_argument('--max_train_steps', type=int, default=None, help="Override: Train for a specific number of steps (takes priority).")
+    # Other Overrides
     parser.add_argument('--precision', type=str, default=None, choices=['fp32', 'fp16', 'bf16'], help='Override training precision.')
     parser.add_argument("--nsave", type=int, default=None, help="Override save frequency (steps).")
     parser.add_argument("--val_split_count", type=int, default=None, help="Override validation split count.")
@@ -80,261 +80,196 @@ def parse_and_load_args():
     parser.add_argument('--optimizer', type=str, default=None, help='Override optimizer choice.')
     parser.add_argument('--loss_function', type=str, default=None, help="Override loss function choice.")
     parser.add_argument('--lr', type=float, default=None, help="Override learning rate.")
-    # Add any other KEY hyperparams you might want to override via cmd line
-    parser.add_argument('--betas', type=float, nargs='+', default=None, help="Override optimizer betas.")
+    parser.add_argument('--betas', type=float, nargs='+', default=None, help="Override optimizer betas.") # Keep common overrides
     parser.add_argument('--weight_decay', type=float, default=None, help='Override optimizer weight decay.')
     parser.add_argument('--eps', type=float, default=None, help='Override optimizer epsilon.')
-    # Maybe add steps/batch override?
-    parser.add_argument('--steps', type=int, default=None, help='Override total training steps.')
     parser.add_argument('--batch', type=int, default=None, help='Override batch size.')
 
-    # Parse command line args
     cmd_args = parser.parse_args()
 
     # Load YAML config
-    if not os.path.isfile(cmd_args.config):
-        parser.error(f"Can't find config file '{cmd_args.config}'")
-    with open(cmd_args.config) as f:
-        conf = yaml.safe_load(f)
+    if not os.path.isfile(cmd_args.config): parser.error(f"Config file '{cmd_args.config}' not found.")
+    try:
+        with open(cmd_args.config) as f: conf = yaml.safe_load(f)
+    except Exception as e: parser.error(f"Error loading YAML config '{cmd_args.config}': {e}")
 
-    # --- Create final args object, prioritizing command line over YAML ---
-    args = argparse.Namespace() # Start with an empty namespace
+    args = argparse.Namespace() # Final args object
 
-    # Helper to get value: cmd > yaml > default
+    # Helper function remains the same
     def get_arg_value(arg_name, cmd_value, yaml_conf_section, yaml_key=None, default=None, expected_type=None):
         if yaml_key is None: yaml_key = arg_name
         yaml_value = yaml_conf_section.get(yaml_key, default)
-        # If command line value was provided (is not None), use it
         final_value = cmd_value if cmd_value is not None else yaml_value
-
-        # Attempt type conversion if needed (simplistic for now)
         if final_value is not None and expected_type is not None:
-             try:
-                  if expected_type == bool: final_value = bool(final_value)
-                  elif expected_type == int: final_value = int(final_value)
-                  elif expected_type == float: final_value = float(final_value)
-                  elif expected_type == tuple and isinstance(final_value, list): final_value = tuple(final_value)
-                  # Add more types if needed
-             except (ValueError, TypeError):
-                  print(f"Warning: Could not convert arg '{arg_name}' value '{final_value}' to {expected_type}. Using as is or default.")
-                  final_value = default # Fallback to default on conversion error
-        # If still None after cmd/yaml, use the default
+            try:
+                if expected_type == bool: final_value = bool(final_value)
+                elif expected_type == int: final_value = int(final_value)
+                elif expected_type == float: final_value = float(final_value)
+                elif expected_type == tuple and isinstance(final_value, list): final_value = tuple(final_value)
+            except (ValueError, TypeError):
+                print(f"Warning: Arg '{arg_name}' value '{final_value}' invalid for {expected_type}. Using default: {default}")
+                final_value = default
         return final_value if final_value is not None else default
 
-    # --- Populate Args ---
+    # --- Populate Args (Prioritize CMD > YAML > Default) ---
+    # Config path / Resume
+    args.config = cmd_args.config
+    args.resume = cmd_args.resume
     # Model Info
     model_conf = conf.get("model", {})
-    args.config = cmd_args.config # Store config path
-    args.resume = cmd_args.resume
-    args.base = model_conf.get("base", "unknown_model")
-    args.rev = model_conf.get("rev", "v0.0")
-    args.arch = model_conf.get("arch", "class")
-    args.embed_ver = model_conf.get("embed_ver", "unknown")
+    args.base = model_conf.get("base", "unknown_model"); args.rev = model_conf.get("rev", "v0.0")
+    args.arch = model_conf.get("arch", "class"); args.embed_ver = model_conf.get("embed_ver", "unknown")
     args.name = f"{args.base}-{args.rev}"
     args.base_vision_model = model_conf.get("base_vision_model")
-    # Try inferring base_vision_model if still None (Keep fallback, but make it clearer)
-    if not args.base_vision_model:
-        print("Warning: 'base_vision_model' not specified in YAML config. Attempting to infer...")
-        # Dictionary mapping BASE embed versions (or common prefixes) to HF model names
-        # NOTE: This inference is limited. Explicitly setting base_vision_model is preferred.
-        default_vision_models = {
-            "CLIP": "openai/clip-vit-large-patch14-336",
-            "siglip2_so400m_patch16_512": "google/siglip2-so400m-patch16-512",
-            "siglip2_so400m_patch16_naflex": "google/siglip2-so400m-patch16-naflex", # Added more specific key
-            "facebook_dinov2_giant": "facebook/dinov2-giant", # Added DINOv2
-            "timm_vit_large_patch14_dinov2": "timm/vit_large_patch14_dinov2.lvd142m", # Added DINOv2
-            "META": "facebook/metaclip-h14-fullcc2.5b"
-        }
-
-        found_model = None
-        l_embed_ver = args.embed_ver.lower() if args.embed_ver else ""
-        best_match_key = None
-
-        # Find the longest matching prefix key (This logic should work with better keys)
-        for key in default_vision_models.keys():
-            if l_embed_ver.startswith(key.lower()):
-                if best_match_key is None or len(key) > len(best_match_key):
-                    best_match_key = key
-
-        if best_match_key:
-            found_model = default_vision_models[best_match_key]
-            print(
-                f"DEBUG: Inferred base_vision_model '{found_model}' from embed_ver '{args.embed_ver}' using longest matching base key '{best_match_key}'")
-        else:
-            print(
-                f"Warning: Could not automatically determine base_vision_model for embed_ver '{args.embed_ver}'. Please specify it in the YAML config.")
-
-        args.base_vision_model = found_model
-
-        # Add a warning if we still couldn't find it
-        if not args.base_vision_model:
-            print(f"Warning: Could not automatically determine base_vision_model for embed_ver '{args.embed_ver}'. Please specify it in the YAML config.")
-
-
-    # Predictor Params (Directly from YAML - these aren't cmd line args)
+    # Predictor Params (Directly from YAML)
     predictor_conf = conf.get("predictor_params", {})
-    args.use_attention = predictor_conf.get("use_attention", True)
-    args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
-    args.attn_dropout = predictor_conf.get("attn_dropout", 0.1)
-    args.hidden_dim = predictor_conf.get("hidden_dim", None) # Default set later
-    args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
-    args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
-    args.output_mode = predictor_conf.get("output_mode", None) # Needs explicit value
+    args.use_attention = predictor_conf.get("use_attention", True); args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
+    args.attn_dropout = predictor_conf.get("attn_dropout", 0.1); args.hidden_dim = predictor_conf.get("hidden_dim", None)
+    args.num_res_blocks = predictor_conf.get("num_res_blocks", 1); args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
+    args.output_mode = predictor_conf.get("output_mode", None) # MUST be set in YAML
 
-    # Training Params (Merge cmd > yaml > coded default)
+    # Training Params (Merged)
     train_conf = conf.get("train", {})
     args.lr = get_arg_value('lr', cmd_args.lr, train_conf, default=1e-4, expected_type=float)
-    args.steps = get_arg_value('steps', cmd_args.steps, train_conf, default=100000, expected_type=int)
     args.batch = get_arg_value('batch', cmd_args.batch, train_conf, default=4, expected_type=int)
     args.loss_function = get_arg_value('loss_function', cmd_args.loss_function, train_conf)
     args.optimizer = get_arg_value('optimizer', cmd_args.optimizer, train_conf, default='AdamW')
-    args.betas = get_arg_value('betas', cmd_args.betas, train_conf, expected_type=tuple) # Expect tuple from YAML/CMD
+    # Common overrides
+    args.betas = get_arg_value('betas', cmd_args.betas, train_conf, expected_type=tuple)
     args.eps = get_arg_value('eps', cmd_args.eps, train_conf, expected_type=float)
     args.weight_decay = get_arg_value('weight_decay', cmd_args.weight_decay, train_conf, expected_type=float)
-    args.cosine = get_arg_value('cosine', None, train_conf, default=True, expected_type=bool) # No cmd arg
-    args.warmup_steps = get_arg_value('warmup_steps', None, train_conf, default=0, expected_type=int) # No cmd arg
+    # Training duration (values will be calculated later in train.py)
+    args.max_train_epochs = get_arg_value('max_train_epochs', cmd_args.max_train_epochs, train_conf, default=None, expected_type=int)
+    args.max_train_steps = get_arg_value('max_train_steps', cmd_args.max_train_steps, train_conf, default=None, expected_type=int)
 
-    # --- Other Top-Level Args ---
+    # Other Params
     args.precision = get_arg_value('precision', cmd_args.precision, train_conf, default='fp32')
     args.nsave = get_arg_value('nsave', cmd_args.nsave, train_conf, default=10000, expected_type=int)
     args.val_split_count = get_arg_value('val_split_count', cmd_args.val_split_count, train_conf, default=0, expected_type=int)
     args.seed = get_arg_value('seed', cmd_args.seed, train_conf, default=218, expected_type=int)
     args.num_workers = get_arg_value('num_workers', cmd_args.num_workers, train_conf, default=0, expected_type=int)
     args.preload_data = get_arg_value('preload_data', cmd_args.preload_data, train_conf, default=True, expected_type=bool)
-    args.data_root = get_arg_value('data_root', cmd_args.data_root, train_conf, default="data")
-    args.wandb_project = get_arg_value('wandb_project', cmd_args.wandb_project, train_conf, default="city-classifiers")
+    args.data_root = get_arg_value('data_root', cmd_args.data_root, conf, default="data") # Get from top level or default
+    args.wandb_project = get_arg_value('wandb_project', cmd_args.wandb_project, conf, default="city-classifiers") # Get from top level or default
 
     # --- Copy ALL OTHER keys from train_conf directly into args ---
-    # This ensures any optimizer-specific args from YAML are available
-    # It might overwrite things like 'lr' if cmd wasn't used, but get_arg_value already handled precedence.
-    # Filter out keys already explicitly handled above.
-    handled_keys = ['lr', 'steps', 'batch', 'loss_function', 'optimizer', 'betas', 'eps', 'weight_decay', 'cosine', 'warmup_steps', 'precision', 'nsave', 'val_split_count', 'seed', 'num_workers', 'preload_data', 'data_root', 'wandb_project']
+    # This passes through optimizer/scheduler specific args from YAML
+    handled_keys = ['lr', 'max_train_steps', 'max_train_epochs', 'batch', 'loss_function', 'optimizer', 'betas', 'eps', 'weight_decay', 'precision', 'nsave', 'val_split_count', 'seed', 'num_workers', 'preload_data']
     for key, value in train_conf.items():
-         if key not in handled_keys and not hasattr(args, key): # Only add if not already set
+         if key not in handled_keys and not hasattr(args, key):
+              # Attempt type inference for common scheduler args if needed
+              if isinstance(value, list): value = tuple(value) # Convert lists to tuples for consistency?
               setattr(args, key, value)
     # --- End Copy ---
 
     # --- Set Defaults based on embed_ver and arch ---
     try: embed_params = get_embed_params(args.embed_ver)
-    except ValueError as e: # ... (error handling) ...
-         embed_params = {"features": 768, "hidden": 1024}
-
+    except ValueError as e: print(f"Error: {e}"); embed_params = {}
     if args.hidden_dim is None: args.hidden_dim = embed_params.get('hidden', 1280)
     args.features = embed_params.get('features')
-    if args.features is None: exit("ERROR: Could not determine embedding features.")
+    if args.features is None: exit(f"ERROR: Could not determine embedding features for '{args.embed_ver}'.")
 
-    # Labels/Weights for classifier
+    # Labels/Weights
     labels_conf = conf.get("labels", {})
+    args.labels = None; args.weights = None; args.num_labels = 1 if args.arch == 'score' else 0
     if args.arch == "class":
         if labels_conf:
             args.labels = {str(k): v.get("name", str(k)) for k, v in labels_conf.items()}
             try: args.num_labels = max(int(k) for k in labels_conf.keys()) + 1
-            except: args.num_labels = 0
-            weights = [1.0] * args.num_labels
-            for k_str, label_conf in labels_conf.items():
-                try: weights[int(k_str)] = float(label_conf.get("loss", 1.0))
-                except: pass
-            args.weights = weights
-        else:
-             args.num_labels = model_conf.get("outputs", 2)
-             args.labels = None; args.weights = None
-    else: # Score
-        args.num_labels = 1; args.labels = None; args.weights = None
+            except: args.num_labels = 0 # Handle empty labels case
+            if args.num_labels > 0:
+                weights = [1.0] * args.num_labels
+                for k_str, label_conf in labels_conf.items():
+                    try: weights[int(k_str)] = float(label_conf.get("loss", 1.0))
+                    except (ValueError, IndexError): pass # Ignore bad index/value
+                args.weights = weights
+        else: args.num_labels = 2 # Default to 2 classes if none specified
 
-    # Validate inputs
-    assert args.arch in ["score", "class"], f"Unknown arch '{args.arch}'"
+    # --- Final Validation ---
     if args.arch == "score" and args.loss_function not in [None, 'l1', 'mse']:
-         print(f"Warning: Loss '{args.loss_function}' specified for score arch. Using default L1.")
-         args.loss_function = 'l1'
-
-    # Add 'bce' to the list of valid class losses
+         args.loss_function = 'l1' # Default for score
     valid_class_losses = [None, 'crossentropy', 'focal', 'bce', 'nll', 'ghm']
     if args.arch == "class" and args.loss_function not in valid_class_losses:
-         print(f"Warning: Loss '{args.loss_function}' specified for class arch is not in {valid_class_losses}. Defaulting to FocalLoss.")
-         # Default to FocalLoss is probably safer than CrossEntropy now
-         args.loss_function = 'focal'
+         args.loss_function = 'focal' # Default for class
+
+    if args.output_mode is None and args.arch != 'score':
+         exit(f"ERROR: predictor_params.output_mode must be set in YAML for arch '{args.arch}'.")
+    if args.max_train_epochs is None and args.max_train_steps is None:
+         print("Warning: Neither max_train_epochs nor max_train_steps specified. Defaulting to max_train_steps = 100000.")
+         args.max_train_steps = 100000
+
+    # Defer final print until after calculations in train.py
 
     return args
+# --- End Argument Parsing ---
 
 # --- Updated write_config Function ---
-# Version 2.3.1: Saves enhanced PredictorModel v2 parameters
+# Version 2.5.0: Saves calculated steps/epochs and scheduler args
 def write_config(args):
-    """Writes the final training configuration, including enhanced model params, to a JSON file."""
-    # Determine embed params based on the version string (used for defaults/consistency)
+    """Writes the final training configuration, including calculated steps/epochs and scheduler args."""
     try: embed_params = get_embed_params(args.embed_ver)
-    except ValueError as e: print(f"Error: {e}"); embed_params = {"features": 0, "hidden": 0}
+    except ValueError as e: print(f"Error: {e}"); embed_params = {}
 
-    # Consolidate config dictionary
     conf = {
-        # --- Model Identification & Type ---
         "model": {
-            "base": getattr(args, 'base', 'unknown_model'),
-            "rev": getattr(args, 'rev', 'v0.0'),
-            "arch": getattr(args, 'arch', 'class'), # score or class
-            "embed_ver": getattr(args, 'embed_ver', 'unknown'), # e.g., FitPad, NaFlex
-            "base_vision_model": getattr(args, 'base_vision_model', None), # HF name
+            "base": getattr(args, 'base', '?'), "rev": getattr(args, 'rev', '?'),
+            "arch": getattr(args, 'arch', '?'), "embed_ver": getattr(args, 'embed_ver', '?'),
+            "base_vision_model": getattr(args, 'base_vision_model', None),
         },
-        # --- PredictorModel v2 Architecture Parameters ---
         "predictor_params": {
-             # Renamed from model_params for clarity
-             # Use getattr with defaults matching PredictorModel.__init__ if args might be missing
-            "features": getattr(args, 'features', embed_params.get('features')), # Input embedding size
-            "hidden_dim": getattr(args, 'hidden_dim', embed_params.get('hidden')), # MLP hidden size
-            "num_classes": getattr(args, 'num_classes', 2), # Number of output neurons
-            "use_attention": getattr(args, 'use_attention', True), # Use attention layer?
-            "num_attn_heads": getattr(args, 'num_attn_heads', 8), # Attention heads
-            "attn_dropout": getattr(args, 'attn_dropout', 0.1), # Attention dropout
-            "num_res_blocks": getattr(args, 'num_res_blocks', 1), # Number of ResBlocks
-            "dropout_rate": getattr(args, 'dropout_rate', 0.1), # MLP dropout rate
-            "output_mode": getattr(args, 'output_mode', 'linear') # Final activation/output type
+            "features": getattr(args, 'features', '?'),
+            "hidden_dim": getattr(args, 'hidden_dim', '?'),
+            "num_classes": getattr(args, 'num_classes', '?'),
+            "use_attention": getattr(args, 'use_attention', '?'),
+            "num_attn_heads": getattr(args, 'num_attn_heads', '?'),
+            "attn_dropout": getattr(args, 'attn_dropout', '?'),
+            "num_res_blocks": getattr(args, 'num_res_blocks', '?'),
+            "dropout_rate": getattr(args, 'dropout_rate', '?'),
+            "output_mode": getattr(args, 'output_mode', '?')
         },
-        # --- Training Parameters ---
         "train": {
-            "lr": getattr(args, 'lr', 1e-4),
-            "steps": getattr(args, 'steps', 100000),
-            "batch": getattr(args, 'batch', 4),
-            "optimizer": getattr(args, 'optimizer', 'AdamW'),
-            "loss_function": getattr(args, 'loss_function', None), # Name of the loss used
-            "precision": getattr(args, 'precision', 'fp32'),
-            "val_split_count": getattr(args, 'val_split_count', 0),
-            # Store relevant optimizer hyperparams
-            "betas": getattr(args, 'betas', None),
-            "eps": getattr(args, 'eps', None),
-            "weight_decay": getattr(args, 'weight_decay', None),
-            "cosine": getattr(args, 'cosine', True),
-            "warmup_steps": getattr(args, 'warmup_steps', 0),
-            # Add others as needed (ensure they exist in args)
+            # Save calculated values if they exist
+            "max_train_epochs": getattr(args, 'num_train_epochs', '?'),
+            "max_train_steps": getattr(args, 'max_train_steps', '?'),
+            # Save other core params
+            "lr": getattr(args, 'lr', '?'), "batch": getattr(args, 'batch', '?'),
+            "optimizer": getattr(args, 'optimizer', '?'), "loss_function": getattr(args, 'loss_function', '?'),
+            "precision": getattr(args, 'precision', '?'), "val_split_count": getattr(args, 'val_split_count', '?'),
+            # Save optimizer specific args found on args object
             **{k: v for k, v in vars(args).items() if k in [
-                'gamma', 'r_sf', 'wlpow_sf', 'state_precision', 'weight_decouple',
-                'stable_weight_decay', 'adaptive_clip', 'adaptive_clip_eps',
-                'adaptive_clip_type', 'debias_beta2', 'use_beta2_warmup',
-                'beta2_warmup_initial', 'beta2_warmup_steps', 'mars_gamma', 'use_muon_pp',
-                'fisher', 'update_strategy', 'stable_update', 'atan2_denom', 'use_orthograd',
-                'use_spam_clipping', 'spam_clipping_threshold', 'spam_clipping_start_step',
-                'spam_clipping_type', 'focal_loss_gamma' # Added focal gamma
-                ] and hasattr(args, k) and getattr(args, k) is not None}
+                'betas', 'eps', 'weight_decay', 'weight_decouple', 'rectify', # Add others if needed
+                'gamma', 'r_sf', 'wlpow_sf', 'state_precision', 'adaptive_clip', 'adaptive_clip_eps',
+                 # ... copy relevant keys from the list in parse_and_load_args generic loop ...
+                'focal_loss_gamma', 'ghm_bins', 'ghm_momentum' # Add loss-specific args
+                ] and hasattr(args, k) and getattr(args, k) is not None},
+            # Save scheduler specific args found on args object
+            "scheduler_name": getattr(args, 'scheduler_name', None),
+             **{k: v for k, v in vars(args).items() if k.startswith('scheduler_') and hasattr(args, k) and getattr(args, k) is not None},
         },
-        # --- Labels (Only relevant for Classifier) ---
         "labels": getattr(args, 'labels', None) if getattr(args, 'arch', 'class') == "class" else None,
-        # Removed old model_params section to avoid duplication
+        "data_root": getattr(args, 'data_root', '?'),
+        "wandb_project": getattr(args, 'wandb_project', '?'),
     }
+    # Remove None values for cleaner output
+    conf['train'] = {k: v for k, v in conf['train'].items() if v is not None}
+    if conf['labels'] is None: del conf['labels']
+
     os.makedirs(SAVE_FOLDER, exist_ok=True)
     config_path = f"{SAVE_FOLDER}/{args.name}.config.json"
     try:
         with open(config_path, "w") as f:
-            # Use default=repr for things json can't handle directly (like tuples)
             f.write(json.dumps(conf, indent=2, default=repr))
-        print(f"Saved training config to {config_path}")
+        print(f"Saved final effective training config to {config_path}")
     except Exception as e:
         print(f"Error saving config file {config_path}: {e}")
+# --- End write_config ---
 
-# --- End Argument Parsing and Config Loading ---
 
-
-# v2.5.0: Correctly handles single latest _sXXX_best_val file, optional aux saving.
+# --- ModelWrapper Class ---
+# Version 2.6.0: Saves/loads epoch and global step state
 class ModelWrapper:
     def __init__(self, name, model, optimizer, criterion, scheduler=None, device="cpu",
-                 stdout=True, scaler=None, wandb_run=None, num_labels=1):
+                 stdout=True, scaler=None, wandb_run=None, num_labels=1, log_file_path=None):
         self.name = name
         self.model = model
         self.optimizer = optimizer
@@ -347,33 +282,61 @@ class ModelWrapper:
         self.num_labels = num_labels
 
         self.losses = []
-        self.current_step = 0
+        self.current_epoch = 0 # Tracks CURRENT epoch index (0-based) being processed or just completed
+        self.current_global_step = 0 # Tracks total steps completed
         self.best_val_loss = float('inf')
-        # Store the path to the *last known* best checkpoint file ending with _best_val.safetensors
-        self.current_best_val_model_path = None
-        # Try to find existing best model on init/resume? More complex, skip for now.
+        self.current_best_val_model_path = None # Path to the *.safetensors file
 
-        os.makedirs(SAVE_FOLDER, exist_ok=True)
-        self.log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
+        # Initialize or find existing best model path
+        self._find_initial_best_model()
+
+        # Setup logging
+        if log_file_path is None: log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
+        self.log_file_path = log_file_path
         file_mode = "a" if os.path.exists(self.log_file_path) else "w"
+        self.csvlog = None
         try:
             self.csvlog = open(self.log_file_path, file_mode)
             if file_mode == "w":
                 self.csvlog.write("step,train_loss_avg,eval_loss,learning_rate\n")
-                self.csvlog.flush() # Ensure header is written immediately
-        except IOError as e:
-            print(f"Warning: Could not open CSV log file {self.log_file_path}: {e}")
-            self.csvlog = None
-        self.stdout = stdout
+                self.csvlog.flush()
+        except IOError as e: print(f"Warning: Could not open CSV log file {self.log_file_path}: {e}")
         print(f"ModelWrapper initialized. Logging to {self.log_file_path} (mode: {file_mode})")
 
-    def update_step(self, step):
-        """Update the internal step counter."""
-        self.current_step = step
+    def _find_initial_best_model(self):
+        """Checks save folder for existing _best_val file on init."""
+        try:
+            os.makedirs(SAVE_FOLDER, exist_ok=True)
+            potential_best = None
+            lowest_loss = float('inf') # Ignored for now, just find latest file
+            latest_mtime = 0
+
+            for fname in os.listdir(SAVE_FOLDER):
+                 if fname.startswith(self.name) and fname.endswith("_best_val.safetensors"):
+                      fpath = os.path.join(SAVE_FOLDER, fname)
+                      try:
+                           mtime = os.path.getmtime(fpath)
+                           if mtime > latest_mtime:
+                                latest_mtime = mtime
+                                potential_best = fpath
+                      except OSError: continue # Skip if file disappears
+
+            if potential_best:
+                 self.current_best_val_model_path = potential_best
+                 print(f"Found existing best model checkpoint: {os.path.basename(potential_best)}")
+            else:
+                 print("No existing best model checkpoint found.")
+        except Exception as e:
+             print(f"Warning: Error finding initial best model: {e}")
+
+
+    def update_step(self, global_step):
+        """Update the internal global step counter."""
+        self.current_global_step = global_step
 
     def get_current_step(self):
-        """Get the current step counter."""
-        return self.current_step
+        """Get the current global step counter."""
+        return self.current_global_step
 
     def log_step(self, loss):
         """Log training loss for averaging."""
@@ -579,78 +542,89 @@ class ModelWrapper:
              # We don't save here anymore, just update the best loss value
 
     # --- Model Saving ---
-    # v2.5.1: Final corrected saving logic
-    def save_model(self, step=None, epoch=None, suffix="", save_aux=False):
+    # Version 2.6.2: Default save_aux=False, improved deletion logic
+    def save_model(self, step=None, epoch=None, suffix="", save_aux=False): # <<< Changed default to False
         """
-        Saves model checkpoint. If suffix contains '_best_val', it manages the single
-        latest best checkpoint with that naming convention.
-        Auxiliary files (optim, etc.) are only saved if save_aux is True.
+        Saves model checkpoint and optionally training state.
+        Manages the single latest _best_val checkpoint.
+        Auxiliary files (optim, sched, scaler, state) saved ONLY if save_aux is True.
         """
-        current_step_num = step if step is not None else self.current_step
+        current_global_step = step if step is not None else self.current_global_step
+        current_epoch_to_save = epoch if epoch is not None else self.current_epoch
 
         # --- Determine Filename Components ---
         step_str = ""
-        is_best = "_best_val" in suffix # Check if this save is intended as a best model save
+        if current_global_step >= 1_000_000: step_str = f"_s{round(current_global_step / 1_000_000, 1)}M"
+        elif current_global_step >= 1_000: step_str = f"_s{round(current_global_step / 1_000)}K"
+        else: step_str = f"_s{current_global_step}"
+        epoch_str = f"_e{current_epoch_to_save}" if isinstance(epoch, str) else "" # Only add if epoch is string like "final"
+        base_output_name = f"./{SAVE_FOLDER}/{self.name}{epoch_str}{step_str}{suffix}"
 
-        if epoch is None: # Use step count for filename base
-            if current_step_num >= 1_000_000: step_str = f"_s{round(current_step_num / 1_000_000, 1)}M"
-            elif current_step_num >= 1_000: step_str = f"_s{round(current_step_num / 1_000)}K"
-            else: step_str = f"_s{current_step_num}"
-        else: # Use epoch string if provided (e.g., "final")
-            step_str = f"_e{epoch}"
-
-        # Construct the full path for the file(s) being saved in THIS call
-        # Includes the step and the full suffix (which might contain _best_val)
-        base_output_name = f"./{SAVE_FOLDER}/{self.name}{step_str}{suffix}"
         model_output_path = f"{base_output_name}.safetensors"
-        # Define aux paths even if not saved, for potential deletion
         optim_output_path = f"{base_output_name}.optim"
         sched_output_path = f"{base_output_name}.sched"
         scaler_output_path = f"{base_output_name}.scaler"
-        # --- End Filename Components ---
+        state_output_path = f"{base_output_name}.state"
 
-        print(f"\nSaving checkpoint: {base_output_name} (Step: {current_step_num})")
+        is_best = "_best_val" in suffix
+        print(f"\nSaving checkpoint: {os.path.basename(base_output_name)} (Epoch: {current_epoch_to_save}, Global Step: {current_global_step})")
+
         try:
-            # --- Delete OLD Best Checkpoint FIRST (if this is a new best) ---
+            # --- Delete OLD Best Checkpoint & Aux FIRST (if this is a new best) ---
             if is_best:
-                # Check if we have a record of the PREVIOUS best model's path
-                if self.current_best_val_model_path and os.path.exists(self.current_best_val_model_path):
-                     # Check if the file we are about to save is DIFFERENT from the stored previous best
-                     if os.path.abspath(model_output_path) != os.path.abspath(self.current_best_val_model_path):
-                          try:
-                               print(f"  Removing previous best model checkpoint: {os.path.basename(self.current_best_val_model_path)}")
-                               os.remove(self.current_best_val_model_path)
-                               # Remove corresponding aux files ONLY if save_aux was likely True when THEY were saved
-                               # This is tricky. Simpler: don't save/delete aux for _best_val saves at all.
-                          except OSError as e:
-                               print(f"  Warning: Could not remove previous best checkpoint file: {e}")
-                     else:
-                          # If the filename is the same (e.g. re-saving best at same step), don't delete.
-                           print(f"  New best model has same name as previous, not removing.")
-            # --- End Delete OLD ---
+                old_best_model_path = self.current_best_val_model_path
+                # Check if old best exists and is different from the new one we're saving
+                if old_best_model_path and os.path.normpath(old_best_model_path) != os.path.normpath(model_output_path):
+                     old_base = os.path.splitext(old_best_model_path)[0]
+                     files_to_remove = [old_best_model_path] + [old_base + ext for ext in ['.optim', '.sched', '.scaler', '.state']]
+                     print(f"  New best found. Removing previous best files starting with: {os.path.basename(old_base)}")
+                     removed_count = 0
+                     for f_path in files_to_remove:
+                         if os.path.exists(f_path):
+                             try:
+                                 os.remove(f_path)
+                                 removed_count += 1
+                             except OSError as e: print(f"  Warning: Could not remove '{os.path.basename(f_path)}': {e}")
+                     if removed_count > 0: print(f"  Removed {removed_count} previous best file(s).")
+                     self.current_best_val_model_path = None # Clear old path
+                # else: print("  New best model has same name or no previous best known.")
 
             # --- Save CURRENT Checkpoint Files ---
-            # Save Model (safetensors)
+            # Always save the model weights
             save_file(self.model.state_dict(), model_output_path)
 
-            # Optionally Save Aux Files
+            # Save Aux Files ONLY if requested
             if save_aux:
-                print("  Saving auxiliary files (optim, sched, scaler)...")
+                print("  Saving auxiliary files (optim, sched, scaler, state)...")
                 torch.save(self.optimizer.state_dict(), optim_output_path)
-                if self.scheduler is not None: torch.save(self.scheduler.state_dict(), sched_output_path)
-                if self.scaler is not None and self.scaler.is_enabled(): torch.save(self.scaler.state_dict(), scaler_output_path)
-            # --- End Save CURRENT ---
+                if self.scheduler is not None:
+                     try: torch.save(self.scheduler.state_dict(), sched_output_path)
+                     except Exception as e_sched: print(f"  Warning: Failed to save scheduler state: {e_sched}")
+                if self.scaler is not None and self.scaler.is_enabled():
+                     torch.save(self.scaler.state_dict(), scaler_output_path)
+                # Save Epoch (completed) and Global Step (reached)
+                train_state = {'epoch': current_epoch_to_save, 'global_step': current_global_step}
+                torch.save(train_state, state_output_path)
+            else:
+                 # If not saving aux, ensure any potentially orphaned aux files for THIS name are removed
+                 # (e.g., if a periodic save happened before, but now only model is saved for best_val)
+                 if is_best: # Only cleanup aux for best_val if save_aux is False
+                      for ext in ['.optim', '.sched', '.scaler', '.state']:
+                           if os.path.exists(base_output_name + ext):
+                                try: os.remove(base_output_name + ext)
+                                except OSError: pass # Ignore errors here
 
             print(f"Checkpoint base ({os.path.basename(model_output_path)}) saved successfully.")
 
             # --- Update Path if This Was the Best Model ---
             if is_best:
-                self.current_best_val_model_path = model_output_path # Store the path we just saved
+                self.current_best_val_model_path = model_output_path
                 print(f"  Marked {os.path.basename(model_output_path)} as new best model path.")
-            # --- End Update Path ---
 
         except Exception as e:
             print(f"Error saving checkpoint {base_output_name}: {e}")
+            import traceback
+            traceback.print_exc()
     # --- End Model Saving ---
 
     def close(self):
