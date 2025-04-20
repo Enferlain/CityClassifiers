@@ -20,6 +20,15 @@ except ImportError as e:
     print("Ensure model.py and utils.py are in the same directory or accessible.")
     raise
 
+try:
+    import timm
+    import timm.data
+    TIMM_AVAILABLE = True
+except ImportError:
+    print("Warning: timm library not found. Cannot use TIMM models for inference.")
+    TIMM_AVAILABLE = False
+
+
 # --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
 # Copied from generate_embeddings.py - simplified slightly for inference use
 def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
@@ -175,14 +184,18 @@ class BasePipeline:
         # --- Vision Model Setup ---
         self.base_vision_model_name = self.config.get("model", {}).get("base_vision_model")
         if not self.base_vision_model_name:
-            # Fallback if missing - should be set by write_config
-            print("Warning: 'base_vision_model' not found in config. Defaulting to CLIP.")
-            self.base_vision_model_name = "openai/clip-vit-large-patch14-336"
+            # Fallback if missing (shouldn't happen with new config)
+            raise ValueError("Missing 'base_vision_model' in config file.")
 
-        self.proc = None
-        self.clip_model = None
-        self.proc_size = 512 # Default, updated in _init_vision_model
-        self._init_vision_model()
+        # <<< Initialize vision model attributes >>>
+        self.vision_model_type = "unknown" # To store 'hf' or 'timm'
+        self.vision_model = None           # Stores the actual model (HF AutoModel or TIMM model)
+        self.hf_processor = None           # Stores HF processor (if HF model)
+        self.timm_transforms = None        # Stores TIMM transforms (if TIMM model)
+        self.proc_size = 512               # Default/HF processor size
+        # <<< End Initialize >>>
+
+        self._init_vision_model() # Call the updated init function
         # --- End Vision Model Setup ---
 
         # <<< START NEW: Select Preprocessing Function >>>
@@ -237,44 +250,77 @@ class BasePipeline:
             return None
 
     def _init_vision_model(self):
-        """Initializes the vision model and processor, disabling auto-preprocessing."""
+        """Initializes the vision model and processor/transforms based on config."""
         model_name = self.base_vision_model_name
         print(f"Initializing Vision Model: {model_name} on {self.device} with dtype {self.clip_dtype}")
-        try:
-            # Load processor and model
-            self.proc = AutoProcessor.from_pretrained(model_name)
-            self.clip_model = AutoModel.from_pretrained(
-                model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
-            ).to(self.device).eval()
-            print(f"  Loaded model: {self.clip_model.__class__.__name__}")
-            print(f"  Loaded processor: {self.proc.__class__.__name__}")
 
-            # Disable processor's built-in resize/crop/rescale
-            if hasattr(self.proc, 'image_processor'):
-                 image_processor = self.proc.image_processor
-                 print(f"  DEBUG Inference: Original image processor config: {image_processor}")
-#                 if hasattr(image_processor, 'do_resize'): image_processor.do_resize = False
-                 if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
-#                 if hasattr(image_processor, 'do_rescale'): image_processor.do_rescale = False # Let normalization handle scaling
-                 if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True # Keep normalization
-                 print(f"  DEBUG Inference: Modified image processor config: {image_processor}")
-            else:
-                 print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
+        # --- Check if TIMM Model ---
+        if model_name.startswith("timm/") and TIMM_AVAILABLE:
+            self.vision_model_type = "timm"
+            print("  Detected TIMM model type.")
+            try:
+                timm_model_name = model_name.split('/', 1)[1] # Get actual model name for timm
+                # Load TIMM model without classifier head
+                self.vision_model = timm.create_model(
+                    timm_model_name,
+                    pretrained=True,
+                    num_classes=0 # <<< Crucial: Get pooled features
+                ).to(self.device).eval()
 
-            # Determine model's expected input size (for non-naflex modes like FitPad)
-            self.proc_size = 512  # Default
-            if hasattr(self.proc, 'image_processor') and hasattr(self.proc.image_processor, 'size'):
-                proc_sz = self.proc.image_processor.size
-                if isinstance(proc_sz, dict):
-                    # Use height for square or potentially non-square standard sizes
-                    self.proc_size = int(proc_sz.get("height", 512))
-                elif isinstance(proc_sz, int):
-                    self.proc_size = int(proc_sz)
-            # print(f"  Determined processor target size (for FitPad/CenterCrop): {self.proc_size}")
+                # Apply clip_dtype AFTER loading pretrained weights (usually FP32)
+                self.vision_model = self.vision_model.to(dtype=self.clip_dtype)
 
-        except Exception as e:
-            print(f"Error initializing vision model {model_name}: {e}")
-            raise
+                # Get TIMM transforms
+                data_config = timm.data.resolve_model_data_config(self.vision_model)
+                self.timm_transforms = timm.data.create_transform(**data_config, is_training=False)
+                print(f"  Loaded TIMM model: {timm_model_name}")
+                print(f"  Loaded TIMM transforms: {self.timm_transforms}")
+
+                # Store input size if needed (less critical for TIMM as transforms handle it)
+                timm_input_size = data_config.get('input_size')
+                if timm_input_size: self.proc_size = timm_input_size[-1]
+
+            except Exception as e:
+                print(f"Error initializing TIMM vision model {timm_model_name}: {e}")
+                raise
+
+        # --- Else: Assume Hugging Face Model ---
+        else:
+            if model_name.startswith("timm/"):
+                 print("Warning: TIMM model specified but 'timm' library not available or failed import.")
+            self.vision_model_type = "hf"
+            print("  Detected Hugging Face model type.")
+            try:
+                # Load HF processor and model
+                self.hf_processor = AutoProcessor.from_pretrained(model_name)
+                self.vision_model = AutoModel.from_pretrained(
+                    model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
+                ).to(self.device).eval()
+                print(f"  Loaded HF model: {self.vision_model.__class__.__name__}")
+                print(f"  Loaded HF processor: {self.hf_processor.__class__.__name__}")
+
+                # Disable processor's built-in transforms (Keep As Is)
+                if hasattr(self.hf_processor, 'image_processor'):
+                     image_processor = self.hf_processor.image_processor
+                     print(f"  DEBUG Inference: Original image processor config: {image_processor}")
+                     if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
+                     if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True
+                     print(f"  DEBUG Inference: Modified image processor config: {image_processor}")
+                else:
+                     print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
+
+                # Determine processor size (Keep As Is)
+                self.proc_size = 512
+                if hasattr(self.hf_processor, 'image_processor') and hasattr(self.hf_processor.image_processor, 'size'):
+                    proc_sz = self.hf_processor.image_processor.size
+                    if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("height", 512))
+                    elif isinstance(proc_sz, int): self.proc_size = int(proc_sz)
+                print(f"  Determined processor target size (for FitPad/CenterCrop): {self.proc_size}")
+
+            except Exception as e:
+                print(f"Error initializing Hugging Face vision model {model_name}: {e}")
+                raise
+
 
     # --- Step 3: Modify _preprocess_images ---
     def _preprocess_images(self, img_list: list[Image.Image]) -> list[Image.Image] | None:
@@ -314,125 +360,140 @@ class BasePipeline:
         return processed_imgs if processed_imgs else None
     # --- End Modify _preprocess_images ---
 
-    # Version 1.7.2: Handle NaFlex Proc1024 via direct processor call
+    # Version 1.8.0: Adds TIMM DINOv2 support, keeps HF logic untouched
     def get_clip_emb(self, img_list: list[Image.Image]) -> torch.Tensor | None:
         """
-        Generates embeddings for a list of PIL images.
-        - Handles NaFlex by calling processor directly with max_num_patches=1024.
-        - Handles FitPad/CenterCrop via manual preprocessing then processor call.
+        Generates embeddings for a list of PIL images using the loaded vision model.
+        Handles HF (SigLIP/NaFlex) and TIMM (DINOv2) models.
         """
         if not isinstance(img_list, list): img_list = [img_list]
         if not img_list:
             print("Error: Empty image list provided to get_clip_emb.")
             return None
 
-        # --- Check Model Type and Preprocessing Mode ---
-        is_siglip2_model = "Siglip2Model" in self.clip_model.__class__.__name__
-        # Determine preprocessing based on embed_ver stored during init
-        is_naflex_mode = "Naflex" in self.embed_ver  # Simple check, adjust if naming changes
+        final_emb = None # Initialize
 
-        model_call_kwargs = {}  # Initialize
-        pixel_values = None
-        attention_mask = None
-        spatial_shapes = None
+        # --- TIMM Model Inference ---
+        if self.vision_model_type == "timm":
+            if self.vision_model is None or self.timm_transforms is None:
+                print("Error: TIMM model or transforms not initialized.")
+                return None
+            try:
+                # Apply TIMM transforms and create batch tensor
+                # Handle multiple images in the list
+                processed_tensors = [self.timm_transforms(img) for img in img_list]
+                input_batch = torch.stack(processed_tensors).to(device=self.device, dtype=self.clip_dtype)
 
-        try:
-            # --- NaFlex Mode: Use Processor Logic @ 1024 ---
-            if is_siglip2_model and is_naflex_mode:
-                # print(f"DEBUG get_clip_emb: Using Processor NaFlex logic (target 1024 patches).")
-                # Call processor directly on the raw PIL images
-                inputs = self.proc(
-                    images=img_list,  # Process the whole batch if multiple images provided
-                    return_tensors="pt",
-                    max_num_patches=1024  # <<< Override target length
-                )
+                with torch.no_grad():
+                    # Get pooled features directly (since num_classes=0)
+                    emb = self.vision_model(input_batch) # Shape: [Batch, Features]
 
-                # Extract outputs directly from processor
-                pixel_values = inputs.get("pixel_values")
-                attention_mask = inputs.get("pixel_attention_mask")  # Processor provides correct mask
-                spatial_shapes = inputs.get("spatial_shapes")
+                    # <<< IMPORTANT: L2 Normalize TIMM DINOv2 Embeddings >>>
+                    emb_normalized = F.normalize(emb.float(), p=2, dim=-1)
 
-                if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
-                if attention_mask is None: raise ValueError("Processor didn't return 'pixel_attention_mask'.")
-                if spatial_shapes is None: raise ValueError("Processor didn't return 'spatial_shapes'.")
+                # Move to CPU, ensure FP32 for predictor head
+                final_emb = emb_normalized.detach().to(device='cpu', dtype=torch.float32)
 
-                # Verify sequence length
-                if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
-                    print(
-                        f"ERROR: Inference NaFlex Processor output sequence length is not 1024! Got {pixel_values.shape[1]}.")
-                    return None
+            except Exception as e:
+                 print(f"Error during TIMM model inference: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 return None
 
-                # Prepare args for model call
-                model_call_kwargs = {
-                    "pixel_values": pixel_values.to(device=self.device, dtype=self.clip_dtype),
-                    "attention_mask": attention_mask.to(device=self.device),
-                    "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
-                }
+        # --- Hugging Face Model Inference (Keep Existing Logic) ---
+        elif self.vision_model_type == "hf":
+            if self.vision_model is None or self.hf_processor is None:
+                 print("Error: Hugging Face model or processor not initialized.")
+                 return None
 
-            # --- FitPad / CenterCrop / Other Modes: Manual Preprocessing ---
-            else:
-                # print(f"DEBUG get_clip_emb: Using manual preprocessing ({self.embed_ver}).")
-                # Preprocess using the selected manual function (e.g., FitPad)
-                # Note: _preprocess_images applies the function stored in self.preprocess_func
-                processed_imgs = self._preprocess_images(img_list)
-                if not processed_imgs:
-                    print("Error: No images left after manual preprocessing.")
-                    return None
+            # Check if NaFlex mode based on embed_ver
+            is_naflex_mode = "Naflex" in self.embed_ver
+            is_siglip2_model = "Siglip2Model" in self.vision_model.__class__.__name__
 
-                # Call processor on the *already preprocessed* images
-                inputs = self.proc(images=processed_imgs, return_tensors="pt")
-                pixel_values_from_proc = inputs.get("pixel_values")
-                if pixel_values_from_proc is None: raise ValueError("Processor didn't return 'pixel_values'.")
+            model_call_kwargs = {}
+            pixel_values = None
+            attention_mask = None
+            spatial_shapes = None
 
-                pixel_values = pixel_values_from_proc.to(device=self.device, dtype=self.clip_dtype)
-                model_call_kwargs = {"pixel_values": pixel_values}
+            try:
+                # NaFlex Mode: Use Processor Logic @ 1024
+                if is_siglip2_model and is_naflex_mode:
+                    inputs = self.hf_processor(images=img_list, return_tensors="pt", max_num_patches=1024)
+                    pixel_values = inputs.get("pixel_values")
+                    attention_mask = inputs.get("pixel_attention_mask")
+                    spatial_shapes = inputs.get("spatial_shapes")
+                    if pixel_values is None or attention_mask is None or spatial_shapes is None:
+                         raise ValueError("Missing required tensors from HF NaFlex processor.")
+                    if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
+                         raise ValueError(f"HF NaFlex Processor output seq len != 1024 ({pixel_values.shape[1]})")
 
-                # Pass mask if available (e.g., for standard SigLIP if processor adds one)
-                # This is less relevant now since resize/pad are done manually, but keep for safety
-                attention_mask_from_processor = inputs.get("pixel_attention_mask")
-                if attention_mask_from_processor is not None:
-                    model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=self.device)
+                    model_call_kwargs = {
+                        "pixel_values": pixel_values.to(device=self.device, dtype=self.clip_dtype),
+                        "attention_mask": attention_mask.to(device=self.device),
+                        "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
+                    }
 
-                # No spatial_shapes needed for non-NaFlex models typically
-                # If needed for a future standard model, logic would go here.
+                # FitPad / CenterCrop / Other HF Modes: Manual Preprocessing
+                else:
+                    processed_imgs = self._preprocess_images(img_list)
+                    if not processed_imgs:
+                        print("Error: No images left after HF manual preprocessing.")
+                        return None
+                    inputs = self.hf_processor(images=processed_imgs, return_tensors="pt")
+                    pixel_values_from_proc = inputs.get("pixel_values")
+                    if pixel_values_from_proc is None: raise ValueError("HF Processor didn't return 'pixel_values'.")
 
-        except Exception as e:
-            print(f"Error processing images with HF processor in inference: {e}")
-            import traceback
-            traceback.print_exc()
+                    pixel_values = pixel_values_from_proc.to(device=self.device, dtype=self.clip_dtype)
+                    model_call_kwargs = {"pixel_values": pixel_values}
+                    attention_mask_from_processor = inputs.get("pixel_attention_mask")
+                    if attention_mask_from_processor is not None:
+                        model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=self.device)
+
+            except Exception as e:
+                print(f"Error processing images with HF processor in inference: {e}")
+                import traceback; traceback.print_exc(); return None
+
+            # Get Embeddings from HF Vision Model
+            emb = None
+            with torch.no_grad():
+                try:
+                    # <<< Use self.vision_model here (was self.clip_model) >>>
+                    vision_model_component = getattr(self.vision_model, 'vision_model', None)
+                    if vision_model_component:
+                        vision_outputs = vision_model_component(**model_call_kwargs)
+                        emb = vision_outputs.pooler_output
+                    elif hasattr(self.vision_model, 'get_image_features'):
+                        kwargs_for_get = {"pixel_values": model_call_kwargs["pixel_values"]}
+                        # Only pass other args if they exist in the call kwargs
+                        if "attention_mask" in model_call_kwargs: kwargs_for_get["attention_mask"] = model_call_kwargs["attention_mask"]
+                        if "spatial_shapes" in model_call_kwargs: kwargs_for_get["spatial_shapes"] = model_call_kwargs["spatial_shapes"]
+                        emb = self.vision_model.get_image_features(**kwargs_for_get)
+                    else:
+                        # This was the error source before! Now handled by TIMM check above.
+                        # If we reach here with an HF model, it *should* have one of these.
+                        raise AttributeError("HF Model has neither 'vision_model' nor 'get_image_features'.")
+
+                    if emb is None: raise ValueError("Failed to get embedding from HF model call.")
+
+                except Exception as e_fwd:
+                    print(f"Error during HF vision model forward pass in inference: {e_fwd}")
+                    import traceback; traceback.print_exc(); return None
+
+                # Post-processing (Normalization already handled by HF models usually)
+                # <<< Normalization is handled inside HF get_image_features or vision_model >>>
+                # Just ensure correct device and dtype for output
+                final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
+                # Optional extra normalization just in case? Usually not needed for HF.
+                # norm = torch.linalg.norm(final_emb, dim=-1, keepdim=True).clamp(min=1e-8)
+                # final_emb = final_emb / norm
+
+        # --- Unknown Model Type ---
+        else:
+            print(f"Error: Unknown vision_model_type '{self.vision_model_type}' in get_clip_emb.")
             return None
 
-        # --- Get Embeddings from Vision Model (Common Logic) ---
-        emb = None
-        with torch.no_grad():
-            try:
-                vision_model_component = getattr(self.clip_model, 'vision_model', None)
-                if vision_model_component:
-                    # print(f"DEBUG Inference: Calling vision_model...")
-                    vision_outputs = vision_model_component(**model_call_kwargs)
-                    emb = vision_outputs.pooler_output
-                elif hasattr(self.clip_model, 'get_image_features'):
-                    # print("Warning: Calling get_image_features in inference.")
-                    # get_image_features might only expect pixel_values for some models
-                    kwargs_for_get = {"pixel_values": model_call_kwargs["pixel_values"]}
-                    emb = self.clip_model.get_image_features(**kwargs_for_get)
-                else:
-                    raise AttributeError("Model has neither 'vision_model' nor 'get_image_features'.")
-
-                if emb is None: raise ValueError("Failed to get embedding from model call.")
-
-            except Exception as e_fwd:
-                print(f"Error during vision model forward pass in inference: {e_fwd}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # --- Post-processing (Common Logic) ---
-            final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
-            norm = torch.linalg.norm(final_emb, dim=-1, keepdim=True).clamp(min=1e-8)
-            final_emb = final_emb / norm
-
-            return final_emb
+        # Return final embedding (FP32 on CPU)
+        return final_emb
 
     # Version 1.7.4: Corrected five_crop argument name
     def get_clip_emb_tiled(self, raw_pil_image: Image.Image, tiling: bool = False) -> torch.Tensor | None:

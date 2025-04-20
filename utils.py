@@ -329,7 +329,6 @@ class ModelWrapper:
         except Exception as e:
              print(f"Warning: Error finding initial best model: {e}")
 
-
     def update_step(self, global_step):
         """Update the internal global step counter."""
         self.current_global_step = global_step

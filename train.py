@@ -537,190 +537,224 @@ def load_checkpoint(args, model, optimizer, scheduler, scaler):
 # ================================================
 #        Main Training Loop (Epoch-Based)
 # ================================================
-# Version 3.3.1: Single progress bar, less frequent epoch logging, added postfix info
+# Version 3.3.0 (Proper Epoch/Iterator Handling)
 def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                train_loader, val_loader, wrapper, start_epoch, initial_global_step,
                enabled_amp, amp_dtype):
-    """Runs the main training loop (Epoch-based outer, Step-based inner/progress)."""
+    """
+    Runs the main training loop (Epoch-based outer, Step-based inner/progress)
+    with proper DataLoader iterator handling to avoid restarts within an epoch.
+    Includes deferred loss processing.
+    """
 
-    if not hasattr(args, 'num_train_epochs') or not hasattr(args, 'steps_per_epoch'): return
+    # --- Initial Setup ---
+    if not hasattr(args, 'num_train_epochs') or not hasattr(args, 'steps_per_epoch'):
+         print("ERROR: num_train_epochs or steps_per_epoch missing from args.")
+         return
+    if not hasattr(args, 'max_train_steps'):
+         print("ERROR: max_train_steps missing from args.")
+         return
+
     if hasattr(optimizer, 'train') and callable(optimizer.train): optimizer.train()
     model.train()
+
     total_steps_to_run = args.max_train_steps
     total_epochs_to_run = args.num_train_epochs
     steps_per_epoch = args.steps_per_epoch
-    print(f"Starting training loop...") # Simplified start message
+
+    print(f"Starting training loop. Target Epochs: {total_epochs_to_run}, Target Steps: {total_steps_to_run}")
+    print(f"Steps per epoch: {steps_per_epoch}")
 
     global_step = initial_global_step
     best_eval_loss = float('inf')
 
-    # --- Create ONE progress bar for total steps ---
-    progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc="Overall Training", unit="it", dynamic_ncols=True)
+    progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc="Overall Training", unit="step", dynamic_ncols=True)
 
-    # --- Accumulator for average loss calculation ---
     accumulated_loss = torch.tensor(0.0, device=TARGET_DEV)
     accumulation_steps = 0
-    # --- End Accumulator ---
+
+    # <<< Create the iterator ONCE before the epoch loop >>>
+    print("Initializing DataLoader iterator...")
+    train_iterator = iter(train_loader)
 
     # --- Outer Epoch Loop ---
-    for epoch in range(start_epoch, total_epochs_to_run):
-        # Print epoch message less frequently
-        if epoch == start_epoch or (epoch + 1) % 50 == 0 or epoch == total_epochs_to_run - 1:
-             print(f"\n--- Starting Epoch {epoch + 1} / {total_epochs_to_run} (Global Step: {global_step}) ---")
-        wrapper.current_epoch = epoch
+    try:
+        for epoch in range(start_epoch, total_epochs_to_run):
+            if global_step >= total_steps_to_run: break # Check limit before starting epoch
 
-        model.train()
-        if hasattr(optimizer, 'train') and callable(optimizer.train): optimizer.train()
+            # Print epoch message less frequently
+            if epoch == start_epoch or (epoch + 1) % 50 == 0 or epoch == total_epochs_to_run - 1:
+                 print(f"\n--- Starting Epoch {epoch + 1} / {total_epochs_to_run} (Global Step: {global_step}) ---")
+            wrapper.current_epoch = epoch
 
-        # Dataloader Skipping
-        steps_to_skip_in_epoch = 0
-        epoch_start_step = epoch * steps_per_epoch
-        if epoch == start_epoch and initial_global_step > epoch * steps_per_epoch:
-             steps_to_skip_in_epoch = initial_global_step - (epoch * steps_per_epoch)
+            model.train()
+            if hasattr(optimizer, 'train'): optimizer.train()
 
-        train_iterator = iter(train_loader)
-        step_in_epoch = 0
+            step_in_epoch = 0
+            # --- Inner Step Loop (Fixed number of steps per epoch) ---
+            while step_in_epoch < steps_per_epoch:
+                if global_step >= total_steps_to_run: break # Check limit before getting batch
 
-        # --- Inner Step Loop ---
-        while step_in_epoch < steps_per_epoch:
-            if global_step >= total_steps_to_run: break
+                # --- Get Batch using Persistent Iterator ---
+                try:
+                    batch = next(train_iterator)
+                except StopIteration:
+                    # <<< Handle DataLoader Exhaustion: Restart Iterator >>>
+                    # print("\n--- DataLoader exhausted, restarting iterator ---")
+                    train_iterator = iter(train_loader)
+                    try:
+                         batch = next(train_iterator)
+                    except StopIteration:
+                         # Should not happen if dataset is not empty, but handle anyway
+                         print("ERROR: DataLoader provided no batches even after restart. Stopping.")
+                         global_step = total_steps_to_run # Force exit
+                         break
+                except Exception as e_iter:
+                     print(f"\nError getting batch from iterator at step {global_step}: {e_iter}. Stopping.")
+                     global_step = total_steps_to_run # Force exit
+                     break
+                # --- End Get Batch ---
 
-            try: batch = next(train_iterator)
-            except StopIteration: break
+                # --- Skipping Logic (Based on Global Step for Resuming) ---
+                # This needs to be inside the step loop now
+                if global_step < initial_global_step:
+                    global_step += 1
+                    progress_bar.update(1)
+                    # Do *not* increment step_in_epoch here, as this step wasn't "part" of the current epoch's work
+                    continue # Skip processing
+                # --- End Skipping Logic ---
 
-            if step_in_epoch < steps_to_skip_in_epoch: step_in_epoch += 1; continue
-            if batch is None: step_in_epoch += 1; continue
+                # --- Handle Bad Batches ---
+                if batch is None:
+                    print(f"Warning: Skipping step {global_step} due to invalid batch.")
+                    global_step += 1
+                    step_in_epoch += 1 # Count this as a step within the epoch
+                    progress_bar.update(1)
+                    continue
 
-            # --- Get Batch Data ---
-            # (Same logic as before)
-            emb = batch.get("emb").to(TARGET_DEV)
-            target_val_from_batch = batch.get("val")
-            val = None
-            try:  # Prepare val target tensor
-                if args.arch == "score":
-                    val = target_val_from_batch.to(TARGET_DEV, dtype=torch.float32).squeeze()
-                elif args.arch == "class":
-                    if isinstance(criterion, nn.BCEWithLogitsLoss):
-                        val = target_val_from_batch.to(dtype=torch.float32, device=TARGET_DEV).squeeze()
-                    else:
-                        val = target_val_from_batch.squeeze().to(dtype=torch.long, device=TARGET_DEV)
-                if val.ndim == 0: val = val.unsqueeze(0)
-            except Exception as e:
-                print(f"Error processing target step {global_step}: {e}"); step_in_epoch += 1; continue
+                # --- Get Batch Data (remains same) ---
+                emb = batch.get("emb")
+                target_val_from_batch = batch.get("val")
+                val = None
+                if emb is None or target_val_from_batch is None:
+                     print(f"Error: Batch missing 'emb' or 'val' at step {global_step}. Skipping.")
+                     global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                emb = emb.to(TARGET_DEV)
 
-            # --- Forward/Backward Pass ---
-            loss = torch.tensor(0.0) # Initialize loss on default device (CPU), move later if needed or handle device in criterion
-            optimizer_stepped = False
-            # current_step_loss = None # Not used anymore, can remove
+                try: # Prepare val target tensor
+                     if args.arch == "score": val = target_val_from_batch.to(TARGET_DEV, dtype=torch.float32).squeeze()
+                     elif args.arch == "class":
+                         if isinstance(criterion, nn.BCEWithLogitsLoss): val = target_val_from_batch.to(dtype=torch.float32, device=TARGET_DEV).squeeze()
+                         else: val = target_val_from_batch.squeeze().to(dtype=torch.long, device=TARGET_DEV)
+                     if val.ndim == 0: val = val.unsqueeze(0)
+                except Exception as e:
+                     print(f"Error processing target 'val' at step {global_step}: {e}")
+                     global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                # --- End Batch Data ---
 
-            try:
-                with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
-                    # (FWD, loss calc remains same)
-                    y_pred = model(emb)
-                    y_pred_for_loss = y_pred # Default
-                    if args.arch == "score" or isinstance(criterion, nn.BCEWithLogitsLoss):
-                        if y_pred.ndim == 2 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(1)
+                # --- Forward/Backward Pass (remains same, uses accumulated loss) ---
+                loss = torch.tensor(0.0, device=TARGET_DEV)
+                optimizer_stepped = False
+                y_pred_for_loss = None
+                try:
+                    if not model.training: model.train()
+                    with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
+                        y_pred = model(emb)
+                        y_pred_for_loss = y_pred
+                        if args.arch == "score" or isinstance(criterion, nn.BCEWithLogitsLoss):
+                            if y_pred.ndim == 2 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(1)
 
-                    # (Shape check as before)
-                    if not isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss)): # Add GHM if needed
-                        if hasattr(criterion, 'reduction') and criterion.reduction != 'none' and y_pred_for_loss.shape != val.shape:
-                            print(f"ERROR Shape mismatch step {global_step}: Pred {y_pred_for_loss.shape}, Target {val.shape}. Skipping.")
-                            step_in_epoch += 1 # Increment step counter for the skipped iteration
-                            continue # Go to next iteration of inner while loop
+                        # Shape check
+                        if not isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)):
+                            if hasattr(criterion, 'reduction') and criterion.reduction != 'none' and y_pred_for_loss.shape != val.shape:
+                                print(f"ERROR Shape mismatch step {global_step}: Pred {y_pred_for_loss.shape}, Target {val.shape}. Skipping.")
+                                global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
 
-                    # (Loss calculation as before)
-                    loss_input = y_pred_for_loss.to(torch.float32) # Ensure float32 for loss calc
-                    if isinstance(criterion, nn.NLLLoss):
-                         loss_input = F.log_softmax(loss_input, dim=-1)
+                        loss_input = y_pred_for_loss.to(torch.float32)
+                        if isinstance(criterion, nn.NLLLoss): loss_input = F.log_softmax(loss_input, dim=-1)
+                        loss = criterion(loss_input, val.to(loss_input.device))
 
-                    # Ensure target `val` is on the same device as the input to the criterion
-                    loss = criterion(loss_input, val.to(loss_input.device)) # Calculate loss (Tensor on GPU)
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: NaN/Inf loss at step {global_step}. Skipping BWD/step.")
+                        loss = None
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: NaN/Inf loss at step {global_step}. Skipping BWD/step.")
-                    loss = None # Flag to skip backprop
+                    if loss is not None:
+                        accumulated_loss += loss.detach()
+                        accumulation_steps += 1
 
-                if loss is not None:
-                    # <<< Accumulate loss tensor (on GPU) >>>
-                    # Ensure accumulated_loss is on the same device
-                    accumulated_loss = accumulated_loss.to(loss.device)
-                    accumulated_loss += loss.detach() # Use detach to avoid graph buildup
-                    accumulation_steps += 1
-                    # <<< End Accumulate >>>
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer_stepped = True
 
-                    optimizer.zero_grad(set_to_none=True)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer_stepped = True
+                except Exception as e:
+                    print(f"Error in FWD/BWD step {global_step}: {e}")
+                    import traceback; traceback.print_exc()
+                    global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                # --- End Forward/Backward ---
 
-            except Exception as e:
-                print(f"Error in FWD/BWD step {global_step}: {e}")
-                import traceback
-                traceback.print_exc() # Print detailed error
-                step_in_epoch += 1 # Increment step counter for the failed iteration
-                continue # Skip to next iteration of inner while loop
+                # --- Scheduler Step ---
+                if scheduler is not None and optimizer_stepped: scheduler.step()
+                # --- End Scheduler Step ---
 
-            # Scheduler Step
-            if scheduler is not None and optimizer_stepped: scheduler.step()
+                # --- Update Counters ---
+                global_step += 1
+                step_in_epoch += 1 # Crucially, increment steps *within* this epoch
+                progress_bar.update(1)
+                wrapper.update_step(global_step)
+                # --- End Update Counters ---
 
-            # Update Counters
-            global_step += 1
-            step_in_epoch += 1
-            progress_bar.update(1)
-            wrapper.update_step(global_step)  # Still needed for saving logic
+                # --- Logging, Saving, Postfix Update (remains same, based on global_step) ---
+                if global_step % LOG_EVERY_N == 0 and global_step > 0:
+                    # Calculate Average Loss
+                    avg_loss_value = float('nan')
+                    if accumulation_steps > 0:
+                        avg_loss_tensor = accumulated_loss / accumulation_steps
+                        avg_loss_value = avg_loss_tensor.item()
+                        accumulated_loss.zero_(); accumulation_steps = 0
 
-            # --- Logging, Saving, Postfix Update (Based on global_step) ---
-            if global_step % LOG_EVERY_N == 0 and global_step > 0:
-                # --- Calculate Average Loss ---
-                avg_loss_value = float('nan')
-                if accumulation_steps > 0:
-                    avg_loss_tensor = accumulated_loss / accumulation_steps
-                    avg_loss_value = avg_loss_tensor.item()  # <<< Call .item() HERE, periodically >>>
-                    # Reset accumulators
-                    accumulated_loss.zero_()
-                    accumulation_steps = 0
-                # --- End Average Loss Calc ---
+                    # Perform validation
+                    eval_loss_val = float('nan')
+                    if val_loader:
+                        eval_loss_val = wrapper.evaluate_on_validation_set(val_loader)
+                        if not model.training: model.train() # Ensure back in train mode
 
-                # (Validation logic remains same)
-                eval_loss_val = float('nan')
-                if val_loader:
-                    was_training = model.training; model.eval()
-                    eval_loss_val = wrapper.evaluate_on_validation_set(val_loader)
-                    if was_training: model.train()
+                    # Log metrics
+                    if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Global Step {global_step}.")
+                    wrapper.log_main(step=global_step, train_loss_batch=avg_loss_value, eval_loss=eval_loss_val)
 
-                # Log metrics (use calculated average loss)
-                if math.isnan(eval_loss_val): print(f"Warning: Eval loss NaN step {global_step}.")
-                # NOTE: We don't have the single batch loss here anymore, log avg instead
-                wrapper.log_main(step=global_step, train_loss_batch=avg_loss_value,
-                                eval_loss=eval_loss_val)  # Log avg as 'batch' for now? Or change log_main?
+                    # Update Progress Bar Postfix
+                    lr = optimizer.param_groups[0]['lr']
+                    postfix_data = {"Epoch": epoch + 1, "AvgLoss": avg_loss_value}
+                    if not math.isnan(eval_loss_val): postfix_data["EvalLoss"] = eval_loss_val
+                    postfix_data["LR"] = lr
+                    progress_bar.set_postfix(postfix_data, refresh=False)
 
-                # Update Progress Bar Postfix (use calculated average loss)
-                lr = optimizer.param_groups[0]['lr']
-                postfix_data = {"Epoch": epoch + 1, "AvgLoss": avg_loss_value}
-                if not math.isnan(eval_loss_val): postfix_data["EvalLoss"] = eval_loss_val
-                postfix_data["LR"] = lr
-                progress_bar.set_postfix(postfix_data, refresh=False)  # Refresh False might be smoother
+                    # Save best model
+                    if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
+                        best_eval_loss = eval_loss_val
+                        print(f"\nNew best validation loss: {best_eval_loss:.4e} at Global Step {global_step}. Saving best model...")
+                        wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val")
 
-                # Save best model (remains same)
-                if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
-                    best_eval_loss = eval_loss_val
-                    print(f"\nNew best validation loss: {best_eval_loss:.4e} at GStep {global_step}. Saving...")
-                    wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False)
+                # Periodic saving
+                if args.nsave > 0 and global_step % args.nsave == 0:
+                     if global_step > initial_global_step or global_step == args.nsave:
+                          print(f"\nSaving periodic checkpoint at Global Step {global_step}...")
+                          wrapper.save_model(step=global_step, epoch=epoch, save_aux=False)
+                # --- End Logging and Saving ---
 
-            # Periodic saving (remains same)
-            if args.nsave > 0 and global_step % args.nsave == 0:
-                if global_step > initial_global_step or global_step == args.nsave:
-                    print(f"\nSaving periodic checkpoint GStep {global_step}...")
-                    wrapper.save_model(step=global_step, epoch=epoch, save_aux=True)
-            # --- End Logging and Saving ---
+            # --- End Inner Step Loop (while step_in_epoch < steps_per_epoch) ---
 
-            if global_step >= total_steps_to_run: break  # Check limit after step completion
+            # Check global step limit again after inner loop finishes
+            if global_step >= total_steps_to_run:
+                break
 
-            # --- End Inner Step Loop ---
-        if global_step >= total_steps_to_run: break  # Check limit after epoch completion
         # --- End Outer Epoch Loop ---
 
+    except KeyboardInterrupt:
+         print("\nTraining interrupted by user.")
+    finally:
         progress_bar.close()
         print(f"\nTraining loop finished. Reached Global Step: {global_step}")
 
@@ -788,7 +822,7 @@ def main():
     try:
         train_loop(args, model, criterion, optimizer, scheduler, scaler,
                    train_loader, val_loader, wrapper,
-                   start_epoch, initial_global_step, # Pass correct start points
+                   start_epoch, initial_global_step,  # Pass correct start points
                    enabled_amp, amp_dtype)
     finally:
         # 9. Final Save & Cleanup

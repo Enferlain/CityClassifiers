@@ -3,7 +3,7 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"  # Base name (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v6.2_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
+  rev: "v6.3_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
   arch: class                # Model architecture: 'class' or 'score'
 
   # --- Embedding Configuration ---
@@ -38,7 +38,7 @@ train:
   # If both are given, max_train_steps takes priority as the hard limit.
   # If neither is given, defaults to max_train_steps = 100000.
   max_train_epochs: null       # Total number of epochs to train for (int, or null).
-  max_train_steps: 300000      # Max total steps (batches processed) to train for (int, or null).
+  max_train_steps: 10000      # Max total steps (batches processed) to train for (int, or null).
 
   # --- Core Settings ---
   lr: 1e-4                   # Initial learning rate (float)
@@ -65,7 +65,7 @@ train:
   betas: [0.9, 0.999]      # List/tuple of 2 floats
   eps: 1e-8                # Float
   weight_decay: 1e-3       # Float
-  rectify: false            # Example bool arg for AdaBelief/RAdam variants
+  rectify: true            # Example bool arg for AdaBelief/RAdam variants
   weight_decouple: true    # Example bool arg for AdamW/AdaBelief variants
   clip_threshold: 1.0      # Example float arg for CAME
 
@@ -83,9 +83,9 @@ train:
   # Example Args for CosineAnnealingWarmRestarts / RexAnnealingWarmRestarts:
   scheduler_gamma: 0.95                     # Decay factor for max LR on restart (float)
   scheduler_cycle_multiplier: 1.0           # Multiplier for cycle length after restart (float)
-  scheduler_first_cycle_max_steps: 100000   # Duration of first cycle in steps (int, usually == max_train_steps)
+  scheduler_first_cycle_max_steps: 3000   # Duration of first cycle in steps (int, usually == max_train_steps)
   scheduler_min_lr: 1e-7                    # Minimum LR (float)
-  scheduler_warmup_steps: 5000              # Warmup steps *within each cycle* if scheduler supports it (int)
+  scheduler_warmup_steps: 500              # Warmup steps *within each cycle* if scheduler supports it (int)
   # scheduler_d: 0.9                        # Example arg specific to Rex
 
   # Example Args for Standard CosineAnnealingLR:
