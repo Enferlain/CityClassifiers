@@ -17,7 +17,7 @@ import torch.nn.functional as torch_func
 from PIL import Image
 from tqdm import tqdm
 import numpy as np
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoProcessor, AutoModel, Dinov2Model
 import argparse
 import math
 import shutil
@@ -45,7 +45,7 @@ def parse_gen_args():
                             'avg_crop',             # Manual AvgCrop (NYI)
                             'naflex_resize',        # NaFlex HF (Proc Logic @ 1024)
                             'dinov2_large_timm_fitpad',   # DINOv2 TIMM (TIMM Transforms)
-                            'dinov2_giant_fb_fitpad'      # <<< ADDED: DINOv2 Facebook (Manual FitPad)
+                            'dinov2_giant_fb'      # <<< ADDED: DINOv2 Facebook (Manual FitPad)
                         ],
                         help="Image preprocessing method before embedding.")
     parser.add_argument('--resize_factor_avg_crop', type=float, default=2.0,
@@ -172,33 +172,51 @@ def init_vision_model(model_name, device, dtype):
              print(f"  DEBUG: Modified processor config: {image_processor}")
         else: print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
 
-        # Determine model's standard input size (for non-naflex modes)
-        image_size = 384 # Default guess
+        # Determine model's standard input size
+        image_size = 384  # Default guess
         try:
-             if hasattr(model, 'config') and hasattr(model.config, 'vision_config') and hasattr(model.config.vision_config, 'image_size'):
-                  image_size = int(model.config.vision_config.image_size)
-             elif hasattr(processor, 'image_processor') and hasattr(processor.image_processor, 'size'):
-                  # Use .get('height') for dict sizes, handle int directly
-                  proc_sz_config = processor.image_processor.size
-                  if isinstance(proc_sz_config, dict): image_size = int(proc_sz_config.get("height", image_size))
-                  elif isinstance(proc_sz_config, int): image_size = int(proc_sz_config)
-             print(f"  Determined Model Standard Input Size (for non-Naflex modes): {image_size}x{image_size}")
+            model_config = getattr(model, 'config', None)
+            if model_config:
+                # Check standard vision_config first (like SigLIP)
+                vision_config = getattr(model_config, 'vision_config', None)
+                if vision_config and hasattr(vision_config, 'image_size'):
+                    image_size = int(vision_config.image_size)
+                    print(f"  DEBUG: Found size via model.config.vision_config.image_size: {image_size}")
+                # Check DINOv2 specific config location
+                elif hasattr(model_config, 'image_size'):
+                    image_size = int(model_config.image_size)
+                    print(f"  DEBUG: Found size via model.config.image_size: {image_size}")
+                # Fallback to processor config (might not reflect model needs accurately)
+                elif hasattr(processor, 'image_processor') and hasattr(processor.image_processor, 'size'):
+                    proc_sz_config = processor.image_processor.size
+                    if isinstance(proc_sz_config, dict):
+                        image_size = int(proc_sz_config.get("height", image_size))
+                    elif isinstance(proc_sz_config, int):
+                        image_size = int(proc_sz_config)
+                    print(f"  DEBUG: Found size via processor.image_processor.size: {image_size}")
+                else:
+                    print(f"  DEBUG: Could not find specific image_size config. Using default: {image_size}")
+            else:
+                print(f"  DEBUG: Model has no 'config' attribute. Using default size: {image_size}")
+
+            print(f"  Determined Model Standard Input Size (for non-Naflex modes): {image_size}x{image_size}")
         except Exception as e_size:
-             print(f"  Warning: Could not determine model standard input size: {e_size}. Using default {image_size}.")
+            print(f"  Warning: Could not determine model standard input size: {e_size}. Using default {image_size}.")
 
         return processor, model, image_size
+
     except Exception as e:
         print(f"Error initializing vision model {model_name}: {e}")
         raise
 
 
 # --- Unified Embedding Function ---
-# Version 4.2.1: Added Facebook DINOv2 FitPad logic
+# Version 4.2.2: Added Facebook DINOv2 Manual Preprocessing support
 @torch.no_grad()
 def get_embedding(
     raw_img_pil: Image.Image,
     preprocess_mode: str,
-    model_info: dict, # Bundle containing model, processor/transforms, type
+    model_info: dict,
     device,
     dtype,
     model_image_size: int, # Size needed for manual preprocess modes
@@ -262,6 +280,8 @@ def get_embedding(
                     "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)
                 }
 
+                do_l2_normalize = False
+
                 # --- HF DINOv2 Mode (Manual FitPad + CLS Token) ---
             elif is_dinov2_model and preprocess_mode == 'dinov2_giant_fb_fitpad':
                 # print(f"DEBUG get_embedding [HF/DINOv2]: Using manual FitPad.")
@@ -276,28 +296,35 @@ def get_embedding(
                 model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
                 do_l2_normalize = True  # Normalize DINOv2 CLS token
 
-            # --- HF SigLIP FitPad / CenterCrop Modes ---
+            # --- HF Manual Modes (FitPad / CenterCrop) ---
             elif preprocess_mode in ['fit_pad', 'center_crop']:
+                # Apply manual preprocessing (works for both SigLIP and FB DINOv2)
                 processed_img_pil = None
                 if preprocess_mode == 'fit_pad':
                     processed_img_pil = preprocess_fit_pad(raw_img_pil, target_size=model_image_size)
                 elif preprocess_mode == 'center_crop':
                     processed_img_pil = preprocess_center_crop(raw_img_pil, target_size=model_image_size)
-                if processed_img_pil is None: return None
+                if processed_img_pil is None: return None # Preprocessing failed
 
+                # Use processor ONLY for ToTensor + Normalize
                 inputs = processor(images=[processed_img_pil], return_tensors="pt")
                 pixel_values = inputs.get("pixel_values")
                 if pixel_values is None: raise ValueError("Processor didn't return 'pixel_values'.")
 
+                # Set model call args (usually just pixel_values for these models/modes)
                 model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
-                attention_mask = inputs.get("pixel_attention_mask")
+                attention_mask = inputs.get("pixel_attention_mask") # Include mask if processor provides it
                 if attention_mask is not None: model_call_kwargs["attention_mask"] = attention_mask.to(device=device)
-                # SigLIP standard models expect pooler_output, which doesn't use spatial_shapes
+
+                # <<< Set normalize flag ONLY for DINOv2 in these modes >>>
+                if is_dinov2_model:
+                    do_l2_normalize = True
+                else: # SigLIP FitPad/CenterCrop doesn't need external normalization
+                    do_l2_normalize = False
 
             # --- Invalid HF Mode ---
             else:
-                print(
-                    f"ERROR get_embedding [HF]: Invalid preprocess_mode '{preprocess_mode}' for detected HF model type.")
+                print(f"ERROR get_embedding [HF]: Invalid/unsupported preprocess_mode '{preprocess_mode}' for detected HF model type.")
                 return None
 
             # --- HF Model Call ---
@@ -339,11 +366,8 @@ def get_embedding(
             return None
 
         # --- Final Normalization & Conversion ---
-        if emb is None:
-            print(f"ERROR get_embedding: Embedding is None before final conversion for {img_name}.")
-            return None
-
-        assert isinstance(emb, torch.Tensor), f"Expected emb to be a Tensor, but got {type(emb)}"
+        if emb is None: print(f"ERROR: Embedding is None before final conversion for {img_name}."); return None
+        if not isinstance(emb, torch.Tensor): raise TypeError(f"Embedding is not a Tensor ({type(emb)}).")
 
         if do_l2_normalize:
             # print(f"DEBUG get_embedding: L2 Normalizing final embedding.")
@@ -426,13 +450,14 @@ if __name__ == "__main__":
         'avg_crop': "AvgCrop",            # NYI
         'naflex_resize': "Naflex_Proc1024", # HF SigLIP NaFlex Processor@1024
         'dinov2_large_timm_fitpad': "FitPad",   # TIMM DINOv2 (uses FitPad via transforms)
-        'dinov2_giant_fb_fitpad': "FitPad"      # FB DINOv2 Manual FitPad
+        # No need for dinov2_giant_fb_fitpad here, handled by model type prefix now
     }
     mode_suffix = mode_suffix_map.get(args.preprocess_mode, "UnknownMode")
-    # Add prefix only if needed for clarity (HF DINOv2 vs TIMM DINOv2)
+
+    # Add prefix based on model source AND type for clarity
     model_prefix = ""
-    if 'dinov2' in args.model_name and model_info["type"] == "hf":
-         model_prefix = "hf_"
+    if model_info["type"] == "timm": model_prefix = "timm_"
+    elif model_info["type"] == "hf" and "dinov2" in args.model_name.lower(): model_prefix = "fb_" # Prefix for Facebook DINOv2
 
     output_subdir_name = f"{model_prefix}{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
     final_output_dir = os.path.join(args.output_dir_root, output_subdir_name)

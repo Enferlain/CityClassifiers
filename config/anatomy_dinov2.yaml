@@ -3,17 +3,17 @@
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"  # Base name (e.g., AnatomyFlaws, Aesthetics)
-  rev: "v6.3_adabeleif_fl_sigmoid_dinov2_large"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
+  rev: "v6.4_adabeleif_fl_sigmoid_dinov2_giant"     # Revision string (e.g., v6.0_DINOv2_Large_Focal) - Used for filenames
   arch: class                # Model architecture: 'class' or 'score'
 
   # --- Embedding Configuration ---
   # Key used by utils.get_embed_params to determine 'features' and 'hidden_dim' defaults.
   # MUST match a key defined in utils.py: get_embed_params.
-  embed_ver: "vit_large_patch14_dinov2.lvd142m_FitPad" # Or "facebook_dinov2_giant_FitPad", "siglip2_so400m_patch16_naflex_Naflex_Proc1024", etc.
+  embed_ver: "fb_dinov2_giant_FitPad" # Or "facebook_dinov2_giant_FitPad", "siglip2_so400m_patch16_naflex_Naflex_Proc1024", etc.
 
   # Explicitly specify the base vision model used for embeddings (Recommended!).
   # If null/missing, utils.py will attempt to infer it from embed_ver (may be unreliable).
-  base_vision_model: "timm/vit_large_patch14_dinov2.lvd142m" # Or "facebook/dinov2-giant", "google/siglip2-so400m-patch16-naflex", etc.
+  base_vision_model: "facebook/dinov2-giant" # Or "facebook/dinov2-giant", "google/siglip2-so400m-patch16-naflex", etc.
 
 # --- PredictorModel v2 Architecture Parameters ---
 predictor_params:

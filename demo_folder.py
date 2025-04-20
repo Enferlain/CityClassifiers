@@ -174,22 +174,22 @@ if __name__ == "__main__":
     args = parse_args()
 
     # --- Config Handling ---
-    # Use provided config path OR infer from model path
     config_path = args.config
     if config_path is None:
-        # Infer config path by removing potential suffixes like _best_val, _sXXXK, _efinal
+        # --- CHANGE: We need a dummy BasePipeline just to use _infer_config_path ---
+        # This feels a bit hacky, maybe _infer_config_path should be a standalone utility?
+        # Or we pass the model path to the pipeline init and let IT handle inference?
+        # For now, let's just infer it manually here based on the helper's logic.
         model_base_name = os.path.basename(args.model)
-        # Simple suffix removal (can be made more robust)
+        if model_base_name.endswith(".safetensors"): model_base_name = model_base_name[:-len(".safetensors")]
         suffixes_to_remove = ["_best_val", "_efinal"]
         for suffix in suffixes_to_remove:
-             if model_base_name.endswith(f"{suffix}.safetensors"):
-                  model_base_name = model_base_name[:-len(f"{suffix}.safetensors")]
-                  break
-        # Remove step suffixes like _s28K
+             if model_base_name.endswith(suffix): model_base_name = model_base_name[:-len(suffix)]; break
         if "_s" in model_base_name:
-             model_base_name = model_base_name.split("_s")[0]
-
+             parts = model_base_name.split("_s");
+             if len(parts) > 1 and parts[-1] and (parts[-1][0].isdigit() or parts[-1][-1] in ['K', 'M']): model_base_name = parts[0]
         inferred_config_path = os.path.join(os.path.dirname(args.model), f"{model_base_name}.config.json")
+
         if os.path.isfile(inferred_config_path):
             print(f"DEBUG: Using inferred config path: {inferred_config_path}")
             config_path = inferred_config_path
@@ -200,13 +200,13 @@ if __name__ == "__main__":
          print(f"Error: Provided config path not found: {config_path}")
          exit(1)
 
-    # Load the specified or inferred config
-    config_data = _load_config_helper(config_path)
-    if config_data is None:
-        print(f"Error: Failed to load config data from {config_path}")
-        exit(1)
-    config_labels = config_data.get("labels", {}) # Get labels for classifier display fallback
-    # --- End Config Handling ---
+    # <<< REMOVE Direct Config Load Here >>>
+    # config_data = _load_config_helper(config_path)
+    # if config_data is None:
+    #     print(f"Error: Failed to load config data from {config_path}")
+    #     exit(1)
+    # config_labels = config_data.get("labels", {})
+    # --- End REMOVE ---
 
     os.makedirs(args.dst, exist_ok=True)
     print(f"Using model: {os.path.basename(args.model)}")
@@ -216,26 +216,26 @@ if __name__ == "__main__":
     pipeline_args = {}
     if torch.cuda.is_available():
         pipeline_args["device"] = "cuda"
-        # Note: clip_dtype applies to the vision model, not the predictor head
-        # Predictor head usually runs in fp32
-        pipeline_args["clip_dtype"] = torch.float16 # Or float32 if preferred/needed
+        pipeline_args["clip_dtype"] = torch.float16
 
     pipeline = None
     try:
+        # <<< Pipeline initialization now loads the config internally >>>
         if args.arch == "score":
-            # Pass explicit config_path to ensure it uses the correct one
             pipeline = CityAestheticsPipeline(args.model, config_path=config_path, **pipeline_args)
         elif args.arch == "class":
-            # Pass explicit config_path here too
             pipeline = CityClassifierPipeline(args.model, config_path=config_path, **pipeline_args)
         else:
-            # This case should not be reachable due to argparse choices
              raise ValueError(f"Unknown model architecture '{args.arch}'")
     except Exception as e_pipe:
          print(f"\nError initializing pipeline: {e_pipe}")
-         print("Ensure the model file, config file, and architecture type match.")
          exit(1)
     # --- End Pipeline Setup ---
 
-    # Run processing
+    # <<< GET Labels AFTER Pipeline Init >>>
+    # The pipeline already loaded the config into self.config and set self.labels
+    config_labels = getattr(pipeline, 'labels', {}) # Get labels from the pipeline instance
+    # <<< End GET Labels >>>
+
+    # Run processing, passing the labels obtained from the pipeline
     process_folder(pipeline, config_labels, args)

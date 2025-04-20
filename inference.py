@@ -284,14 +284,12 @@ class BasePipeline:
                 print(f"Error initializing TIMM vision model {timm_model_name}: {e}")
                 raise
 
-        # --- Else: Assume Hugging Face Model ---
+        # --- Hugging Face Model Path ---
         else:
-            if model_name.startswith("timm/"):
-                 print("Warning: TIMM model specified but 'timm' library not available or failed import.")
+            if model_name.startswith("timm/"): print("Warning: TIMM model specified but 'timm' library not available.")
             self.vision_model_type = "hf"
             print("  Detected Hugging Face model type.")
             try:
-                # Load HF processor and model
                 self.hf_processor = AutoProcessor.from_pretrained(model_name)
                 self.vision_model = AutoModel.from_pretrained(
                     model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
@@ -299,251 +297,238 @@ class BasePipeline:
                 print(f"  Loaded HF model: {self.vision_model.__class__.__name__}")
                 print(f"  Loaded HF processor: {self.hf_processor.__class__.__name__}")
 
-                # Disable processor's built-in transforms (Keep As Is)
+                # Disable processor's built-in transforms (remains same)
                 if hasattr(self.hf_processor, 'image_processor'):
                      image_processor = self.hf_processor.image_processor
-                     print(f"  DEBUG Inference: Original image processor config: {image_processor}")
+                     # This check might be the one failing to disable for BitImageProcessor
+                     print(f"  DEBUG Inference: Original processor config: {image_processor}")
                      if hasattr(image_processor, 'do_center_crop'): image_processor.do_center_crop = False
-                     if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True
-                     print(f"  DEBUG Inference: Modified image processor config: {image_processor}")
+                     else: print("  Warning: Cannot access 'do_center_crop' on image_processor.")
+                     if hasattr(image_processor, 'do_normalize'): image_processor.do_normalize = True # Keep normalization ON
+                     else: print("  Warning: Cannot access 'do_normalize' on image_processor.")
+                     print(f"  DEBUG Inference: Attempted modified processor config: {image_processor}")
                 else:
                      print("  Warning: Cannot access image_processor to disable auto-preprocessing.")
 
-                # Determine processor size (Keep As Is)
-                self.proc_size = 512
+
+                # --- Determine Processor Size (Attempt automatic first) ---
+                self.proc_size = 512 # Start with default
                 if hasattr(self.hf_processor, 'image_processor') and hasattr(self.hf_processor.image_processor, 'size'):
                     proc_sz = self.hf_processor.image_processor.size
                     if isinstance(proc_sz, dict): self.proc_size = int(proc_sz.get("height", 512))
                     elif isinstance(proc_sz, int): self.proc_size = int(proc_sz)
-                print(f"  Determined processor target size (for FitPad/CenterCrop): {self.proc_size}")
+                # Also check model config directly for size (like in generate_embeddings)
+                model_config = getattr(self.vision_model, 'config', None)
+                if model_config and hasattr(model_config, 'image_size'):
+                     config_size = int(model_config.image_size)
+                     if config_size != self.proc_size:
+                          print(f"  DEBUG: Overriding proc size ({self.proc_size}) with model config size ({config_size}).")
+                          self.proc_size = config_size
+
+                # <<< ADD EXPLICIT OVERRIDE FOR DINOv2 GIANT >>>
+                if "dinov2" in model_name.lower() and "giant" in model_name.lower():
+                    if self.proc_size != 518:
+                        print(f"  INFO: Explicitly setting processor target size to 518 for DINOv2 Giant (was {self.proc_size}).")
+                        self.proc_size = 518
+                # <<< END OVERRIDE >>>
+
+                print(f"  Determined processor target size (for FitPad/CenterCrop): {self.proc_size}") # This log should now show 518
 
             except Exception as e:
                 print(f"Error initializing Hugging Face vision model {model_name}: {e}")
                 raise
 
 
-    # --- Step 3: Modify _preprocess_images ---
+    # Version 1.8.4: Correct target_size determination for FitPad
     def _preprocess_images(self, img_list: list[Image.Image]) -> list[Image.Image] | None:
-        """Applies the selected preprocessing function to a list of PIL images."""
-        if not self.preprocess_func:
-             print("ERROR: Preprocessing function not selected in pipeline init.")
-             return None
+        """Applies the selected manual preprocessing function to a list of PIL images."""
+        if not self.preprocess_func: print("ERROR: Preprocessing function not selected."); return None
 
         processed_imgs = []
         for img_pil in img_list:
             try:
                 img_processed = None
-                # Check which function we stored and call it appropriately
+                # --- Determine Correct Target Size ---
+                target_s = self.proc_size # Default size (e.g., 512 from HF SigLIP)
+                # Specific overrides based on model/embed_ver for manual modes
+                # Check for DINOv2 Giant specifically
+                if "dinov2" in self.base_vision_model_name.lower() and "giant" in self.base_vision_model_name.lower():
+                    target_s = 518 # DINOv2 Giant uses 518
+                    # print(f"DEBUG _preprocess_images: Using target_size {target_s} for DINOv2 Giant.")
+                # Add other overrides if needed (e.g., checking self.embed_ver)
+                # elif 'dinov2' in self.base_vision_model_name and '_224' in self.embed_ver: target_s = 224
+
+                # --- Apply Selected Preprocessing ---
                 if self.preprocess_func == preprocess_fit_pad:
-                    # FitPad needs target_size from the processor/model
-                    img_processed = self.preprocess_func(img_pil, target_size=self.proc_size)
-                elif self.preprocess_func == preprocess_naflex_resize:
-                    # NaFlex resize (v4) uses defaults for target_patches/patch_size
+                    img_processed = self.preprocess_func(img_pil, target_size=target_s)
+                elif self.preprocess_func == preprocess_naflex_resize: # NaFlex doesn't use target_s
                     img_processed = self.preprocess_func(img_pil)
-                # Add elif for other functions if needed
+                # Add elif for CenterCrop if needed
                 # elif self.preprocess_func == preprocess_center_crop:
-                #     img_processed = self.preprocess_func(img_pil, target_size=self.proc_size)
-                else:
-                    # Fallback for safety, though should be set in init
-                    print(f"Warning: Unknown preprocess_func {self.preprocess_func.__name__}, trying basic call.")
+                #    img_processed = self.preprocess_func(img_pil, target_size=target_s)
+                else: # Fallback
                     img_processed = self.preprocess_func(img_pil) # Attempt basic call
 
-                if img_processed:
-                     processed_imgs.append(img_processed)
-                else:
-                     print(f"Warning: Preprocessing function {self.preprocess_func.__name__} returned None for an image.")
+                if img_processed: processed_imgs.append(img_processed)
+                else: print(f"Warning: Preprocessing returned None.")
             except Exception as e_prep:
-                 # Include function name in error
                  print(f"Error during {getattr(self.preprocess_func, '__name__', 'unknown preprocessing')} in inference: {e_prep}. Skipping image.")
-                 import traceback
-                 traceback.print_exc() # Add traceback here for debugging
+                 import traceback; traceback.print_exc()
         return processed_imgs if processed_imgs else None
-    # --- End Modify _preprocess_images ---
 
-    # Version 1.8.0: Adds TIMM DINOv2 support, keeps HF logic untouched
+    # Version 1.8.6: Restore TIMM path, correctly handle FB DINOv2, preserve SigLIP
     def get_clip_emb(self, img_list: list[Image.Image]) -> torch.Tensor | None:
         """
         Generates embeddings for a list of PIL images using the loaded vision model.
-        Handles HF (SigLIP/NaFlex) and TIMM (DINOv2) models.
+        Correctly handles TIMM-native, FB DINOv2 (Manual), SigLIP NaFlex, SigLIP Manual.
+        Input img_list expected to be RAW PIL images for NaFlex/TIMM-native.
+        Input img_list expected to be PREPROCESSED PIL images for Manual modes if called after _preprocess_images.
         """
         if not isinstance(img_list, list): img_list = [img_list]
-        if not img_list:
-            print("Error: Empty image list provided to get_clip_emb.")
-            return None
+        if not img_list: print("Error: Empty image list provided."); return None
 
-        final_emb = None # Initialize
+        final_emb = None
+        do_l2_normalize = False
 
-        # --- TIMM Model Inference ---
-        if self.vision_model_type == "timm":
-            if self.vision_model is None or self.timm_transforms is None:
-                print("Error: TIMM model or transforms not initialized.")
-                return None
-            try:
-                # Apply TIMM transforms and create batch tensor
-                # Handle multiple images in the list
+        try:
+            # --- Path 1: TIMM Model using TIMM Transforms ---
+            if self.vision_model_type == "timm":
+                if self.vision_model is None or self.timm_transforms is None: raise ValueError("TIMM model or transforms not initialized.")
+                # Expects RAW PIL images in img_list here
                 processed_tensors = [self.timm_transforms(img) for img in img_list]
                 input_batch = torch.stack(processed_tensors).to(device=self.device, dtype=self.clip_dtype)
 
                 with torch.no_grad():
-                    # Get pooled features directly (since num_classes=0)
-                    emb = self.vision_model(input_batch) # Shape: [Batch, Features]
+                    emb = self.vision_model(input_batch) # Pooled features
+                # Check if base model name indicates DINOv2 for normalization
+                do_l2_normalize = "dinov2" in self.base_vision_model_name.lower()
 
-                    # <<< IMPORTANT: L2 Normalize TIMM DINOv2 Embeddings >>>
-                    emb_normalized = F.normalize(emb.float(), p=2, dim=-1)
+            # --- Path 2: Hugging Face Models (SigLIP or FB DINOv2) ---
+            elif self.vision_model_type == "hf":
+                if self.vision_model is None or self.hf_processor is None: raise ValueError("HF model or processor not initialized.")
+                is_naflex_mode = "Naflex" in self.embed_ver
+                is_siglip_model = "Siglip" in self.vision_model.__class__.__name__
+                is_dinov2_model = "Dinov2" in self.vision_model.__class__.__name__ or "dinov2" in self.base_vision_model_name.lower()
 
-                # Move to CPU, ensure FP32 for predictor head
-                final_emb = emb_normalized.detach().to(device='cpu', dtype=torch.float32)
-
-            except Exception as e:
-                 print(f"Error during TIMM model inference: {e}")
-                 import traceback
-                 traceback.print_exc()
-                 return None
-
-        # --- Hugging Face Model Inference (Keep Existing Logic) ---
-        elif self.vision_model_type == "hf":
-            if self.vision_model is None or self.hf_processor is None:
-                 print("Error: Hugging Face model or processor not initialized.")
-                 return None
-
-            # Check if NaFlex mode based on embed_ver
-            is_naflex_mode = "Naflex" in self.embed_ver
-            is_siglip2_model = "Siglip2Model" in self.vision_model.__class__.__name__
-
-            model_call_kwargs = {}
-            pixel_values = None
-            attention_mask = None
-            spatial_shapes = None
-
-            try:
-                # NaFlex Mode: Use Processor Logic @ 1024
-                if is_siglip2_model and is_naflex_mode:
+                # --- SubPath 2a: SigLIP NaFlex (Processor handles all) ---
+                if is_siglip_model and is_naflex_mode:
+                    # Expects RAW PIL images in img_list
                     inputs = self.hf_processor(images=img_list, return_tensors="pt", max_num_patches=1024)
-                    pixel_values = inputs.get("pixel_values")
-                    attention_mask = inputs.get("pixel_attention_mask")
-                    spatial_shapes = inputs.get("spatial_shapes")
-                    if pixel_values is None or attention_mask is None or spatial_shapes is None:
-                         raise ValueError("Missing required tensors from HF NaFlex processor.")
-                    if pixel_values.shape[1] != 1024 or attention_mask.shape[1] != 1024:
-                         raise ValueError(f"HF NaFlex Processor output seq len != 1024 ({pixel_values.shape[1]})")
+                    pixel_values = inputs.get("pixel_values"); attention_mask = inputs.get("pixel_attention_mask"); spatial_shapes = inputs.get("spatial_shapes")
+                    if pixel_values is None or attention_mask is None or spatial_shapes is None: raise ValueError("Missing tensors from HF NaFlex processor.")
 
                     model_call_kwargs = {
                         "pixel_values": pixel_values.to(device=self.device, dtype=self.clip_dtype),
                         "attention_mask": attention_mask.to(device=self.device),
                         "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=self.device)
                     }
+                    # Call SigLIP model
+                    with torch.no_grad():
+                        vision_model_component = getattr(self.vision_model, 'vision_model', None)
+                        if vision_model_component: emb = vision_model_component(**model_call_kwargs).pooler_output
+                        elif hasattr(self.vision_model, 'get_image_features'):
+                            kwargs_for_get = {k: v for k, v in model_call_kwargs.items() if k in ['pixel_values', 'attention_mask', 'spatial_shapes']}
+                            emb = self.vision_model.get_image_features(**kwargs_for_get)
+                        else: raise AttributeError("SigLIP Model missing expected methods.")
+                    do_l2_normalize = False # SigLIP internal norm
 
-                # FitPad / CenterCrop / Other HF Modes: Manual Preprocessing
-                else:
-                    processed_imgs = self._preprocess_images(img_list)
-                    if not processed_imgs:
-                        print("Error: No images left after HF manual preprocessing.")
-                        return None
-                    inputs = self.hf_processor(images=processed_imgs, return_tensors="pt")
-                    pixel_values_from_proc = inputs.get("pixel_values")
-                    if pixel_values_from_proc is None: raise ValueError("HF Processor didn't return 'pixel_values'.")
+                # --- SubPath 2b: Manual Preprocessing (FB DINOv2 or SigLIP FitPad/CenterCrop) ---
+                elif not is_naflex_mode:
+                    # Expects PREPROCESSED PIL images in img_list (processed by _preprocess_images)
+                    # Use processor ONLY for ToTensor + Normalize
+                    inputs = self.hf_processor(images=img_list, return_tensors="pt")
+                    pixel_values = inputs.get("pixel_values")
+                    if pixel_values is None: raise ValueError("HF Processor didn't return 'pixel_values'.")
+                    model_call_kwargs = {"pixel_values": pixel_values.to(device=self.device, dtype=self.clip_dtype)}
+                    attention_mask = inputs.get("pixel_attention_mask")
+                    if attention_mask is not None: model_call_kwargs["attention_mask"] = attention_mask.to(device=self.device)
 
-                    pixel_values = pixel_values_from_proc.to(device=self.device, dtype=self.clip_dtype)
-                    model_call_kwargs = {"pixel_values": pixel_values}
-                    attention_mask_from_processor = inputs.get("pixel_attention_mask")
-                    if attention_mask_from_processor is not None:
-                        model_call_kwargs["attention_mask"] = attention_mask_from_processor.to(device=self.device)
+                    # Call appropriate model
+                    with torch.no_grad():
+                        if is_dinov2_model:
+                            outputs = self.vision_model(**model_call_kwargs)
+                            emb = outputs.last_hidden_state[:, 0] # CLS token
+                        elif is_siglip_model:
+                             vision_model_component = getattr(self.vision_model, 'vision_model', None)
+                             if vision_model_component: emb = vision_model_component(**model_call_kwargs).pooler_output
+                             elif hasattr(self.vision_model, 'get_image_features'):
+                                  kwargs_for_get = {k: v for k, v in model_call_kwargs.items() if k in ['pixel_values', 'attention_mask', 'spatial_shapes']}
+                                  emb = self.vision_model.get_image_features(**kwargs_for_get)
+                             else: raise AttributeError("SigLIP Model missing expected methods.")
+                        else: # Should not happen if model loaded correctly
+                            raise TypeError(f"Model type mismatch in HF manual preproc path: {self.vision_model.__class__.__name__}")
 
-            except Exception as e:
-                print(f"Error processing images with HF processor in inference: {e}")
-                import traceback; traceback.print_exc(); return None
+                    # Set normalization flag based on model type
+                    do_l2_normalize = is_dinov2_model
 
-            # Get Embeddings from HF Vision Model
-            emb = None
-            with torch.no_grad():
-                try:
-                    # <<< Use self.vision_model here (was self.clip_model) >>>
-                    vision_model_component = getattr(self.vision_model, 'vision_model', None)
-                    if vision_model_component:
-                        vision_outputs = vision_model_component(**model_call_kwargs)
-                        emb = vision_outputs.pooler_output
-                    elif hasattr(self.vision_model, 'get_image_features'):
-                        kwargs_for_get = {"pixel_values": model_call_kwargs["pixel_values"]}
-                        # Only pass other args if they exist in the call kwargs
-                        if "attention_mask" in model_call_kwargs: kwargs_for_get["attention_mask"] = model_call_kwargs["attention_mask"]
-                        if "spatial_shapes" in model_call_kwargs: kwargs_for_get["spatial_shapes"] = model_call_kwargs["spatial_shapes"]
-                        emb = self.vision_model.get_image_features(**kwargs_for_get)
-                    else:
-                        # This was the error source before! Now handled by TIMM check above.
-                        # If we reach here with an HF model, it *should* have one of these.
-                        raise AttributeError("HF Model has neither 'vision_model' nor 'get_image_features'.")
+                else: # Should not happen: is_naflex_mode is True but model isn't SigLIP?
+                    raise ValueError(f"Unsupported NaFlex mode for model type: {self.vision_model.__class__.__name__}")
 
-                    if emb is None: raise ValueError("Failed to get embedding from HF model call.")
+            else: # Unknown vision_model_type
+                raise ValueError(f"Unknown vision_model_type '{self.vision_model_type}'")
 
-                except Exception as e_fwd:
-                    print(f"Error during HF vision model forward pass in inference: {e_fwd}")
-                    import traceback; traceback.print_exc(); return None
+            # --- Check if emb was obtained ---
+            if emb is None: raise ValueError("Failed to get embedding from model call.")
 
-                # Post-processing (Normalization already handled by HF models usually)
-                # <<< Normalization is handled inside HF get_image_features or vision_model >>>
-                # Just ensure correct device and dtype for output
-                final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
-                # Optional extra normalization just in case? Usually not needed for HF.
-                # norm = torch.linalg.norm(final_emb, dim=-1, keepdim=True).clamp(min=1e-8)
-                # final_emb = final_emb / norm
+            # --- Final Normalization & Conversion ---
+            if do_l2_normalize:
+                norm = torch.linalg.norm(emb.float(), dim=-1, keepdim=True).clamp(min=1e-8)
+                emb = emb / norm.to(emb.dtype)
+            final_emb = emb.detach().to(device='cpu', dtype=torch.float32)
 
-        # --- Unknown Model Type ---
-        else:
-            print(f"Error: Unknown vision_model_type '{self.vision_model_type}' in get_clip_emb.")
-            return None
+        except Exception as e:
+            print(f"Error during get_clip_emb (v1.8.6): {e}")
+            import traceback; traceback.print_exc(); return None
 
-        # Return final embedding (FP32 on CPU)
         return final_emb
 
-    # Version 1.7.4: Corrected five_crop argument name
+    # --- v1.8.6: Adjusted comments to reflect where preprocessing happens ---
     def get_clip_emb_tiled(self, raw_pil_image: Image.Image, tiling: bool = False) -> torch.Tensor | None:
         """Generates embeddings, potentially using 5-crop tiling."""
         img_list = []
-        # Check if embed_ver indicates NaFlex mode
         is_naflex_mode = "Naflex" in self.embed_ver
 
-        if tiling:
-            # If tiling is requested BUT it's NaFlex mode, process single view instead
-            if is_naflex_mode:
-                 print("DEBUG: Tiling requested with NaFlex, processing single view instead.")
-                 img_list = [raw_pil_image]
-            else:
-                 # Original FitPad tiling logic
-                 # We need _preprocess_images for the base padded view if using 5-crop
-                 base_padded_img_list = self._preprocess_images([raw_pil_image]) # Returns a list
-                 if not base_padded_img_list:
-                     print("Error: Preprocessing failed for tiling base image.")
-                     return None
-                 base_padded_img_tensor = TF.to_tensor(base_padded_img_list[0])
-
-                 # Use TF.five_crop - needs tensor input, returns tuple of tensors
-                 # Size for five_crop should be the CLIP input size (self.proc_size)
-                 crop_size = [self.proc_size, self.proc_size] # e.g., [512, 512]
-                 try:
-                      # Ensure image is large enough for the crop size
-                      if base_padded_img_tensor.shape[1] < crop_size[0] or base_padded_img_tensor.shape[2] < crop_size[1]:
-                            print(f"Warning: Image ({base_padded_img_tensor.shape}) smaller than crop size ({crop_size}). Using original padded image.")
-                            img_list = base_padded_img_list
-                      else:
-                            # <<< CORRECTED ARGUMENT NAME HERE >>>
-                            tiled_crops_tensors = TF.five_crop(base_padded_img_tensor, size=crop_size)
-                            # Convert tensors back to PIL images for get_clip_emb processing
-                            img_list = [TF.to_pil_image(crop) for crop in tiled_crops_tensors]
-                            # print(f"DEBUG: Generated {len(img_list)} tiled crops.")
-                 except Exception as e_tile:
-                      print(f"Error during five_crop tiling: {e_tile}. Falling back to single view.")
-                      img_list = base_padded_img_list # Fallback
-
-        else:
-             # Process single image (preprocessing happens inside get_clip_emb)
+        # --- Prepare img_list (PIL images) ---
+        if is_naflex_mode:
+             # NaFlex always uses single view RAW image
+             if tiling: print("DEBUG: Tiling requested with NaFlex, processing single view instead.")
              img_list = [raw_pil_image]
+        elif tiling:
+             # Manual Modes (FitPad/CenterCrop) Tiling:
+             # Apply manual preprocessing FIRST to get base image for cropping
+             base_processed_img_list = self._preprocess_images([raw_pil_image]) # Uses correct size (e.g., 518)
+             if not base_processed_img_list: print("Error: Preprocessing failed for tiling base."); return None
+             base_processed_img = base_processed_img_list[0]
 
-        # Ensure img_list contains PIL images
-        if not all(isinstance(img, Image.Image) for img in img_list):
-             print("Error: img_list does not contain PIL images before get_clip_emb.")
-             return None
+             # Determine crop size (should match final input size)
+             crop_size = [self.proc_size, self.proc_size] # self.proc_size should be correct now (e.g., 518)
 
-        return self.get_clip_emb(img_list) # Calls the updated get_clip_emb
+             # Perform Tiling on the *Preprocessed* Base Image
+             base_processed_img_tensor = TF.to_tensor(base_processed_img)
+             try:
+                  if base_processed_img_tensor.shape[1] < crop_size[0] or base_processed_img_tensor.shape[2] < crop_size[1]:
+                        print(f"Warning: Preprocessed image ({base_processed_img_tensor.shape}) smaller than crop size ({crop_size}). Using single view.")
+                        img_list = [base_processed_img] # Pass the single PREPROCESSED image
+                  else:
+                        tiled_crops_tensors = TF.five_crop(base_processed_img_tensor, size=crop_size)
+                        # Pass PREPROCESSED crops (as PIL) to get_clip_emb
+                        # get_clip_emb for manual modes expects preprocessed PIL
+                        img_list = [TF.to_pil_image(crop) for crop in tiled_crops_tensors]
+             except Exception as e_tile:
+                  print(f"Error during five_crop tiling: {e_tile}. Falling back to single view.")
+                  img_list = [base_processed_img] # Fallback to single PREPROCESSED image
+        else:
+             # Manual Modes (FitPad/CenterCrop) Non-Tiled:
+             # Apply manual preprocessing first.
+             processed_single_view = self._preprocess_images([raw_pil_image])
+             if not processed_single_view: print("Error: Preprocessing failed for single view."); return None
+             img_list = processed_single_view # List containing one PREPROCESSED PIL image
+
+        if not all(isinstance(img, Image.Image) for img in img_list): print("Error: img_list invalid."); return None
+
+        # Call get_clip_emb. It expects RAW images for NaFlex/TIMM-native,
+        # and PREPROCESSED images for manual modes (FitPad/CenterCrop).
+        return self.get_clip_emb(img_list)
 
     # --- v1.7.12: Loads PredictorModel v2 using enhanced config ---
     def _load_predictor_head(self, required_outputs: int | None = None):
