@@ -41,7 +41,7 @@ def get_embed_params(ver):
         # --- DINOv2 ---
         # Assumes FitPad preprocessing was used for generation
         "fb_dinov2_giant_FitPad": {"features": 1536, "hidden": 1280}, # ViT-Giant
-        "vit_large_patch14_dinov2.lvd142m_FitPad": {"features": 1024, "hidden": 1280}, # ViT-Large
+        "timm_vit_large_patch14_dinov2.lvd142m_FitPad": {"features": 1024, "hidden": 1280}, # ViT-Large
 
         # --- Other ---
         "META": {"features": 1024, "hidden": 1280}, # Legacy MetaCLIP Example
