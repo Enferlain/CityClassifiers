@@ -19,7 +19,7 @@ from utils import (
     LOG_EVERY_N, FocalLoss
 )
 from dataset import EmbeddingDataset
-from model import PredictorModel
+from model_early_extract import EarlyExtractAnatomyModel
 
 # --- Attempt to import our custom optimizers ---
 try:
@@ -258,20 +258,49 @@ def setup_model_criterion(args, dataset):
     # Use the num_classes determined by the loss function logic
     args.num_classes = num_classes
 
-    # --- Instantiate the Enhanced Model ---
-    print(f"DEBUG: Instantiating PredictorModel v2 with num_classes={num_classes}, output_mode='{output_mode}'")
-    model = PredictorModel(
-        features=features,
-        hidden_dim=hidden_dim,
-        num_classes=num_classes, # Use determined num_classes
-        use_attention=use_attention,
-        num_attn_heads=num_attn_heads,
-        attn_dropout=attn_dropout,
-        num_res_blocks=num_res_blocks,
-        dropout_rate=dropout_rate,
-        output_mode=output_mode # Pass explicit output_mode from config
-    )
-    model.to(TARGET_DEV)
+    base_model_name_from_config = getattr(args, 'base_vision_model', None)
+    if not base_model_name_from_config:
+        # Maybe try inferring from embed_ver if base_vision_model is missing? Risky.
+        raise ValueError("Config must specify 'base_vision_model' for EarlyExtractAnatomyModel.")
+
+    # --- Instantiate EarlyExtractAnatomyModel ---
+    print(f"DEBUG: Instantiating EarlyExtractAnatomyModel for base: {base_model_name_from_config}")
+    try:
+        model = EarlyExtractAnatomyModel(
+            # --- Base Model / Feature Extraction ---
+            base_model_name=base_model_name_from_config,
+            # Add these to YAML config:
+            extract_layer=getattr(args, 'extract_layer', -1),  # Default to last hidden layer
+            pooling_strategy=getattr(args, 'pooling_strategy', 'attn'),  # Default to attention pooling
+            freeze_base_model=getattr(args, 'freeze_base_model', True),  # Default to frozen
+
+            # --- Predictor Head Configuration (map from args) ---
+            # head_features: None, # Let the model infer this
+            head_hidden_dim=getattr(args, 'head_hidden_dim', getattr(args, 'hidden_dim', 1280)),
+            # Use new name or fallback
+            head_num_classes=num_classes,  # Use the num_classes determined earlier by loss/arch
+            head_num_res_blocks=getattr(args, 'head_num_res_blocks', getattr(args, 'num_res_blocks', 2)),
+            # Use new name or fallback, maybe default 2?
+            head_dropout_rate=getattr(args, 'head_dropout_rate', getattr(args, 'dropout_rate', 0.2)),
+            # Use new name or fallback, maybe default 0.2?
+            head_output_mode=getattr(args, 'head_output_mode', getattr(args, 'output_mode', 'linear')),
+            # Use new name or fallback
+
+            # --- Attention Pooling Config (if pooling_strategy='attn') ---
+            # Add these to YAML config if using attn pooling:
+            attn_pool_heads=getattr(args, 'attn_pool_heads', 8),
+            attn_pool_dropout=getattr(args, 'attn_pool_dropout', 0.1),
+
+            # --- Other ---
+            # compute_dtype=amp_dtype  # Pass the precision determined earlier
+        )
+    except Exception as e_model_init:
+        print(f"ERROR instantiating EarlyExtractAnatomyModel: {e_model_init}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
+
+    model.to(TARGET_DEV)  # Move the whole model to device
 
     # --- Store parameters back to args ---
     args.features = features
