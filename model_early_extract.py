@@ -1,11 +1,21 @@
 # model_early_extract.py
-# Version 1.0.0: End-to-end model with early feature extraction & attention pooling
+# Version 1.1.0: aimv2 is not in transformers
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, PretrainedConfig
+# Remove transformers AutoModel import if no longer needed
+# from transformers import AutoModel, PretrainedConfig
 import math
+
+# <<< Add AIMv2 import >>>
+try:
+    from aim.v2.utils import load_pretrained
+    AIMV2_AVAILABLE = True
+except ImportError:
+    print("Warning: Could not import 'load_pretrained' from 'aim.v2.utils'.")
+    print("Ensure aim.v2 is installed: pip install 'git+https://github.com/apple/ml-aim.git#subdirectory=aim-v2'")
+    AIMV2_AVAILABLE = False
 
 # --- ResBlock (Can copy from original model.py or redefine) ---
 class ResBlock(nn.Module):
@@ -64,180 +74,203 @@ class AttentionPool(nn.Module):
 
 # --- Main End-to-End Model ---
 class EarlyExtractAnatomyModel(nn.Module):
+    # <<< Add device parameter >>>
     def __init__(self,
-                 base_model_name: str, # e.g., "google/siglip2-so400m-patch16-naflex"
+                 base_model_name: str,
+                 device: str = "cpu", # <<< Added >>>
                  # --- Feature Extraction Params ---
-                 extract_layer: int = -1, # Which hidden layer to use (-1 for last)
-                 pooling_strategy: str = 'attn', # 'cls', 'avg', 'attn'
+                 extract_layer: int = -1,
+                 pooling_strategy: str = 'attn',
                  # --- Predictor Head Params ---
-                 # Feature dim often matches base model hidden dim, but pooling might change it
-                 head_features: int = None, # If None, infer from base model
+                 head_features: int = None,
                  head_hidden_dim: int = 1024,
                  head_num_classes: int = 2,
                  head_num_res_blocks: int = 2,
                  head_dropout_rate: float = 0.2,
                  head_output_mode: str = 'linear',
-                 # --- Attention Pooling Params (if pooling_strategy='attn') ---
+                 # --- Attention Pooling Params ---
                  attn_pool_heads: int = 8,
                  attn_pool_dropout: float = 0.1,
                  # --- Fine-tuning Params ---
                  freeze_base_model: bool = True,
                  # --- Other ---
-                 compute_dtype: torch.dtype = torch.float32
+                 compute_dtype: torch.dtype = torch.bfloat16
                  ):
         super().__init__()
 
         self.extract_layer = extract_layer
         self.pooling_strategy = pooling_strategy.lower()
         self.compute_dtype = compute_dtype
+        self.device = device # Store device
+
 
         # --- 1. Load Base Vision Model ---
-        print(f"Loading base vision model: {base_model_name}")
+        aimv2_short_name = base_model_name.split('/')[-1] # Get part after "apple/"
+        print(f"Loading base vision model using aim.v2: {base_model_name} (using short name: {aimv2_short_name})")
+        if not AIMV2_AVAILABLE:
+            exit("Error: aim.v2 package not available. Cannot load AIMv2 model.")
+
         try:
-            # Load config first to get hidden size etc.
-            vision_config = PretrainedConfig.from_pretrained(base_model_name, trust_remote_code=True)
-            # Try finding hidden size (might be under vision_config or directly)
-            self.base_hidden_dim = getattr(vision_config, 'hidden_size', getattr(getattr(vision_config, 'vision_config', {}), 'hidden_size', None))
-            if self.base_hidden_dim is None:
-                 # Add specific checks for models like DINOv2 if needed
-                 if hasattr(vision_config, 'hidden_dim'): self.base_hidden_dim = vision_config.hidden_dim
-                 else: raise ValueError("Could not determine base model hidden dimension.")
-
-            self.vision_model = AutoModel.from_pretrained(
-                base_model_name,
-                torch_dtype=self.compute_dtype,
-                trust_remote_code=True,
-                # Add output_hidden_states=True if needed by pooling strategy
-                output_hidden_states=(self.pooling_strategy != 'pooler') # Pooler output doesn't need hidden states
+            # Use the official AIMv2 loading function
+            self.vision_model = load_pretrained(
+                aimv2_short_name,
+                backend="torch",
             )
-            print(f"  Base model loaded. Hidden Dim: {self.base_hidden_dim}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load base vision model {base_model_name}: {e}")
+            # Move to device and set dtype AFTER loading
+            self.vision_model = self.vision_model.to(device=self.device, dtype=self.compute_dtype)
 
-        # --- Freeze Base Model (Optional) ---
+            # Manually configure output_hidden_states if needed
+            if hasattr(self.vision_model, 'config'):
+                 # Default AIMv2 forward outputs hidden states, so maybe not needed?
+                 # Check AIMv2Model forward signature if issues arise.
+                 # Let's assume default is okay unless pooling requires specific hidden states.
+                 self.vision_model.config.output_hidden_states = True # Ensure it's true if needed
+                 print(f"  Set vision_model.config.output_hidden_states = {self.vision_model.config.output_hidden_states}")
+            else:
+                 print("  Warning: Cannot access vision_model.config to set output_hidden_states.")
+
+            # Get hidden dim
+            if hasattr(self.vision_model, 'config') and hasattr(self.vision_model.config, 'hidden_size'):
+                self.base_hidden_dim = self.vision_model.config.hidden_size
+            else:
+                 try: # Attempt fallback using known structure (less robust)
+                      self.base_hidden_dim = self.vision_model.trunk.post_trunk_norm.weight.shape[0]
+                 except Exception as e_dim:
+                      raise ValueError(f"Could not determine base model hidden dimension from loaded AIMv2 model: {e_dim}")
+
+            print(f"  Base model loaded via aim.v2. Hidden Dim: {self.base_hidden_dim}")
+
+        except Exception as e:
+            print(f"Details: {e}")
+            raise RuntimeError(f"Failed to load base vision model {base_model_name} using aim.v2.")
+
+        # --- Freeze Base Model ---
         if freeze_base_model:
             for param in self.vision_model.parameters():
                 param.requires_grad = False
-            self.vision_model.eval() # Set base to eval if frozen
+            self.vision_model.eval()
             print("  Base vision model frozen.")
         else:
-            self.vision_model.train() # Ensure base is trainable if not frozen
+            self.vision_model.train()
 
-        # --- Determine Input Features for Head ---
+        # --- Determine Input Features for Head (logic remains same) ---
         if head_features is None:
-            # If using CLS token or Avg/Attn pooling on hidden states, feature dim = base hidden dim
-            if self.pooling_strategy in ['cls', 'avg', 'attn']:
-                self.head_features = self.base_hidden_dim
+            if self.pooling_strategy in ['cls', 'avg', 'attn']: self.head_features = self.base_hidden_dim
             elif self.pooling_strategy == 'pooler':
-                # Pooler output size might differ (check config again)
-                pooler_dim = getattr(vision_config, 'projection_dim', self.base_hidden_dim) # Example check
-                self.head_features = pooler_dim
-            else:
-                 raise ValueError(f"Cannot determine head features for pooling strategy '{self.pooling_strategy}'. Please specify head_features.")
+                 # AIMv2 doesn't really have a 'pooler' output like CLIP/SigLIP
+                 print("Warning: Pooling strategy 'pooler' selected for AIMv2. Using 'cls' logic instead (first token).")
+                 self.head_features = self.base_hidden_dim
+                 self.pooling_strategy = 'cls' # Force change if pooler selected
+            else: raise ValueError(f"Cannot determine head features for pooling strategy '{self.pooling_strategy}'.")
             print(f"  Inferred head input features: {self.head_features}")
         else:
-             self.head_features = head_features # Use provided value
+             self.head_features = head_features
              print(f"  Using specified head input features: {self.head_features}")
 
-        # --- 2. Define Pooling Layer (if needed) ---
+
+        # --- 2. Define Pooling Layer ---
         self.pooler = None
         if self.pooling_strategy == 'attn':
              if self.head_features != self.base_hidden_dim: print("Warning: Attention pooling input dim mismatch? Using base_hidden_dim.")
              self.pooler = AttentionPool(
                  embed_dim=self.base_hidden_dim, # Attn operates on base hidden dim
-                 num_heads=attn_pool_heads,
-                 dropout=attn_pool_dropout
-             )
+                 num_heads=attn_pool_heads, dropout=attn_pool_dropout
+             ).to(device=self.device) # Move pooler to device
              print("  Using Attention Pooling layer.")
-        elif self.pooling_strategy not in ['cls', 'avg', 'pooler']:
-             raise ValueError(f"Invalid pooling_strategy: '{self.pooling_strategy}'. Choose 'cls', 'avg', 'attn', or 'pooler'.")
+        elif self.pooling_strategy not in ['cls', 'avg', 'pooler']: # 'pooler' now handled above
+             raise ValueError(f"Invalid pooling_strategy: '{self.pooling_strategy}'. Choose 'cls', 'avg', or 'attn'.")
+
 
         # --- 3. Define Predictor Head ---
-        # Slightly simplified head structure example (can reuse PredictorModel if adapted)
         print("Initializing Predictor Head...")
         self.head = nn.Sequential(
-            nn.LayerNorm(self.head_features), # Normalize input to head
+            nn.LayerNorm(self.head_features),
             nn.Linear(self.head_features, head_hidden_dim),
             nn.GELU(),
             nn.Dropout(head_dropout_rate),
-            # Optional ResBlocks (could add loop here)
             *[ResBlock(ch=head_hidden_dim) for _ in range(head_num_res_blocks)],
-            # Final layers
             nn.Linear(head_hidden_dim, head_hidden_dim // 4),
             nn.GELU(),
             nn.Dropout(head_dropout_rate),
             nn.Linear(head_hidden_dim // 4, head_num_classes)
-        )
+        ).to(device=self.device) # Move head to device
         self.head_output_mode = head_output_mode.lower()
         print(f"  Head initialized. Input: {self.head_features}, Output: {head_num_classes}, Mode: {self.head_output_mode}")
 
-        # --- 4. Optional: Final L2 Norm (if needed for specific base models) ---
-        self.needs_final_norm = "dinov2" in base_model_name.lower() and self.pooling_strategy != 'pooler'
-        if self.needs_final_norm: print("  Will apply final L2 norm (DINOv2 detected).")
+        # --- 4. Optional: Final L2 Norm ---
+        self.needs_final_norm = False # AIMv2 features are typically used directly
+        # self.needs_final_norm = "dinov2" in base_model_name.lower() and self.pooling_strategy != 'pooler'
+        # if self.needs_final_norm: print("  Will apply final L2 norm (DINOv2 detected).")
 
-
-    def forward(self, pixel_values, attention_mask=None, spatial_shapes=None): # Match potential inputs
+    # Version 1.1.2: Removed unnecessary detach()
+    def forward(self, pixel_values, attention_mask=None, spatial_shapes=None):
 
         # --- Run Base Vision Model ---
-        # Prepare inputs based on model type (DINOv2 doesn't use mask/shapes usually)
-        model_kwargs = {"pixel_values": pixel_values.to(dtype=self.compute_dtype)}
-        if attention_mask is not None and not self.needs_final_norm: # Pass mask if not DINO
-             model_kwargs["attention_mask"] = attention_mask
-        if spatial_shapes is not None and not self.needs_final_norm: # Pass shapes if not DINO
-             model_kwargs["spatial_shapes"] = spatial_shapes # Assuming tensor already
+        input_pixels_tensor = pixel_values.to(dtype=self.compute_dtype)
+        request_features = (self.pooling_strategy != 'pooler') or (self.extract_layer != -1)
+        outputs_tuple = self.vision_model(input_pixels_tensor, output_features=request_features)
 
-        outputs = self.vision_model(**model_kwargs)
-
-        # --- Extract Features based on Strategy ---
-        features = None
-        if self.pooling_strategy == 'cls':
-            # Assumes last_hidden_state is available and CLS is first token
-            last_hidden = outputs.last_hidden_state # Shape: [B, SeqLen, Hidden]
-            features = last_hidden[:, 0] # Take CLS token -> [B, Hidden]
-        elif self.pooling_strategy == 'avg':
-            # Assumes last_hidden_state is available
-            last_hidden = outputs.last_hidden_state # Shape: [B, SeqLen, Hidden]
-            # Average pool patch tokens (optional: exclude CLS token?)
-            features = torch.mean(last_hidden[:, 1:], dim=1) # Avg pool sequence dim -> [B, Hidden]
-        elif self.pooling_strategy == 'attn':
-            # Assumes last_hidden_state is available
-            last_hidden = outputs.last_hidden_state # Shape: [B, SeqLen, Hidden]
-            features = self.pooler(last_hidden) # Apply attention pooling -> [B, HeadFeatures]
-        elif self.pooling_strategy == 'pooler':
-            # Use the default pooled output if available
-            if not hasattr(outputs, 'pooler_output') or outputs.pooler_output is None:
-                 # Fallback needed if model doesn't have pooler (like some DINOv2)
-                 print("Warning: Pooling strategy 'pooler' selected but no pooler_output found. Falling back to CLS token.")
-                 last_hidden = outputs.last_hidden_state
-                 features = last_hidden[:, 0]
+        # --- Unpack and Select Base Features ---
+        if request_features: # ... (unpack logic) ...
+            # ... select base_features_raw from hidden_states_tuple or base_output_raw ...
+            if isinstance(outputs_tuple, tuple) and len(outputs_tuple) == 2:
+                base_output_raw, hidden_states_tuple = outputs_tuple
             else:
-                 features = outputs.pooler_output # Shape: [B, PoolerDim]
-        else:
-             # Should be caught in init
-             raise RuntimeError("Invalid pooling strategy in forward pass.")
+                base_output_raw = outputs_tuple; hidden_states_tuple = None
 
-        # --- Optional Final L2 Normalization ---
+            if self.extract_layer == -1 and hidden_states_tuple: base_features_raw = hidden_states_tuple[-1]
+            elif hidden_states_tuple and 0 <= self.extract_layer < len(hidden_states_tuple): base_features_raw = hidden_states_tuple[self.extract_layer]
+            else: base_features_raw = base_output_raw # Use output after trunk norm as fallback
+
+        else: # 'pooler' strategy or no features requested
+             base_output_raw = outputs_tuple
+             hidden_states_tuple = None
+             base_features_raw = base_output_raw # Output from vision_model.head is likely already pooled
+
+        if base_features_raw is None: exit("Error: Could not determine base_features_raw.")
+
+
+        # <<< --- NO DETACH HERE --- >>>
+        # Process the features directly, allowing gradients to flow back to pooler if needed
+        features_to_pool_or_use = base_features_raw
+
+
+        # --- Pool Features ---
+        pooled_features = None
+        # Check if features_to_pool_or_use is already pooled (e.g. from vision_model's internal head)
+        # Heuristic: If pooling was 'pooler' or ndim is not 3 (Batch, Seq, Dim)
+        is_already_pooled = (self.pooling_strategy == 'pooler' or features_to_pool_or_use.ndim != 3)
+
+        if is_already_pooled:
+            pooled_features = features_to_pool_or_use # Use directly
+            # print("DEBUG Forward: Using features directly (assumed pre-pooled or not sequence).")
+        elif self.pooling_strategy == 'cls':
+            # print("Warning: 'cls' pooling not applicable to AIMv2VisionEncoder. Using AVG.")
+            pooled_features = torch.mean(features_to_pool_or_use, dim=1)
+        elif self.pooling_strategy == 'avg':
+            pooled_features = torch.mean(features_to_pool_or_use, dim=1)
+            # print("DEBUG Forward: Using AVG pooling.")
+        elif self.pooling_strategy == 'attn':
+            if self.pooler is not None: pooled_features = self.pooler(features_to_pool_or_use) # <<< Pooler operates on original features >>>
+            else: pooled_features = torch.mean(features_to_pool_or_use, dim=1) # Fallback AVG
+            # print("DEBUG Forward: Using ATTN pooling.")
+        else: # Fallback
+            pooled_features = torch.mean(features_to_pool_or_use, dim=1)
+
+
+        # --- Optional Final L2 Norm ---
         if self.needs_final_norm:
-             features = F.normalize(features.float(), p=2, dim=-1).to(dtype=self.compute_dtype)
+             pooled_features = F.normalize(pooled_features.float(), p=2, dim=-1).to(dtype=self.compute_dtype)
 
         # --- Run Predictor Head ---
-        # Head expects FP32 input? Or match compute_dtype? Let's try FP32 for stability.
-        logits = self.head(features.to(torch.float32))
+        logits = self.head(pooled_features.to(torch.float32))
 
         # --- Apply Head Output Activation ---
-        if self.head_output_mode == 'linear':
-            output = logits
-        elif self.head_output_mode == 'sigmoid':
-            output = torch.sigmoid(logits)
-        elif self.head_output_mode == 'softmax':
-            output = F.softmax(logits, dim=-1)
-        elif self.head_output_mode == 'tanh_scaled':
-            output = (torch.tanh(logits) + 1.0) / 2.0
-        else:
-            raise RuntimeError(f"Invalid head_output_mode '{self.head_output_mode}'.")
-
-        # Squeeze if single class output
-        if output.shape[-1] == 1 and output.ndim > 1:
-            output = output.squeeze(-1)
+        if self.head_output_mode == 'linear': output = logits
+        elif self.head_output_mode == 'sigmoid': output = torch.sigmoid(logits)
+        elif self.head_output_mode == 'softmax': output = F.softmax(logits, dim=-1)
+        elif self.head_output_mode == 'tanh_scaled': output = (torch.tanh(logits) + 1.0) / 2.0
+        else: raise RuntimeError(f"Invalid head_output_mode '{self.head_output_mode}'.")
+        if output.shape[-1] == 1 and output.ndim > 1: output = output.squeeze(-1)
 
         return output

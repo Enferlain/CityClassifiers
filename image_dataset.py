@@ -13,6 +13,54 @@ import traceback
 # List of common image extensions
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp"]
 
+
+# <<< NEW Function: collate_group_by_size >>>
+def collate_group_by_size(batch):
+    """
+    Custom collate function that groups samples by the shape of their 'pixel_values'.
+
+    Args:
+        batch (list): A list of dictionaries, where each dict is a sample
+                      from ImageFolderDataset (e.g., {'pixel_values': tensor, 'label': tensor}).
+
+    Returns:
+        list: A list where each element is a dictionary representing a mini-batch.
+              Samples with the same pixel_values shape are stacked together.
+              Returns None if the input batch is empty after filtering None items.
+    """
+    # 1. Filter out None items (e.g., from failed loads/transforms)
+    batch = [item for item in batch if item is not None and 'pixel_values' in item and 'label' in item]
+    if not batch:
+        # print("Warning: collate_group_by_size received empty batch after filtering.")
+        return None # Return None if the whole batch is invalid
+
+    # 2. Group samples by the shape of their 'pixel_values'
+    #    Using defaultdict makes grouping easy
+    grouped_by_shape = defaultdict(list)
+    for sample in batch:
+        # Use tensor.shape as the key (it's hashable)
+        shape_key = sample['pixel_values'].shape
+        grouped_by_shape[shape_key].append(sample)
+
+    # 3. Create the output list of mini-batches
+    output_batch_list = []
+    for shape, samples in grouped_by_shape.items():
+        # Stack tensors for samples in this group
+        # Use default_collate on the list of samples for this shape
+        # This handles stacking 'pixel_values', 'label', and any other tensors properly
+        try:
+            # Use the standard default_collate for stacking within the group
+            stacked_group = torch.utils.data.dataloader.default_collate(samples)
+            output_batch_list.append(stacked_group)
+        except Exception as e_stack:
+            # This shouldn't happen if grouping worked, but handle just in case
+            print(f"Error stacking group with shape {shape}: {e_stack}")
+            # Optionally, add individual samples as fallback? For now, skip group on error.
+            continue
+
+    return output_batch_list
+# <<< End NEW Function >>>
+
 # --- Helper: Collate function to handle potential None from failed loads ---
 def collate_skip_none(batch):
     """Collate function that filters out None items."""
@@ -191,16 +239,16 @@ class ImageFolderDataset(Dataset):
         if not self.val_items:
             print("Validation set is empty.")
             return None
-        # Use a simple sub-dataset for validation items
         val_dataset = ValidationSubDataset(self.val_items, self.transform)
         return DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False, # No shuffle for validation
             drop_last=False,
-            pin_memory=False, # Generally False for PIL loading
+            pin_memory=False,
             num_workers=num_workers,
-            collate_fn=collate_skip_none # Use the collate function to handle None items
+            # <<< Use collate_group_by_size for validation too! >>>
+            collate_fn=collate_group_by_size
         )
 
 # --- Simple Validation Dataset Wrapper ---

@@ -1,109 +1,83 @@
-# config/anatomy_aimv2_native_e2e.yaml (Example)
+# config/anatomy_aimv2_native_e2e.yaml
+# Configuration for End-to-End Anatomy Flaw classification using AIMv2 Native
 
 # --- Model Identification & Type ---
 model:
   base: "AnatomyFlaws"
-  rev: "v8.0_adabelief_fl_AIMv2Native_3000" # Example revision name
+  rev: "v8.0_adabelief_fl_AIMv2Native_3000" # Revision for filenames
   arch: class
-  is_end_to_end: true
-  embed_ver: "AIMv2_Native_attnpool" # Custom key, not used by get_embed_params
-  # <<< Set the Base Vision Model >>>
-  base_vision_model: "apple/aimv2-large-patch14-native"
+  is_end_to_end: true                         # <<< Specify End-to-End Mode >>>
+  base_vision_model: "apple/aimv2-large-patch14-native" # <<< Base model for E2E >>>
 
-# --- EarlyExtractAnatomyModel Params ---
-# These are now read directly by the model's __init__ via getattr(args,...)
-# Feature extraction settings
-extract_layer: -1             # Use last hidden state (default)
-pooling_strategy: 'attn'       # Choose 'avg', 'cls' (might fail if no CLS), or 'attn'
-freeze_base_model: true       # Keep base frozen initially
-output_mode: sigmoid
+  # --- Early Feature Extraction / Base Model Settings ---
+  extract_layer: -1                           # Use last hidden state (default)
+  pooling_strategy: 'attn'                    # Pooling: 'cls', 'avg', 'attn', 'pooler'
+  freeze_base_model: true                     # Freeze the base vision model weights?
 
-# Predictor head settings (prefix with 'head_')
-head_hidden_dim: 1024         # Match AIMv2 hidden size? Or keep 1280? Let's try 1024.
-# head_num_classes: 2        # Determined automatically from labels
-head_num_res_blocks: 3        # Start with fewer blocks for end-to-end?
-head_dropout_rate: 0.218        # Use higher dropout due to potential overfitting
-head_output_mode: 'sigmoid'    # Use linear for Focal/CE loss
+  # --- Attention Pooling Settings (Only used if pooling_strategy='attn') ---
+  attn_pool_heads: 16                         # Heads for the Attention Pooling layer
+  attn_pool_dropout: 0.218                    # Dropout for the Attention Pooling layer
 
-# Attention pooling settings (only needed if pooling_strategy='attn')
-attn_pool_heads: 16
-attn_pool_dropout: 0.218
+# --- Head Parameters (for EarlyExtractAnatomyModel's head) ---
+head_params:
+  hidden_dim: 1024                            # Hidden dimension for the classification head
+  num_res_blocks: 3                           # Number of ResBlocks in the head
+  dropout_rate: 0.218                         # Dropout rate within the head's down block
+  output_mode: sigmoid                        # 'linear', 'sigmoid', 'softmax', 'tanh_scaled'
 
 # --- Training Parameters ---
 train:
   # --- Training Duration ---
-  max_train_steps: 10000      # Start with 10k steps, adjust based on convergence speed
+  max_train_steps: 1000   # Max total steps (batches processed)
+  # max_train_epochs:
 
   # --- Core Settings ---
-  # <<< Lower LR for end-to-end (even with frozen base) is often safer >>>
-  lr: 1e-5                   # Start much lower than before!
-  batch: 16                  # Use a moderate batch size (adjust based on VRAM)
-  precision: "fp32"          # Use bf16/fp16 if possible for speed/memory
+  lr: 1e-4                                    # Learning rate (Low for frozen base or fine-tuning)
+  batch: 4                                   # Batch size per device
+  precision: "bf16"                           # Training precision: "fp32", "fp16", "bf16"
 
   # --- Loss Function ---
-  loss_function: "focal"
-  focal_loss_gamma: 2.0
+  loss_function: "focal"                      # Loss: 'crossentropy', 'focal', 'bce', 'l1', 'mse', 'nll', 'ghm'
+  focal_loss_gamma: 2.0                       # Gamma for Focal Loss
 
   # --- Optimizer ---
-  # Name MUST be lowercase and match a key in optimizer.OPTIMIZERS dictionary (or 'adamw').
-  optimizer: "adabelief"       # Optimizer choice (string). Defaults to 'AdamW' if omitted.
-
-  # -- Optimizer Hyperparameters --
-  # Only specify args here IF you want to OVERRIDE the optimizer's own internal defaults.
-  # train.py will dynamically pass any args here matching the chosen optimizer's __init__ signature.
-  # Example overrides (check optimizer's code for valid args and defaults):
-  betas: [0.9, 0.95]      # List/tuple of 2 floats
-  eps: 1e-8                # Float
-  weight_decay: 1e-3       # Float
-  rectify: true            # Example bool arg for AdaBelief/RAdam variants
-  weight_decouple: true    # Example bool arg for AdamW/AdaBelief variants
-  clip_threshold: 1.0      # Example float arg for CAME
+  optimizer: "adabelief"                      # Optimizer name (lowercase, from optimizer/ or 'adamw')
+  # -- Optimizer Hyperparameter Overrides (Optional) --
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  weight_decay: 1e-3
+  rectify: true
+  weight_decouple: true
+  # clip_threshold: 1.0 # Example for CAME
 
   # --- Scheduler ---
-  # Ignored if using a ScheduleFree optimizer (name contains 'schedulefree').
-  # Specify scheduler by name (lowercase, matching optimizer.SCHEDULERS or standard torch names like 'cosineannealinglr', 'linearlr').
-  # Use 'None' (as string or null) if no scheduler is desired.
-  scheduler_name: "RexAnnealingWarmRestarts" # Defaults to 'CosineAnnealingLR' if omitted and not schedule-free.
-
-  # -- Scheduler Arguments --
-  # For CUSTOM schedulers (from optimizer folder), prefix args with 'scheduler_'.
-  # For STANDARD torch schedulers, use specific args OR the generic 'scheduler_t_max' / 'scheduler_eta_min'.
-  # Check the scheduler's __init__ signature for valid args.
-
-  # Example Args for CosineAnnealingWarmRestarts / RexAnnealingWarmRestarts:
-  scheduler_gamma: 0.95                     # Decay factor for max LR on restart (float)
-  scheduler_cycle_multiplier: 1.0           # Multiplier for cycle length after restart (float)
-  scheduler_first_cycle_max_steps: 3000     # Duration of first cycle in steps (int, usually == max_train_steps)
-  scheduler_min_lr: 1e-7                    # Minimum LR (float)
-  scheduler_warmup_steps: 500               # Warmup steps *within each cycle* if scheduler supports it (int)
-  # scheduler_d: 0.9                        # Example arg specific to Rex
-  r_sf: 0.0                                 # R value for ScheduleFree (float)
-  wlpow_sf: 2.0                             # Weight LR Power for ScheduleFree (float)
-  state_precision: parameter                # Precision for optimizer state in ScheduleFree (parameter or float32)
-
-  # Example Args for Standard CosineAnnealingLR:
-  # scheduler_t_max: 100000 # Optional: Override T_max (defaults to max_train_steps)
-  # scheduler_eta_min: 0    # Optional: Override eta_min (defaults to 0)
-
-  # Example Args for Standard LinearLR (use scheduler_name: 'LinearLR'):
-  # warmup_steps: 5000      # <<< Use THIS key for LinearLR total warmup iterations (int)
+  scheduler_name: "RexAnnealingWarmRestarts"  # Scheduler name (lowercase, from optimizer/ or standard torch, or None)
+  # -- Scheduler Argument Overrides (Optional, prefix custom with 'scheduler_') --
+  scheduler_gamma: 0.95
+  scheduler_cycle_multiplier: 1.0
+  scheduler_first_cycle_max_steps: 300      # <<< Match max_train_steps for single cycle >>>
+  scheduler_min_lr: 1e-7
+  scheduler_warmup_steps: 100                 # Warmup steps (used by some schedulers)
+  r_sf: 0.0 # Example for ScheduleFree
+  wlpow_sf: 2.0 # Example for ScheduleFree
+  state_precision: parameter # Example for ScheduleFree qfp8
 
   # --- Data & Other ---
-  val_split_count: 300       # Samples PER CLASS for validation set (300 bad, 300 good)
+  val_split_count: 100                       # Samples PER CLASS for validation
   seed: 218
-  num_workers: 4             # Can use more workers for image loading
-  preload_data: false        # Cannot preload images easily
-  nsave: 1000                # Save every 1000 steps
+  num_workers: 0                              # Dataloader workers
+  preload_data: false                         # Should be false for E2E image loading
+  nsave: 500                                 # Save periodic checkpoint frequency (steps)
 
 # --- Data Root ---
-# <<< Point this to the folder containing the RAW image class folders (0/, 1/) >>>
-# <<< Make sure this contains the 3000 original + flipped images >>>
-data_root: "anatomy" # Example path
+# Parent folder containing the raw image class folders (e.g., anatomy/0/, anatomy/1/)
+data_root: "anatomy"
 
 # --- Logging ---
-wandb_project: "city-classifiers" # Maybe use a different project name
+wandb_project: "city-classifiers"             # WandB project name
 
 # --- Labels ---
+# Define classes. Keys must match folder names. 'name' is for display, 'loss' is optional weight.
 labels:
  '0': { name: "Bad Anatomy", loss: 1.0 }
  '1': { name: "Good Anatomy", loss: 1.0 }

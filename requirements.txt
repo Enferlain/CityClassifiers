@@ -1,7 +1,7 @@
 Pillow
 tqdm
-#open_clip_torch>=2.23.0
-#torch==2.1.0
+# open_clip_torch>=2.23.0
+# torch==2.1.0
 accelerate>=0.24.1
 safetensors>=0.4.0
 transformers>=4.35.0
@@ -14,3 +14,5 @@ matplotlib
 bitsandbytes
 sentencepiece
 timm
+# git+https://github.com/apple/ml-aim.git#subdirectory=aim-v1
+git+https://github.com/apple/ml-aim.git#subdirectory=aim-v2
