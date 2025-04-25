@@ -65,10 +65,10 @@ train:
   # --- Data & Other ---
   val_split_count: 100                       # Samples PER CLASS for validation
   seed: 218
-  num_workers: 0                              # Dataloader workers
-  preload_data: false                         # Should be false for E2E image loading
+  num_workers: 0                             # Dataloader workers
+  preload_data: false                        # Should be false for E2E image loading
   nsave: 500                                 # Save periodic checkpoint frequency (steps)
-
+  save_full_model: true                      # Save full state dict along with base model if in e2e
 # --- Data Root ---
 # Parent folder containing the raw image class folders (e.g., anatomy/0/, anatomy/1/)
 data_root: "anatomy"

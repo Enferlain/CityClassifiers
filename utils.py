@@ -19,6 +19,229 @@ LOSS_MEMORY = 500 # How many recent steps' training loss to average for display
 SAVE_FOLDER = "models" # Folder to save models and configs
 
 
+# --- Argument Parsing and Config Loading ---
+# Version 3.0.0: Loads ONLY from YAML config, supports 3 data modes.
+def parse_and_load_args(config_path: str):
+    """
+    Loads configuration SOLELY from a YAML file based on specified data_mode.
+
+    Args:
+        config_path (str): Path to the YAML configuration file.
+
+    Returns:
+        argparse.Namespace: Populated namespace object with configuration values.
+    """
+    # Load YAML config
+    if not os.path.isfile(config_path):
+         raise FileNotFoundError(f"Config file '{config_path}' not found.")
+    try:
+        with open(config_path) as f:
+            conf = yaml.safe_load(f)
+    except Exception as e:
+         raise ValueError(f"Error loading YAML config '{config_path}': {e}") from e
+
+    args = argparse.Namespace()
+    args.config_path = config_path # Store config path for reference
+
+    # --- Helper to get required value from nested dict ---
+    def get_required_config(key_path, config_dict):
+        keys = key_path.split('.')
+        value = config_dict
+        try:
+            for key in keys:
+                value = value[key]
+            if value is None: raise KeyError # Treat None as missing for required keys
+            return value
+        except (KeyError, TypeError):
+             raise ValueError(f"Missing required configuration key: '{key_path}' in {config_path}")
+
+    # --- Helper to get optional value ---
+    def get_optional_config(key_path, config_dict, default=None):
+         keys = key_path.split('.')
+         value = config_dict
+         try:
+             for key in keys: value = value[key]
+             # Return default if YAML value is explicitly None, otherwise return YAML value
+             return default if value is None else value
+         except (KeyError, TypeError):
+             return default # Return default if key path doesn't exist
+
+    # --- Load Common / Top-Level Settings ---
+    args.data_root = get_optional_config("data_root", conf, default="data")
+    args.wandb_project = get_optional_config("wandb_project", conf, default="city-classifiers")
+    args.resume = get_optional_config("resume", conf, default=None) # Allow resuming
+
+    # --- Load Model Info ---
+    args.base = get_required_config("model.base", conf)
+    args.rev = get_required_config("model.rev", conf)
+    args.arch = get_optional_config("model.arch", conf, default="class")
+    args.name = f"{args.base}-{args.rev}"
+
+    # --- Load Data Mode ---
+    args.data_mode = get_required_config("data.mode", conf) # e.g., 'embeddings', 'features', 'images'
+
+    # --- Mode-Specific Loading ---
+    if args.data_mode == 'embeddings':
+        print("DEBUG: Loading config for EMBEDDINGS mode...")
+        args.is_end_to_end = False # Explicitly set mode flag
+        args.embed_ver = get_required_config("data.embed_ver", conf)
+        args.preload_data = get_optional_config("train.preload_data", conf, default=True)
+
+        # Get embed params
+        try: embed_params = get_embed_params(args.embed_ver)
+        except ValueError as e: raise ValueError(f"Config Error: {e}") from e
+        args.features = embed_params['features'] # Required
+        default_hidden = embed_params.get('hidden', 1280)
+
+        # Load PredictorModel params (optional section?)
+        predictor_conf = get_optional_config("predictor_params", conf, default={})
+        args.hidden_dim = predictor_conf.get("hidden_dim", default_hidden)
+        args.use_attention = predictor_conf.get("use_attention", True)
+        args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
+        args.attn_dropout = predictor_conf.get("attn_dropout", 0.1)
+        args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
+        args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
+        args.output_mode = get_required_config("predictor_params.output_mode", conf)
+
+    elif args.data_mode == 'features':
+        print("DEBUG: Loading config for FEATURES mode...")
+        args.is_end_to_end = False # This mode trains head only
+        args.feature_dir_name = get_required_config("data.feature_dir_name", conf)
+        args.preload_data = False # Cannot preload features easily
+
+        # Load HeadModel params
+        head_conf = get_optional_config("head_params", conf, default={})
+        args.head_features = get_required_config("head_params.features", conf) # Input feature dim MUST be specified
+        args.head_hidden_dim = head_conf.get("hidden_dim", 1024)
+        args.pooling_strategy = head_conf.get("pooling_strategy", 'attn') # Head pooling strategy
+        args.head_num_res_blocks = head_conf.get("num_res_blocks", 2)
+        args.head_dropout_rate = head_conf.get("dropout_rate", 0.2)
+        args.head_output_mode = get_required_config("head_params.output_mode", conf)
+
+        # Load Attn Pool specific args (if needed)
+        if args.pooling_strategy == 'attn':
+            attn_conf = get_optional_config("attn_pool_params", conf, default={})
+            args.attn_pool_heads = attn_conf.get("attn_pool_heads", 8)
+            args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.1)
+
+    elif args.data_mode == 'images':
+        print("DEBUG: Loading config for E2E IMAGES mode...")
+        args.is_end_to_end = True # This is the E2E mode flag
+        args.base_vision_model = get_required_config("model.base_vision_model", conf)
+        args.preload_data = False # Cannot preload images
+
+        # Load EarlyExtract specific args (optional section?)
+        e2e_conf = get_optional_config("e2e_params", conf, default={})
+        args.extract_layer = e2e_conf.get("extract_layer", -1)
+        args.pooling_strategy = e2e_conf.get("pooling_strategy", 'attn') # Pooling after base model
+        args.freeze_base_model = e2e_conf.get("freeze_base_model", True)
+
+        # Load Head specific args
+        head_conf = get_optional_config("head_params", conf, default={})
+        args.head_hidden_dim = head_conf.get("hidden_dim", 1024)
+        args.head_num_res_blocks = head_conf.get("num_res_blocks", 2)
+        args.head_dropout_rate = head_conf.get("dropout_rate", 0.2)
+        args.head_output_mode = get_required_config("head_params.output_mode", conf)
+
+        # Load Attn Pool specific args (if needed)
+        if args.pooling_strategy == 'attn':
+            attn_conf = get_optional_config("attn_pool_params", conf, default={})
+            args.attn_pool_heads = attn_conf.get("attn_pool_heads", 8)
+            args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.1)
+    else:
+        raise ValueError(f"Invalid data.mode '{args.data_mode}' in config. Must be 'embeddings', 'features', or 'images'.")
+
+    # --- Load Training Params (Common to all modes) ---
+    train_conf = get_required_config("train", conf) # Train section is required
+    args.lr = get_optional_config("lr", train_conf, default=1e-4)
+    args.batch = get_optional_config("batch", train_conf, default=4)
+    args.loss_function = get_optional_config("loss_function", train_conf) # Default set later based on arch
+    args.optimizer = get_optional_config("optimizer", train_conf, default='AdamW')
+    args.betas = get_optional_config("betas", train_conf) # Let default be handled by optimizer
+    args.eps = get_optional_config("eps", train_conf)
+    args.weight_decay = get_optional_config("weight_decay", train_conf)
+    args.max_train_epochs = get_optional_config("max_train_epochs", train_conf)
+    args.max_train_steps = get_optional_config("max_train_steps", train_conf)
+    args.precision = get_optional_config("precision", train_conf, default='fp32')
+    args.nsave = get_optional_config("nsave", train_conf, default=0) # Default 0 = disabled
+    args.val_split_count = get_optional_config("val_split_count", conf.get("data",{}), default=0) # Look in data section too
+    args.seed = get_optional_config("seed", train_conf, default=42)
+    args.num_workers = get_optional_config("num_workers", train_conf, default=0)
+    args.save_full_model = get_optional_config("save_full_model", train_conf, default=False)
+    args.log_every_n = get_optional_config("log_every_n", train_conf, default=50)
+    args.validate_every_n = get_optional_config("validate_every_n", train_conf, default=0) # Default 0 = disabled
+
+    # Copy ALL OTHER keys from train_conf (for optimizer/scheduler specific args)
+    known_train_keys = {'lr', 'batch', 'loss_function', 'optimizer', 'betas', 'eps',
+                        'weight_decay', 'max_train_epochs', 'max_train_steps', 'precision',
+                        'nsave', 'seed', 'num_workers', 'preload_data', 'save_full_model',
+                        'log_every_n', 'validate_every_n'}
+    for key, value in train_conf.items():
+         # Convert lists to tuples for consistency if they are likely hyperparameters
+         if isinstance(value, list): value = tuple(value)
+         # Set attribute if not already handled and not None
+         if key not in known_train_keys and not hasattr(args, key) and value is not None:
+              setattr(args, key, value)
+
+    # --- Load Labels/Weights (Only relevant for arch: class) ---
+    if args.arch == "class":
+        labels_conf = get_optional_config("labels", conf, default={})
+        args.labels = None; args.weights = None; args.num_labels = 0
+        if labels_conf:
+            # Filter for digit keys AFTER loading the whole section
+            valid_labels = {str(k): v for k, v in labels_conf.items() if str(k).isdigit()}
+            if valid_labels:
+                args.labels = {k: v.get("name", k) for k, v in valid_labels.items()}
+                try: args.num_labels = max(int(k) for k in args.labels.keys()) + 1
+                except ValueError: args.num_labels = 0
+                if args.num_labels > 0:
+                    weights = [1.0] * args.num_labels
+                    for k_str, label_conf in valid_labels.items():
+                        try: weights[int(k_str)] = float(label_conf.get("loss", 1.0))
+                        except (ValueError, IndexError, TypeError): pass
+                    args.weights = weights
+        # If no valid labels found or specified, num_labels remains 0 or 1 (handled later)
+        if args.num_labels == 0: args.num_labels = 2 # Default to 2 classes if none specified
+    else: # arch: score
+         args.labels = None; args.weights = None; args.num_labels = 1
+
+
+    # --- Final Validation / Defaults ---
+    if args.arch == "score" and args.loss_function is None: args.loss_function = 'l1'
+    if args.arch == "class" and args.loss_function is None: args.loss_function = 'focal'
+    if args.max_train_epochs is None and args.max_train_steps is None: args.max_train_steps = 10000 # Default steps
+
+
+    # Validate output modes were set for relevant modes
+    if args.data_mode == 'embeddings' and not hasattr(args, 'output_mode'): raise ValueError("Missing predictor_params.output_mode for embeddings mode.")
+    if args.data_mode == 'features' and not hasattr(args, 'head_output_mode'): raise ValueError("Missing head_params.output_mode for features mode.")
+    if args.data_mode == 'images' and not hasattr(args, 'head_output_mode'): raise ValueError("Missing head_params.output_mode for images (E2E) mode.")
+
+    return args
+# --- End Argument Parsing ---
+
+
+# --- write_config Function (Needs update to reflect new structure) ---
+def write_config(args):
+    """Writes the final training configuration based on args Namespace."""
+    # Convert Namespace to dict, remove sensitive/unneeded info if any
+    conf_to_save = vars(args).copy()
+    # Remove things we don't need to save? e.g., config_path itself?
+    conf_to_save.pop('config_path', None)
+    # Maybe structure it back into nested dicts for readability? (Optional)
+
+    os.makedirs(SAVE_FOLDER, exist_ok=True)
+    # Use args.name which should be defined
+    config_path_out = f"{SAVE_FOLDER}/{getattr(args, 'name', 'config')}.config.json"
+    try:
+        with open(config_path_out, "w") as f:
+            # Use repr for non-serializable items like functions or types if any crept in
+            f.write(json.dumps(conf_to_save, indent=2, default=repr))
+        print(f"Saved final effective training config to {config_path_out}")
+    except Exception as e:
+        print(f"Error saving config file {config_path_out}: {e}")
+
+
 # --- Parameter Dictionary ---
 # Version 2.4.0: Added DINOv2 and final NaFlex types
 def get_embed_params(ver):
@@ -58,401 +281,175 @@ def get_embed_params(ver):
 # --- End Parameter Dictionary ---
 
 
-# --- Argument Parsing and Config Loading ---
-# Version 2.6.0: Handles is_end_to_end flag and associated parameters
-def parse_and_load_args():
-    """
-    Parses command line args and merges with YAML config.
-    Handles conditional loading of parameters based on 'is_end_to_end'.
-    Command line args take precedence over YAML.
-    """
-    parser = argparse.ArgumentParser(description="Train aesthetic predictor/classifier or end-to-end model")
-    # --- Command Line Arguments ---
-    parser.add_argument("--config", required=True, help="Training config YAML file")
-    parser.add_argument('--resume', help="Checkpoint (.safetensors model file) to resume from")
-    # Training Duration Overrides
-    parser.add_argument('--max_train_epochs', type=int, default=None, help="Override: Train for a specific number of epochs.")
-    parser.add_argument('--max_train_steps', type=int, default=None, help="Override: Train for a specific number of steps (takes priority).")
-    # Other Overrides (Keep these common ones)
-    parser.add_argument('--precision', type=str, default=None, choices=['fp32', 'fp16', 'bf16'], help='Override training precision.')
-    parser.add_argument("--nsave", type=int, default=None, help="Override save frequency (steps).")
-    parser.add_argument("--val_split_count", type=int, default=None, help="Override validation split count.")
-    parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
-    parser.add_argument("--num_workers", type=int, default=None, help="Override dataloader workers.")
-    parser.add_argument("--preload_data", action=argparse.BooleanOptionalAction, default=None, help="Override data preloading (only embedding mode).")
-    parser.add_argument("--data_root", type=str, default=None, help="Override data root directory.")
-    parser.add_argument("--wandb_project", type=str, default=None, help="Override WandB project name.")
-    parser.add_argument('--optimizer', type=str, default=None, help='Override optimizer choice.')
-    parser.add_argument('--loss_function', type=str, default=None, help="Override loss function choice.")
-    parser.add_argument('--lr', type=float, default=None, help="Override learning rate.")
-    parser.add_argument('--betas', type=float, nargs='+', default=None, help="Override optimizer betas.") # Keep common overrides
-    parser.add_argument('--weight_decay', type=float, default=None, help='Override optimizer weight decay.')
-    parser.add_argument('--eps', type=float, default=None, help='Override optimizer epsilon.')
-    parser.add_argument('--batch', type=int, default=None, help='Override batch size.')
-    parser.add_argument('--freeze_base_model', action=argparse.BooleanOptionalAction, default=None, help="Override E2E base model freezing.")
+# ================================================
+#        Standalone Validation Functions
+# ================================================
 
-    cmd_args = parser.parse_args()
+@torch.no_grad()
+def run_validation_embeddings(model, val_loader, criterion, device, scaler):
+    """Runs validation loop for embedding-based models (stacked batches)."""
+    if val_loader is None: return float('nan')
+    model.eval()
+    autocast_enabled = scaler is not None and scaler.is_enabled()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    total_loss = 0.0
+    total_samples = 0
 
-    # Load YAML config
-    if not os.path.isfile(cmd_args.config): parser.error(f"Config file '{cmd_args.config}' not found.")
-    try:
-        with open(cmd_args.config) as f: conf = yaml.safe_load(f)
-    except Exception as e: parser.error(f"Error loading YAML config '{cmd_args.config}': {e}")
+    val_iterator = tqdm(val_loader, desc="Validation (Embeddings)", leave=False, dynamic_ncols=True)
+    for batch_data in val_iterator:
+        if batch_data is None or not batch_data: continue
+        try:
+            emb_input = batch_data.get("emb")
+            target_val = batch_data.get("val")
+            if emb_input is None or target_val is None: continue
 
-    args = argparse.Namespace() # Final args object
+            emb_input = emb_input.to(device)
+            target_val = target_val.to(device) # Type adjusted based on loss later
+            current_batch_size = emb_input.size(0)
 
-    # Helper function to get value prioritizing CMD > YAML > Default
-    def get_arg_value(arg_name, cmd_value, yaml_conf_section, yaml_key=None, default=None, expected_type=None):
-        if yaml_key is None: yaml_key = arg_name
-        yaml_value = yaml_conf_section.get(yaml_key, default)
-        final_value = cmd_value if cmd_value is not None else yaml_value
-        if final_value is not None and expected_type is not None:
-            try:
-                if expected_type == bool: # Handle BooleanOptionalAction properly
-                     if isinstance(final_value, str): # Convert string from YAML/CMD
-                          if final_value.lower() in ['true', '1', 'yes']: final_value = True
-                          elif final_value.lower() in ['false', '0', 'no']: final_value = False
-                          else: raise ValueError(f"Invalid boolean string '{final_value}'")
-                     final_value = bool(final_value)
-                elif expected_type == int: final_value = int(final_value)
-                elif expected_type == float: final_value = float(final_value)
-                elif expected_type == tuple and isinstance(final_value, list): final_value = tuple(final_value)
-            except (ValueError, TypeError):
-                print(f"Warning: Arg '{arg_name}' value '{final_value}' invalid for {expected_type}. Using default: {default}")
-                final_value = default
-        return final_value if final_value is not None else default
+            # Assume model output count is accessible, e.g., model.num_classes or determined by criterion
+            num_classes = getattr(model, 'num_classes', 1) # Get from model if possible
 
-    # --- Populate Args (Prioritize CMD > YAML > Default) ---
-    # Config path / Resume
-    args.config = cmd_args.config
-    args.resume = cmd_args.resume
-    # Basic Model Info
-    model_conf = conf.get("model", {})
-    args.base = model_conf.get("base", "unknown_model")
-    args.rev = model_conf.get("rev", "v0.0")
-    args.arch = model_conf.get("arch", "class")
-    args.name = f"{args.base}-{args.rev}"
+            # Prepare target
+            if num_classes == 1: target = target_val.to(dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
+            else: target = target_val.to(dtype=torch.long).view(current_batch_size)
 
-    # <<< Determine Mode: End-to-End or Embedding-based >>>
-    args.is_end_to_end = model_conf.get("is_end_to_end", False) # Default to False
+            with torch.amp.autocast(device_type=device, enabled=autocast_enabled, dtype=amp_dtype):
+                y_pred = model(emb_input) # Expects [B, Emb] -> [B, Classes] or [B]
 
-    if args.is_end_to_end:
-        print("DEBUG: Parsing args for End-to-End model.")
-        # --- End-to-End Specific Parameters ---
-        args.base_vision_model = model_conf.get("base_vision_model")
-        if not args.base_vision_model:
-             parser.error("Missing 'model.base_vision_model' in config for end-to-end model.")
+                y_pred_for_loss = y_pred
+                if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and num_classes == 1:
+                     if y_pred.ndim > 1 and y_pred.shape[-1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
 
-        # Load EarlyExtract specific args (assuming they are directly under 'model' or a dedicated section)
-        # Let's check directly under 'model' first for simplicity
-        args.extract_layer = model_conf.get("extract_layer", -1)
-        args.pooling_strategy = model_conf.get("pooling_strategy", 'attn')
-        args.freeze_base_model = get_arg_value('freeze_base_model', cmd_args.freeze_base_model, model_conf, default=True, expected_type=bool)
+                y_pred_final = y_pred_for_loss.to(torch.float32)
+                target_for_loss = target.to(y_pred_final.device)
 
-        # Load Head specific args (check 'head_params' or fallback to 'predictor_params')
-        head_conf = conf.get("head_params", conf.get("predictor_params", {}))
-        args.head_hidden_dim = head_conf.get("hidden_dim", 1024) # Default for head maybe 1024?
-        args.head_num_res_blocks = head_conf.get("num_res_blocks", 2)
-        args.head_dropout_rate = head_conf.get("dropout_rate", 0.2)
-        args.head_output_mode = head_conf.get("output_mode") # REQUIRED for head
-        if args.head_output_mode is None:
-            parser.error("Missing 'output_mode' in 'head_params' (or 'predictor_params') section for end-to-end model.")
+                # Calculate loss
+                if isinstance(criterion, nn.NLLLoss): loss = criterion(F.log_softmax(y_pred_final, dim=-1), target_for_loss.long())
+                elif isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, GHMC_Loss)): loss = criterion(y_pred_final, target_for_loss.long())
+                elif isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)): loss = criterion(y_pred_final, target_for_loss.float())
+                else: loss = torch.tensor(float('nan'), device=device)
 
-        # Load Attn Pool specific args (check 'attn_pool_params' or directly under 'model')
-        if args.pooling_strategy == 'attn':
-            attn_pool_conf = conf.get("attn_pool_params", model_conf)
-            args.attn_pool_heads = attn_pool_conf.get("attn_pool_heads", 8)
-            args.attn_pool_dropout = attn_pool_conf.get("attn_pool_dropout", 0.1)
+            if not math.isnan(loss.item()):
+                total_loss += loss.item() * current_batch_size
+                total_samples += current_batch_size
 
-        # Set embedding-specific args to None
-        args.embed_ver = None
-        args.features = None
-        args.hidden_dim = None
-        args.use_attention = None # Not applicable for E2E head structure shown
-        args.num_attn_heads = None
-        args.attn_dropout = None
-        args.output_mode = None # Use head_output_mode instead
+            if total_samples > 0: val_iterator.set_postfix({"AvgLoss": f"{(total_loss / total_samples):.4e}"})
 
-    else: # Embedding Path
-        print("DEBUG: Parsing args for Embedding-based model.")
-        # --- Embedding-based Specific Parameters ---
-        args.embed_ver = model_conf.get("embed_ver")
-        if not args.embed_ver:
-             parser.error("Missing 'model.embed_ver' in config for embedding-based model.")
-        args.base_vision_model = model_conf.get("base_vision_model", None) # Optional here
+        except Exception as e_val:
+            print(f"Error during embedding validation step: {e_val}")
+            traceback.print_exc(); continue # Skip batch on error
+        finally:
+             # Minimal cleanup for embedding mode
+             try: del emb_input, target_val, target, y_pred, y_pred_for_loss, loss
+             except NameError: pass
 
-        # Get defaults from embed_ver
-        try: embed_params = get_embed_params(args.embed_ver)
-        except ValueError as e: parser.error(f"Error getting embed params: {e}")
-        args.features = embed_params.get('features')
-        default_hidden = embed_params.get('hidden', 1280)
-
-        # Load PredictorModel specific args
-        predictor_conf = conf.get("predictor_params", {})
-        args.hidden_dim = predictor_conf.get("hidden_dim", default_hidden)
-        args.use_attention = predictor_conf.get("use_attention", True)
-        args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
-        args.attn_dropout = predictor_conf.get("attn_dropout", 0.1)
-        args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
-        args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
-        args.output_mode = predictor_conf.get("output_mode") # REQUIRED for predictor
-        if args.output_mode is None:
-            parser.error("Missing 'output_mode' in 'predictor_params' section for embedding-based model.")
-
-        # Set E2E specific args to None
-        args.extract_layer = None
-        args.pooling_strategy = None
-        args.freeze_base_model = None
-        args.head_hidden_dim = None
-        args.head_num_res_blocks = None
-        args.head_dropout_rate = None
-        args.head_output_mode = None
-        args.attn_pool_heads = None
-        args.attn_pool_dropout = None
-        # For embedding mode, data preload CAN be used
-        args.preload_data = get_arg_value('preload_data', cmd_args.preload_data, conf.get("train", {}), default=True, expected_type=bool)
-
-    # --- Training Params (Merged - applies to both modes) ---
-    train_conf = conf.get("train", {})
-    args.lr = get_arg_value('lr', cmd_args.lr, train_conf, default=1e-4, expected_type=float)
-    args.batch = get_arg_value('batch', cmd_args.batch, train_conf, default=4, expected_type=int)
-    args.loss_function = get_arg_value('loss_function', cmd_args.loss_function, train_conf) # Default set later
-    args.optimizer = get_arg_value('optimizer', cmd_args.optimizer, train_conf, default='AdamW')
-    # Common overrides
-    args.betas = get_arg_value('betas', cmd_args.betas, train_conf, expected_type=tuple)
-    args.eps = get_arg_value('eps', cmd_args.eps, train_conf, expected_type=float)
-    args.weight_decay = get_arg_value('weight_decay', cmd_args.weight_decay, train_conf, expected_type=float)
-    # Training duration (values will be calculated later in train.py)
-    args.max_train_epochs = get_arg_value('max_train_epochs', cmd_args.max_train_epochs, train_conf, default=None, expected_type=int)
-    args.max_train_steps = get_arg_value('max_train_steps', cmd_args.max_train_steps, train_conf, default=None, expected_type=int)
-
-    # Other Params (applies to both modes where relevant)
-    args.precision = get_arg_value('precision', cmd_args.precision, train_conf, default='fp32')
-    args.nsave = get_arg_value('nsave', cmd_args.nsave, train_conf, default=10000, expected_type=int)
-    args.val_split_count = get_arg_value('val_split_count', cmd_args.val_split_count, train_conf, default=0, expected_type=int)
-    args.seed = get_arg_value('seed', cmd_args.seed, train_conf, default=218, expected_type=int)
-    args.num_workers = get_arg_value('num_workers', cmd_args.num_workers, train_conf, default=0, expected_type=int)
-    # args.preload_data handled conditionally above
-    args.data_root = get_arg_value('data_root', cmd_args.data_root, conf, default="data") # Get from top level or default
-    args.wandb_project = get_arg_value('wandb_project', cmd_args.wandb_project, conf, default="city-classifiers") # Get from top level or default
-
-    # --- Copy ALL OTHER keys from train_conf directly into args ---
-    # Handles optimizer/scheduler specific args etc.
-    # <<< Define handled keys carefully based on above >>>
-    handled_keys_train = ['lr', 'batch', 'loss_function', 'optimizer', 'betas', 'eps', 'weight_decay',
-                           'max_train_epochs', 'max_train_steps', 'precision', 'nsave', 'val_split_count',
-                           'seed', 'num_workers', 'preload_data']
-    handled_keys_model = ['base', 'rev', 'arch', 'embed_ver', 'base_vision_model', 'is_end_to_end',
-                           'extract_layer', 'pooling_strategy', 'freeze_base_model'] # Basic model keys
-    handled_keys_pred = ['features', 'hidden_dim', 'use_attention', 'num_attn_heads', 'attn_dropout',
-                           'num_res_blocks', 'dropout_rate', 'output_mode'] # Predictor keys
-    handled_keys_head = ['head_hidden_dim', 'head_num_res_blocks', 'head_dropout_rate', 'head_output_mode'] # Head keys
-    handled_keys_attn = ['attn_pool_heads', 'attn_pool_dropout'] # Attn Pool keys
-    handled_keys_other = ['config', 'resume', 'data_root', 'wandb_project'] # Other top-level keys
-
-    all_handled_keys = set(handled_keys_train + handled_keys_model + handled_keys_pred + handled_keys_head + handled_keys_attn + handled_keys_other)
-
-    # Copy from train_conf
-    for key, value in train_conf.items():
-         if key not in all_handled_keys and not hasattr(args, key):
-              if isinstance(value, list): value = tuple(value)
-              setattr(args, key, value)
-    # Copy from predictor_params (if not handled)
-    predictor_conf = conf.get("predictor_params", {})
-    for key, value in predictor_conf.items():
-         if key not in all_handled_keys and not hasattr(args, key):
-              if isinstance(value, list): value = tuple(value)
-              setattr(args, key, value)
-    # Copy from head_params (if not handled)
-    head_conf = conf.get("head_params", {})
-    for key, value in head_conf.items():
-         if key not in all_handled_keys and not hasattr(args, key):
-              if isinstance(value, list): value = tuple(value)
-              setattr(args, key, value)
-    # --- End Copy ---
-
-    # --- Labels/Weights ---
-    labels_conf = conf.get("labels", {})
-    args.labels = None; args.weights = None; args.num_labels = 1 if args.arch == 'score' else 0
-    if args.arch == "class":
-        if labels_conf:
-            args.labels = {str(k): v.get("name", str(k)) for k, v in labels_conf.items() if str(k).isdigit()} # Ensure keys are digits
-            if args.labels:
-                 try: args.num_labels = max(int(k) for k in args.labels.keys()) + 1
-                 except ValueError: args.num_labels = 0 # Handle empty or non-digit keys
-            else: args.num_labels = 0 # If no valid digit keys found
-
-            if args.num_labels > 0:
-                weights = [1.0] * args.num_labels
-                for k_str, label_conf in labels_conf.items():
-                    if str(k_str).isdigit(): # Process only valid digit keys
-                        try: weights[int(k_str)] = float(label_conf.get("loss", 1.0))
-                        except (ValueError, IndexError): pass # Ignore bad index/value
-                args.weights = weights
-        else: args.num_labels = 2 # Default to 2 classes if none specified
-
-    # --- Final Validation ---
-    if args.arch == "score" and args.loss_function not in [None, 'l1', 'mse']:
-         args.loss_function = 'l1' # Default for score
-    valid_class_losses = [None, 'crossentropy', 'focal', 'bce', 'nll', 'ghm']
-    if args.arch == "class" and args.loss_function not in valid_class_losses:
-         args.loss_function = 'focal' # Default for class
-
-    # Validate output modes were set correctly earlier
-    if args.is_end_to_end and args.head_output_mode is None:
-        parser.error("Internal Error: head_output_mode is None for end-to-end path.")
-    if not args.is_end_to_end and args.output_mode is None:
-        parser.error("Internal Error: output_mode is None for embedding path.")
-
-    if args.max_train_epochs is None and args.max_train_steps is None:
-         print("Warning: Neither max_train_epochs nor max_train_steps specified. Defaulting to max_train_steps = 100000.")
-         args.max_train_steps = 100000
-
-    # Prevent preload_data for E2E mode
-    if args.is_end_to_end and getattr(args, 'preload_data', False):
-        print("Warning: 'preload_data' is True but model is end-to-end. Setting preload_data=False.")
-        args.preload_data = False
-
-    # Defer final print until after calculations in train.py
-
-    return args
-# --- End Argument Parsing ---
-
-# --- write_config Function ---
-# Version 2.6.0: Include is_end_to_end and related params
-def write_config(args):
-    """Writes the final training configuration, including E2E params."""
-    conf = { "model": {}, "train": {} } # Initialize sections
-
-    # Basic Model Info
-    conf["model"]["base"] = getattr(args, 'base', '?')
-    conf["model"]["rev"] = getattr(args, 'rev', '?')
-    conf["model"]["arch"] = getattr(args, 'arch', '?')
-    conf["model"]["is_end_to_end"] = getattr(args, 'is_end_to_end', False)
-
-    # Conditional Params
-    if args.is_end_to_end:
-        conf["model"]["base_vision_model"] = getattr(args, 'base_vision_model', '?')
-        conf["model"]["extract_layer"] = getattr(args, 'extract_layer', '?')
-        conf["model"]["pooling_strategy"] = getattr(args, 'pooling_strategy', '?')
-        conf["model"]["freeze_base_model"] = getattr(args, 'freeze_base_model', '?')
-        # Head Params (store under a separate key for clarity)
-        conf["head_params"] = {
-            "hidden_dim": getattr(args, 'head_hidden_dim', '?'),
-            "num_classes": getattr(args, 'num_classes', '?'), # Use final calculated num_classes
-            "num_res_blocks": getattr(args, 'head_num_res_blocks', '?'),
-            "dropout_rate": getattr(args, 'head_dropout_rate', '?'),
-            "output_mode": getattr(args, 'head_output_mode', '?')
-        }
-        # Attn Pool Params
-        if args.pooling_strategy == 'attn':
-            conf["attn_pool_params"] = {
-                "attn_pool_heads": getattr(args, 'attn_pool_heads', '?'),
-                "attn_pool_dropout": getattr(args, 'attn_pool_dropout', '?')
-            }
-    else: # Embedding Path
-        conf["model"]["embed_ver"] = getattr(args, 'embed_ver', '?')
-        conf["model"]["base_vision_model"] = getattr(args, 'base_vision_model', None) # Optional
-        # Predictor Params
-        conf["predictor_params"] = {
-            "features": getattr(args, 'features', '?'),
-            "hidden_dim": getattr(args, 'hidden_dim', '?'),
-            "num_classes": getattr(args, 'num_classes', '?'), # Use final calculated num_classes
-            "use_attention": getattr(args, 'use_attention', '?'),
-            "num_attn_heads": getattr(args, 'num_attn_heads', '?'),
-            "attn_dropout": getattr(args, 'attn_dropout', '?'),
-            "num_res_blocks": getattr(args, 'num_res_blocks', '?'),
-            "dropout_rate": getattr(args, 'dropout_rate', '?'),
-            "output_mode": getattr(args, 'output_mode', '?')
-        }
-
-    # Training Params
-    conf["train"]["max_train_epochs"] = getattr(args, 'num_train_epochs', '?') # Use calculated value
-    conf["train"]["max_train_steps"] = getattr(args, 'max_train_steps', '?') # Use calculated value
-    conf["train"]["lr"] = getattr(args, 'lr', '?')
-    conf["train"]["batch"] = getattr(args, 'batch', '?')
-    conf["train"]["optimizer"] = getattr(args, 'optimizer', '?')
-    conf["train"]["loss_function"] = getattr(args, 'loss_function', '?')
-    conf["train"]["precision"] = getattr(args, 'precision', '?')
-    conf["train"]["val_split_count"] = getattr(args, 'val_split_count', '?')
-    # Copy other train args dynamically (optimizer/scheduler specific)
-    known_train_keys = {'max_train_epochs', 'max_train_steps', 'lr', 'batch', 'optimizer', 'loss_function', 'precision', 'val_split_count', 'num_train_epochs'} # Need to track calculated ones
-    for key, value in vars(args).items():
-         # Include keys starting with 'scheduler_' or common optimizer args,
-         # but exclude keys already handled in other sections or base train keys.
-         if key not in known_train_keys and \
-            key not in conf["model"] and \
-            key not in conf.get("predictor_params", {}) and \
-            key not in conf.get("head_params", {}) and \
-            key not in conf.get("attn_pool_params", {}) and \
-            key not in ['config', 'resume', 'labels', 'weights', 'num_labels', 'data_root', 'wandb_project', 'name', 'arch', 'is_end_to_end', 'features', 'hidden_dim', 'output_mode', 'head_output_mode'] and \
-            not key.startswith('_') and value is not None: # Exclude None values
-             conf["train"][key] = value
+    val_iterator.close()
+    model.train() # Set model back to training mode
+    if total_samples == 0: return float('nan')
+    avg_loss = total_loss / total_samples
+    print(f"Validation (Embeddings) finished. Avg Loss: {avg_loss:.4e} ({total_samples} samples)")
+    return avg_loss
 
 
-    # Other top-level config
-    if args.arch == "class": conf["labels"] = getattr(args, 'labels', None)
-    conf["data_root"] = getattr(args, 'data_root', '?')
-    conf["wandb_project"] = getattr(args, 'wandb_project', '?')
+@torch.no_grad()
+def run_validation_sequences(model, val_loader, criterion, device, scaler):
+    """Runs validation loop for precomputed feature sequences (bucketed batches)."""
+    if val_loader is None: return float('nan')
+    model.eval()
+    autocast_enabled = scaler is not None and scaler.is_enabled()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    total_loss = 0.0
+    total_samples = 0
 
-    # --- Clean up None values recursively ---
-    def remove_none_values(d):
-        if isinstance(d, dict):
-            return {k: remove_none_values(v) for k, v in d.items() if v is not None}
-        elif isinstance(d, list):
-            return [remove_none_values(i) for i in d if i is not None]
-        else:
-            return d
-    conf = remove_none_values(conf)
+    val_iterator = tqdm(val_loader, desc="Validation (Sequences)", leave=False, dynamic_ncols=True)
+    for batch_data in val_iterator:
+        if batch_data is None or not batch_data: continue
+        try:
+            # Expect stacked batches from BucketBatchSampler + collate_sequences
+            sequence_batch = batch_data.get('sequence')
+            label_batch = batch_data.get('label')
+            if sequence_batch is None or label_batch is None: continue
 
-    # Save config
-    os.makedirs(SAVE_FOLDER, exist_ok=True)
-    config_path = f"{SAVE_FOLDER}/{args.name}.config.json"
-    try:
-        with open(config_path, "w") as f:
-            f.write(json.dumps(conf, indent=2, default=repr))
-        print(f"Saved final effective training config to {config_path}")
-    except Exception as e:
-        print(f"Error saving config file {config_path}: {e}")
-# --- End write_config ---
+            sequence_batch = sequence_batch.to(device) # Should be float16 from dataset
+            label_batch = label_batch.to(device) # Should be long from dataset
+            current_batch_size = sequence_batch.size(0)
+
+            # Assume model output count is accessible
+            num_classes = getattr(model, 'num_classes', 1)
+
+            # Prepare target
+            if num_classes == 1: target = label_batch.to(dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
+            else: target = label_batch.to(dtype=torch.long).view(current_batch_size)
+
+            with torch.amp.autocast(device_type=device, enabled=autocast_enabled, dtype=amp_dtype):
+                # Pass sequence batch [B, NumPatches, Features] to HeadModel
+                y_pred = model(sequence_batch)
+
+                y_pred_for_loss = y_pred
+                if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and num_classes == 1:
+                    if y_pred.ndim > 1 and y_pred.shape[-1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
+
+                y_pred_final = y_pred_for_loss.to(torch.float32)
+                target_for_loss = target.to(y_pred_final.device)
+
+                # Calculate loss
+                if isinstance(criterion, nn.NLLLoss): loss = criterion(F.log_softmax(y_pred_final, dim=-1), target_for_loss.long())
+                elif isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, GHMC_Loss)): loss = criterion(y_pred_final, target_for_loss.long())
+                elif isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)): loss = criterion(y_pred_final, target_for_loss.float())
+                else: loss = torch.tensor(float('nan'), device=device)
+
+            if not math.isnan(loss.item()):
+                total_loss += loss.item() * current_batch_size
+                total_samples += current_batch_size
+
+            if total_samples > 0: val_iterator.set_postfix({"AvgLoss": f"{(total_loss / total_samples):.4e}"})
+
+        except Exception as e_val:
+            print(f"Error during sequence validation step: {e_val}")
+            traceback.print_exc(); continue
+        finally:
+             try: del sequence_batch, label_batch, target, y_pred, y_pred_for_loss, loss
+             except NameError: pass
+
+    val_iterator.close()
+    model.train()
+    if total_samples == 0: return float('nan')
+    avg_loss = total_loss / total_samples
+    print(f"Validation (Sequences) finished. Avg Loss: {avg_loss:.4e} ({total_samples} samples)")
+    return avg_loss
 
 
-# --- ModelWrapper Class ---
-# Version 2.7.0: Updates evaluate_on_validation_set for E2E compatibility
+# --- ModelWrapper Class (Simplified) ---
+# Version 3.0.0: Removed validation loop and CSV logging
 class ModelWrapper:
     def __init__(self, name, model, optimizer, criterion, scheduler=None, device="cpu",
-                 stdout=True, scaler=None, wandb_run=None, num_labels=1, log_file_path=None):
+                 stdout=True, scaler=None, wandb_run=None, num_labels=None): # Remove log_file_path, require num_labels?
         self.name = name
         self.model = model
+        # <<< Store essentials needed by training loop and saving >>>
         self.optimizer = optimizer
-        self.criterion = criterion
+        self.criterion = criterion # Keep criterion if needed elsewhere? Maybe not.
         self.scheduler = scheduler
         self.device = device
         self.scaler = scaler
         self.wandb_run = wandb_run
-        self.stdout = stdout
-        self.num_labels = num_labels # Set during init
+        self.stdout = stdout # Keep stdout flag? Maybe for other prints?
 
+        # <<< Store num_labels if provided, useful for consistency >>>
+        self.num_labels = num_labels if num_labels is not None else getattr(model, 'num_classes', '?')
+
+        # State tracking
         self.losses = [] # Buffer for recent training losses
         self.current_epoch = 0
         self.current_global_step = 0
-        self.best_val_loss = float('inf')
+        self.best_val_loss = float('inf') # Still track best loss if validation run separately
         self.current_best_val_model_path = None
 
         self._find_initial_best_model()
+        # <<< Removed CSV logger setup >>>
+        print(f"ModelWrapper initialized for '{name}'.")
 
-        # Setup logging
-        if log_file_path is None: log_file_path = f"{SAVE_FOLDER}/{self.name}.csv"
-        self.log_file_path = log_file_path
-        file_mode = "a" if os.path.exists(self.log_file_path) else "w"
-        self.csvlog = None
-        try:
-            self.csvlog = open(self.log_file_path, file_mode)
-            if file_mode == "w":
-                self.csvlog.write("step,train_loss_avg,eval_loss,learning_rate\n")
-                self.csvlog.flush()
-        except IOError as e: print(f"Warning: Could not open CSV log file {self.log_file_path}: {e}")
-        print(f"ModelWrapper initialized. Logging to {self.log_file_path} (mode: {file_mode})")
 
     def _find_initial_best_model(self):
         """Checks save folder for existing _best_val file on init."""
@@ -487,230 +484,138 @@ class ModelWrapper:
         return self.current_global_step
 
     def log_step(self, loss):
-        """Log training loss for averaging."""
+        """Add training loss to buffer for averaging."""
+        # This buffer is used by log_main to calculate train_loss_avg
         if not math.isnan(loss):
              self.losses.append(loss)
              if len(self.losses) > LOSS_MEMORY:
                   self.losses.pop(0)
 
-    # v2.8.2: Added tqdm to validation loop
-    @torch.no_grad()
-    def evaluate_on_validation_set(self, val_loader, args):
-        """
-        Performs evaluation on the provided validation DataLoader.
-        Handles both End-to-End (list batches) and Embedding-based (dict batch) models.
-        """
-        if val_loader is None:
-             print("Validation loader not provided, skipping evaluation.")
-             return float('nan')
 
-        self.model.eval()
-        is_e2e = getattr(args, 'is_end_to_end', False)
-
-        # --- Set Optimizer Eval Mode ---
-        original_optimizer_mode_is_training = False
-        needs_optim_switch = (hasattr(self.optimizer, 'eval') and callable(self.optimizer.eval) and
-                              hasattr(self.optimizer, 'train') and callable(self.optimizer.train) and
-                              hasattr(self.optimizer, 'state') and any(s for s in self.optimizer.state.values()))
-        if needs_optim_switch:
-            is_training = getattr(self.optimizer, 'train_mode', True) # Assume training if flag unknown
-            if is_training:
-                try: self.optimizer.eval(); original_optimizer_mode_is_training = True
-                except Exception as e: print(f"Warning: Error calling optimizer.eval(): {e}"); needs_optim_switch = False
-        # --- End Optimizer Eval Mode ---
-
-        total_loss = 0.0
-        total_samples = 0
-        # Determine AMP settings based on scaler state
-        autocast_enabled = self.scaler is not None and self.scaler.is_enabled()
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 # Default AMP dtype
-
-        # <<< Wrap val_loader with tqdm >>>
-        val_iterator = tqdm(val_loader, desc="Validation", leave=False, dynamic_ncols=True)
-
-        # --- Evaluation Loop ---
-        for batch_data in val_iterator:  # <<< Iterate over tqdm iterator >>>
-            if batch_data is None or not batch_data: continue
-
-            if isinstance(batch_data, dict):
-                batch_data_list = [batch_data]
-            elif isinstance(batch_data, list):
-                batch_data_list = batch_data
-            else:
-                continue  # Skip unexpected types
-
-            # --- Inner Loop: Iterate through Mini-Batches ---
-            for sub_batch in batch_data_list:
-                try:
-                    # --- Get Sub-Batch Data ---
-                    target_val = sub_batch.get("label" if is_e2e else "val")
-                    if target_val is None: continue
-
-                    model_input_dict = {}
-                    emb_input = None
-                    current_sub_batch_size = 0
-                    if is_e2e:
-                        pixel_values = sub_batch.get("pixel_values")
-                        if pixel_values is None: continue
-                        model_input_dict["pixel_values"] = pixel_values.to(self.device)
-                        current_sub_batch_size = pixel_values.size(0)
-                    else:
-                        emb_input = sub_batch.get("emb")
-                        if emb_input is None: continue
-                        emb_input = emb_input.to(self.device)
-                        current_sub_batch_size = emb_input.size(0)
-
-                    # --- Prepare Target ---
-                    try:
-                        if self.num_labels == 1:
-                            target = target_val.to(self.device, dtype=torch.float32)
-                        else:
-                            target = target_val.to(self.device, dtype=torch.long)
-                        if target.shape[0] != current_sub_batch_size: target = target.view(current_sub_batch_size,
-                                                                                           -1).squeeze()
-                        if target.shape[0] != current_sub_batch_size: raise ValueError("Target shape mismatch")
-                    except Exception as e_target:
-                        print(f"Error val target: {e_target}"); continue
-
-                    # --- Prediction and Loss ---
-                    loss = torch.tensor(float('nan'), device=self.device)
-                    with torch.amp.autocast(device_type=self.device, enabled=autocast_enabled, dtype=amp_dtype):
-                        if is_e2e:
-                            y_pred = self.model(**model_input_dict)
-                        else:
-                            y_pred = self.model(emb_input)
-
-                        # ... (Prepare y_pred_for_loss) ...
-                        y_pred_for_loss = y_pred
-                        if isinstance(self.criterion,
-                                      (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and self.num_labels == 1:
-                            if y_pred.ndim > 1 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
-
-                        # <<< Ensure calculation happens on CPU if possible to reduce VRAM peak? >>>
-                        # <<< Or keep on GPU for speed? Let's keep on GPU for now. >>>
-                        y_pred_final = y_pred_for_loss.to(torch.float32)
-                        target_for_loss = target.to(y_pred_final.device)
-
-                        # ... (Calculate loss based on criterion) ...
-                        if isinstance(self.criterion, nn.NLLLoss):
-                            loss_input = F.log_softmax(y_pred_final, dim=-1)  # NLLLoss expects log-probs
-                            loss = self.criterion(loss_input, target_for_loss.long())
-                        elif isinstance(self.criterion, (nn.CrossEntropyLoss, FocalLoss, GHMC_Loss)):
-                            loss = self.criterion(y_pred_final, target_for_loss.long())  # These take logits
-                        elif isinstance(self.criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)):
-                            loss = self.criterion(y_pred_final, target_for_loss.float())  # These take logits/values
-                        else:
-                            loss = torch.tensor(float('nan'), device=self.device)
-
-                    # --- Accumulate Loss ---
-                    if not math.isnan(loss.item()):
-                        total_loss += loss.item() * current_sub_batch_size
-                        total_samples += current_sub_batch_size
-                    else:
-                        pass  # Avoid printing NaN warning every time
-
-                    # <<< Explicitly delete tensors inside loop? Maybe helps? >>>
-                    del target_val, model_input_dict, emb_input, target, y_pred, y_pred_for_loss, loss
-                    # <<< Maybe even clear cache? >>>
-                    # if torch.cuda.is_available(): torch.cuda.empty_cache() # Might slow things down!
-
-                except Exception as e_val_sub:
-                    print(f"Error processing validation sub-batch: {e_val_sub}")
-                    traceback.print_exc()
-                    continue
-            # --- End Inner Mini-Batch Loop ---
-
-            # <<< Update validation tqdm postfix >>>
-            if total_samples > 0:
-                val_iterator.set_postfix({"AvgLoss": f"{(total_loss / total_samples):.4e}"})
-
-        # --- End Evaluation Loop ---
-        val_iterator.close()  # Close the tqdm bar
-
-        # --- Restore Modes ---
-        self.model.train()
-        if original_optimizer_mode_is_training and needs_optim_switch:
-            if hasattr(self.optimizer, 'train') and callable(self.optimizer.train):
-                try: self.optimizer.train()
-                except Exception as e: print(f"Warning: Error calling optimizer.train(): {e}")
-
-        # --- Calculate Average Loss ---
-        if total_samples == 0:
-            print("Warning: No valid samples processed during validation.")
-            return float('nan')
-        avg_loss = total_loss / total_samples
-        print(f"Validation finished. Average Loss: {avg_loss:.4e} ({total_samples} samples)")
-        return avg_loss
-
-    # v2.8.1: Removed tqdm.write to allow TQDM postfix to handle updates
-    def log_main(self, step, train_loss_batch, eval_loss):
-        """Logs metrics to CSV and Wandb. Updates internal state."""
+    # Version 3.0.0: Removed CSV logging, stdout logging
+    def log_main(self, step, train_loss_batch, eval_loss=None): # eval_loss is now optional input
+        """Logs metrics to Wandb ONLY. Updates internal best loss."""
         self.update_step(step)
-        self.log_step(train_loss_batch) # Add current step's avg loss to buffer
+        # Add the latest batch loss (or maybe avg loss over log_every_n steps?)
+        self.log_step(train_loss_batch) # Assumes train_loss_batch is avg over log period
 
-        lr = float(self.optimizer.param_groups[0]['lr']) if self.optimizer.param_groups else 0.0
-        # Calculate long-term average loss from buffer for logging consistency
+        # Calculate long-term average loss from buffer for potential WandB logging
         train_loss_avg = sum(self.losses) / len(self.losses) if self.losses else float('nan')
+        lr = float(self.optimizer.param_groups[0]['lr']) if self.optimizer.param_groups else 0.0
 
-        # <<< REMOVE Stdout via tqdm.write() >>>
-        # if self.stdout:
-        #     eval_loss_str = f"{eval_loss:.4e}" if not math.isnan(eval_loss) else "N/A"
-        #     train_avg_str = f"{train_loss_avg:.4e}" if not math.isnan(train_loss_avg) else "N/A"
-        #     tqdm.write(f"Step: {str(step):<8} | Loss(avg): {train_avg_str} | Eval Loss: {eval_loss_str} | LR: {lr:.3e}")
+        # <<< REMOVED Stdout via tqdm.write() >>>
 
-        # Wandb Logging (Keep)
+        # Wandb Logging (Primary Log Target)
         if self.wandb_run:
-            log_data = {"train/loss_batch": train_loss_batch, "train/loss_avg": train_loss_avg, "train/learning_rate": lr}
-            # Use the potentially updated eval_loss passed to this function
-            if not math.isnan(eval_loss): log_data["eval/loss"] = eval_loss
+            log_data = {
+                "train/loss_step": train_loss_batch, # Log the loss passed in (avg over log_every_n)
+                "train/loss_avg_buffer": train_loss_avg, # Log the longer-term buffer average
+                "train/learning_rate": lr
+            }
+            # Log eval_loss ONLY if a valid value is passed in
+            if eval_loss is not None and not math.isnan(eval_loss):
+                log_data["eval/loss"] = eval_loss
             try:
                 self.wandb_run.log(log_data, step=step)
             except Exception as e_wandb:
                 print(f"Warning: Failed to log to WandB at step {step}: {e_wandb}")
 
-        # CSV Logging (Keep)
-        if self.csvlog:
-            try:
-                eval_loss_csv = eval_loss if not math.isnan(eval_loss) else ''
-                train_avg_csv = train_loss_avg if not math.isnan(train_loss_avg) else ''
-                self.csvlog.write(f"{step},{train_avg_csv},{eval_loss_csv},{lr}\n")
-                self.csvlog.flush()
-            except Exception as e_csv: print(f"Warning: Error writing CSV log: {e_csv}")
+        # <<< REMOVED CSV Logging >>>
 
-        # Update internal best loss tracking (Keep)
-        if not math.isnan(eval_loss) and eval_loss < self.best_val_loss:
-             self.best_val_loss = eval_loss
-             # print(f"DEBUG Wrapper: Updated best_val_loss to {self.best_val_loss}") # Optional debug print
+        # Update internal best loss tracking if eval_loss provided
+        if eval_loss is not None and not math.isnan(eval_loss):
+            if eval_loss < self.best_val_loss:
+                 print(f"  ---> New best validation loss recorded: {eval_loss:.4e} (previous: {self.best_val_loss:.4e})")
+                 self.best_val_loss = eval_loss
+                 # Saving happens in train loop based on this updated value
 
     # --- Model Saving ---
-    # Version 2.8.6: Reverted to saving full state_dict always
-    def save_model(self, step=None, epoch=None, suffix="", save_aux=False, args=None): # Still need args to know context
+    # Version 2.9.1: Optional full model save based on args.save_full_model
+    def save_model(self, step=None, epoch=None, suffix="", save_aux=False, args=None):
         """
         Saves model checkpoint and optionally training state.
-        Always saves the full model state dictionary.
+        Saves full model or only trainable parts based on args.save_full_model.
         Manages the single latest _best_val checkpoint.
         """
-        if args is None: print("Error: 'args' object not provided to save_model."); return
+        if args is None:
+            print("Warning: 'args' object not provided to save_model. Defaulting to saving trainable parts only.")
+            should_save_full = False
+        else:
+            should_save_full = getattr(args, 'save_full_model', False)
 
-        # <<< Always get the full state dict >>>
-        state_dict_to_save = self.model.state_dict()
-        save_full_model = True # Always true now
+        state_dict_to_save = {} # Initialize dictionary to save
 
-        # Determine context for logging message
-        is_e2e = getattr(args, 'is_end_to_end', False)
-        is_frozen = getattr(args, 'freeze_base_model', True) # Default True if missing
+        if should_save_full:
+            print("DEBUG save_model: Configured to save FULL model state_dict.")
+            try:
+                state_dict_to_save = self.model.state_dict()
+            except Exception as e:
+                print(f"Error getting full model state_dict: {e}"); return
+        else:
+            print("DEBUG save_model: Configured to save TRAINABLE parts only. Manually collecting parameters...")
+            # Manual Parameter Collection (Head + Pooler if applicable)
+            collected_count = 0
+            # Check for standard E2E structure (head + optional pooler)
+            is_e2e = getattr(args, 'is_end_to_end', False)
+            if is_e2e and hasattr(self.model, 'head') and isinstance(self.model.head, nn.Module):
+                print("  - Collecting head parameters/buffers...")
+                for name, param in self.model.head.named_parameters():
+                    state_dict_to_save[f"head.{name}"] = param.detach().clone().cpu()
+                    collected_count += 1
+                for name, buf in self.model.head.named_buffers():
+                     state_dict_to_save[f"head.{name}"] = buf.detach().clone().cpu()
+                     collected_count += 1
+
+                # Collect Pooler state dict (only if strategy is attn and pooler exists)
+                pool_strat = getattr(args, 'pooling_strategy', None)
+                if pool_strat == 'attn' and hasattr(self.model, 'pooler') and self.model.pooler is not None:
+                    print("  - Collecting pooler parameters/buffers...")
+                    for name, param in self.model.pooler.named_parameters():
+                        state_dict_to_save[f"pooler.{name}"] = param.detach().clone().cpu()
+                        collected_count += 1
+                    for name, buf in self.model.pooler.named_buffers():
+                         state_dict_to_save[f"pooler.{name}"] = buf.detach().clone().cpu()
+                         collected_count += 1
+            # Handle case where model might BE the head (embedding models)
+            elif not is_e2e and isinstance(self.model, nn.Module):
+                 print("  - Model seems to be head-only (Embedding Mode). Collecting all its parameters/buffers...")
+                 for name, param in self.model.named_parameters():
+                     state_dict_to_save[name] = param.detach().clone().cpu()
+                     collected_count += 1
+                 for name, buf in self.model.named_buffers():
+                     state_dict_to_save[name] = buf.detach().clone().cpu()
+                     collected_count += 1
+            else:
+                 print("Warning: Could not determine model structure for partial save.")
+
+            # Fallback if nothing was collected but partial save was intended
+            if collected_count == 0 and not should_save_full:
+                print("Error: No parameters collected for partial save! Saving full model as fallback.")
+                try:
+                    state_dict_to_save = self.model.state_dict(); should_save_full = True
+                except Exception as e:
+                    print(f"Error getting full model state_dict during fallback: {e}"); return
+
+            elif collected_count > 0:
+                print(f"  Manually collected {collected_count} parameters/buffers for partial save.")
+            # If should_save_full was true from the start, state_dict_to_save already has the full dict
+
+        # Final check if dictionary is populated
+        if not state_dict_to_save:
+             print("Error: state_dict_to_save is empty or invalid after collection/fallback."); return
 
         # --- Filenames ---
         current_global_step = step if step is not None else self.current_global_step
         current_epoch_to_save = epoch if epoch is not None else self.current_epoch
-        step_str = ""
+        step_str = ""; epoch_str = ""
         if current_global_step is not None:
              if current_global_step >= 1_000_000: step_str = f"_s{round(current_global_step / 1_000_000, 1)}M"
              elif current_global_step >= 1_000: step_str = f"_s{round(current_global_step / 1_000)}K"
              else: step_str = f"_s{current_global_step}"
-        epoch_str = "_efinal" if isinstance(epoch, str) and epoch.lower() == "final" else ""
+        if isinstance(epoch, str) and epoch.lower() == "final": epoch_str = "_efinal"
         base_output_name = f"./{SAVE_FOLDER}/{self.name}{step_str}{epoch_str}{suffix}"
         model_output_path = f"{base_output_name}.safetensors"
+        # <<< Define ALL aux paths >>>
         optim_output_path = f"{base_output_name}.optim"
         sched_output_path = f"{base_output_name}.sched"
         scaler_output_path = f"{base_output_name}.scaler"
@@ -718,13 +623,12 @@ class ModelWrapper:
 
         is_best = "_best_val" in suffix
 
-        # Log message indicating context
-        context_str = "Unknown"
-        if is_e2e: context_str = "E2E (Base Frozen)" if is_frozen else "E2E (Base Unfrozen)"
-        else: context_str = "Embedding-Based"
-        print(f"\nSaving checkpoint: {os.path.basename(base_output_name)} (Epoch: {current_epoch_to_save}, Step: {current_global_step}) - [Full Model - Context: {context_str}]")
-
-        # <<< Remove pre-save checks/debug saves >>>
+        save_type_str = 'Full Model' if should_save_full else 'Trainable Parts Only'
+        print(f"\nSaving checkpoint: {os.path.basename(base_output_name)} ... [{save_type_str}]")
+        # Estimate size based on the actual dictionary being saved
+        estimated_size_mb = sum(p.numel() * p.element_size() for p in state_dict_to_save.values() if hasattr(p, 'numel')) / (1024 * 1024)
+        print(f"DEBUG: Keys in FINAL state_dict: {len(state_dict_to_save)}")
+        print(f"DEBUG: Estimated size of FINAL state_dict: {estimated_size_mb:.2f} MB")
 
         try:
             os.makedirs(SAVE_FOLDER, exist_ok=True)
@@ -739,26 +643,24 @@ class ModelWrapper:
                     removed_count = 0
                     for f_path in files_to_remove:
                         if os.path.exists(f_path):
-                            try:
-                                os.remove(f_path); removed_count += 1
-                            except OSError as e:
-                                print(f"  Warning: Could not remove '{os.path.basename(f_path)}': {e}")
+                            try: os.remove(f_path); removed_count += 1
+                            except OSError as e: print(f"  Warning: Could not remove '{os.path.basename(f_path)}': {e}")
                     if removed_count > 0: print(f"  Removed {removed_count} previous best file(s).")
-                    self.current_best_val_model_path = None
+                    self.current_best_val_model_path = None # Clear regardless of success
 
             # --- Save CURRENT Checkpoint Files ---
-            save_file(self.model.state_dict(), model_output_path)
-
-            print(f"Checkpoint files based on ({os.path.basename(model_output_path)}) saved successfully. Actual size: {os.path.getsize(model_output_path)/(1024*1024):.2f} MB") # Print actual size
+            # <<< Save the correct dictionary >>>
+            save_file(state_dict_to_save, model_output_path)
+            actual_size_mb = os.path.getsize(model_output_path) / (1024 * 1024)
+            # <<< Print only ONCE after saving >>>
+            print(f"  Model saved successfully. Actual size: {actual_size_mb:.2f} MB")
 
             if save_aux:
                 print("  Saving auxiliary files (optim, sched, scaler, state)...")
                 torch.save(self.optimizer.state_dict(), optim_output_path)
                 if self.scheduler is not None:
-                    try:
-                        torch.save(self.scheduler.state_dict(), sched_output_path)
-                    except Exception as e_sched:
-                        print(f"  Warning: Failed to save scheduler state: {e_sched}")
+                    try: torch.save(self.scheduler.state_dict(), sched_output_path)
+                    except Exception as e_sched: print(f"  Warning: Failed to save scheduler state: {e_sched}")
                 if self.scaler is not None and self.scaler.is_enabled():
                     torch.save(self.scaler.state_dict(), scaler_output_path)
                 train_state = {
@@ -767,39 +669,31 @@ class ModelWrapper:
                 }
                 torch.save(train_state, state_output_path)
             else:
-                # Clean up orphaned aux files *for this specific checkpoint name*
-                # This prevents leaving old .optim files if save_aux becomes False later
-                print(
-                    "  save_aux is False. Skipping save/Ensuring removal of auxiliary files for this specific checkpoint name.")
+                # Clean up orphaned aux files for this specific checkpoint name
+                # print("  save_aux is False. Skipping save/Ensuring removal of aux files...") # Optional
                 for ext in ['.optim', '.sched', '.scaler', '.state']:
                     path_to_check = base_output_name + ext
                     if os.path.exists(path_to_check):
-                        try:
-                            os.remove(path_to_check)
-                            print(f"  Removed existing aux file: {os.path.basename(path_to_check)}")
-                        except OSError as e:
-                            print(
-                                f"  Warning: Failed to remove existing aux file {os.path.basename(path_to_check)}: {e}")
+                        try: os.remove(path_to_check) # ; print(f" Removed aux file: {os.path.basename(path_to_check)}") # Optional print
+                        except OSError as e: pass # print(f" Warning: Failed to remove aux file {os.path.basename(path_to_check)}: {e}") # Optional print
 
-                print(
-                    f"Checkpoint files based on ({os.path.basename(model_output_path)}) saved successfully. Actual size: {os.path.getsize(model_output_path) / (1024 * 1024):.2f} MB")
+            # <<< Removed duplicate print >>>
 
-                if is_best:
-                    self.current_best_val_model_path = model_output_path
-                    print(f"  Marked {os.path.basename(model_output_path)} as new best model path.")
+            # Update best model path tracking
+            if is_best:
+                self.current_best_val_model_path = model_output_path
+                print(f"  Marked {os.path.basename(model_output_path)} as new best model path.")
+
+            print(f"  Checkpoint saving process complete for base: {os.path.basename(base_output_name)}")
 
         except Exception as e:
             print(f"Error saving checkpoint {base_output_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
 
     def close(self):
-        """Closes the CSV log file."""
-        if self.csvlog:
-            try: self.csvlog.close()
-            except Exception as e: print(f"Warning: Error closing CSV log file: {e}")
-            finally: self.csvlog = None
-        print("ModelWrapper resources closed.")
+        """Placeholder for closing resources if any."""
+        # <<< Removed CSV log closing >>>
+        print("ModelWrapper closed.")
 # --- End ModelWrapper Class ---
 
 # --- Helper function to load states ---
