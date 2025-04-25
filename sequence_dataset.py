@@ -279,77 +279,147 @@ class FeatureSequenceDataset(Dataset):
              meta_info = self.metadata[metadata_index] if 'metadata_index' in locals() and 0 <= metadata_index < len(self.metadata) else {'path': 'unknown'}
              print(f"Error processing metadata index {metadata_index} (path: {meta_info.get('path', 'unknown')}): {e}"); traceback.print_exc(); return None
 
-    # v1.1.1: Corrected __getitem__ for direct metadata indexing from sampler
+    # --- Modified __getitem__ ---
+    # v1.2.0: Apply pooling within getitem, return single vector
     def __getitem__(self, index):
         """
-        Loads sequence data for a given METADATA index.
-        The BucketBatchSampler yields indices that directly map to self.metadata.
+        Loads sequence data for a given TRAINING index, applies MEAN POOLING,
+        and returns a single feature vector.
         """
+        metadata_index = -1 # <<< Initialize metadata_index >>>
         try:
-             # <<< Use index directly on self.metadata >>>
-             if index >= len(self.metadata):
-                   raise IndexError(f"Metadata index {index} out of range (len {len(self.metadata)})")
-             meta = self.metadata[index]
-             # <<< End Change >>>
+            # Get the index into the main metadata list from the training indices list
+            if index >= len(self.train_indices):
+                  raise IndexError(f"Training index {index} out of range (len {len(self.train_indices)})")
+            # <<< Assign metadata_index here >>>
+            metadata_index = self.train_indices[index]
 
-             # Check if preloaded
-             if self.preload and self.preloaded_data is not None and index < len(self.preloaded_data) and self.preloaded_data[index] is not None:
-                  sequence_tensor = self.preloaded_data[index] # Already fp16 tensor
-             else: # Load from disk
-                  filepath = meta['path']
-                  try:
-                      data = np.load(filepath)
-                      sequence_np = data['sequence']
-                      sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16) # Load as fp16
-                  except Exception as e_load:
-                       print(f"Error loading npz file {filepath}: {e_load}")
-                       return None # Signal error
+            if metadata_index >= len(self.metadata):
+                  raise IndexError(f"Metadata index {metadata_index} (from train_indices[{index}]) out of range (len {len(self.metadata)})")
+            meta = self.metadata[metadata_index]
 
-             label = meta['label']
-             # Return fp16 sequence, fp32 handled by autocast in training loop
-             return {'sequence': sequence_tensor, 'label': torch.tensor(label, dtype=torch.long)}
+            # Load sequence tensor (fp16 on CPU or preloaded)
+            if self.preload and self.preloaded_data is not None and metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
+                 sequence_tensor = self.preloaded_data[metadata_index] # Already fp16 tensor
+            else: # Load from disk
+                 filepath = meta['path']
+                 try:
+                     with np.load(filepath) as data: # Use with statement for safety
+                         sequence_np = data['sequence']
+                     sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16) # Load as fp16
+                 except Exception as e_load:
+                      print(f"Error loading npz file {filepath}: {e_load}")
+                      return None # Signal error
+
+            # --- Apply Mean Pooling ---
+            # Input: sequence_tensor [NumPatches, Features] (fp16)
+            # Output: pooled_features [Features] (should be fp32 for stability)
+            if sequence_tensor.numel() == 0: # Handle empty sequences if they exist
+                 print(f"Warning: Empty sequence tensor encountered for metadata index {metadata_index}, path {meta.get('path', 'unknown')}. Returning None.")
+                 return None
+            pooled_features = torch.mean(sequence_tensor.float(), dim=0) # Pool along patch dim, convert to float32
+            # --- End Pooling ---
+
+            label = meta['label']
+            # <<< Return the POOLED features (fp32) >>>
+            # Keeping key as 'sequence' for minimal changes to train loop, though 'features' might be clearer
+            return {'sequence': pooled_features, 'label': torch.tensor(label, dtype=torch.long)}
 
         except IndexError as e_index:
-             print(f"Error in __getitem__ with metadata index {index}: {e_index}")
+             print(f"Error in __getitem__ with training index {index}: {e_index}")
              return None
         except Exception as e:
-             # Use index directly in error message
-             path_info = self.metadata[index].get('path', 'unknown') if 0 <= index < len(self.metadata) else 'unknown'
-             print(f"Error processing data for metadata index {index} (path: {path_info}): {e}")
+             metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
+             path_info = self.metadata[metadata_index_info].get('path', 'unknown') if isinstance(metadata_index_info, int) and 0 <= metadata_index_info < len(self.metadata) else 'unknown'
+             print(f"Error processing data for training index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
              traceback.print_exc()
              return None
 
     # --- get_validation_loader ---
-    # This also needs to be consistent if using BucketBatchSampler
-    def get_validation_loader(self, batch_size, num_workers=0):
-         print("Creating validation loader using BucketBatchSampler...")
-         if not self.val_indices:
-              print("Validation set is empty."); return None
+    # v1.2.0: Modify validation loader to use standard DataLoader and pooled features.
+    # <<< Add prefetch_factor argument >>>
+    def get_validation_loader(self, batch_size, num_workers=0, prefetch_factor=2):
+        print("Creating validation loader (using individual pooling)...")
+        if not self.val_indices:
+             print("Validation set is empty."); return None
 
-         # Create buckets specifically for validation indices
-         val_buckets = defaultdict(list)
-         for idx in self.val_indices: # val_indices ARE indices into metadata
-              meta = self.get_metadata(idx)
-              if meta: val_buckets[meta['seq_len']].append(idx)
+        # --- Create a SubDataset for Validation that also pools ---
+        val_dataset = ValidationSubDatasetFeaturesPooled(self.metadata, self.val_indices, self.preload, self.preloaded_data)
+        if len(val_dataset) == 0:
+             print("Warning: ValidationSubDataset is empty.")
+             return None
 
-         if not any(val_buckets.values()):
-              print("No valid samples found for validation buckets."); return None
+        # --- Use Standard DataLoader for Validation ---
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_sequences,
+            persistent_workers=True if num_workers > 0 else False,
+            # <<< Use the passed prefetch_factor argument >>>
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
+        )
+        print(f"  Created validation loader with standard batching ({len(val_dataset)} samples).")
+        return val_loader
 
-         # Create validation sampler
-         val_sampler = BucketBatchSampler(
-             buckets=val_buckets, batch_size=batch_size, drop_last=False,
-             shuffle_buckets=False, shuffle_within_bucket=False, seed=self.seed
-         )
 
-         # Create DataLoader - pass main dataset, sampler handles indices
-         val_loader = DataLoader(
-             self, # Pass self (main dataset instance)
-             batch_sampler=val_sampler, # Use the batch sampler
-             num_workers=num_workers,
-             collate_fn=collate_sequences # Use the sequence collate function
-         )
-         print(f"  Created validation loader with {len(val_sampler)} batches.")
-         return val_loader
+# --- New Validation SubDataset ---
+# Needs to replicate the pooling logic from __getitem__
+class ValidationSubDatasetFeaturesPooled(Dataset):
+     def __init__(self, metadata_list, validation_indices, preload, preloaded_data):
+          self.metadata = metadata_list
+          self.val_indices = validation_indices
+          self.preload = preload
+          self.preloaded_data = preloaded_data
+          print(f"ValidationSubDatasetFeaturesPooled initialized with {len(self.val_indices)} indices.")
+
+     def __len__(self):
+          return len(self.val_indices)
+
+     def __getitem__(self, index):
+          metadata_index = -1 # Initialize
+          try:
+               if index >= len(self.val_indices):
+                    raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
+               metadata_index = self.val_indices[index] # Get index into main metadata
+
+               if metadata_index >= len(self.metadata):
+                    raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
+               meta = self.metadata[metadata_index]
+
+               # Load sequence tensor (fp16 on CPU or preloaded) - Reuse logic from main dataset
+               if self.preload and self.preloaded_data is not None and metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
+                   sequence_tensor = self.preloaded_data[metadata_index]
+               else:
+                   filepath = meta['path']
+                   try:
+                       with np.load(filepath) as data: sequence_np = data['sequence']
+                       sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
+                   except Exception as e_load:
+                       print(f"Error loading validation npz file {filepath}: {e_load}")
+                       return None
+
+               # Apply Mean Pooling
+               if sequence_tensor.numel() == 0:
+                    print(f"Warning: Empty sequence tensor encountered for validation metadata index {metadata_index}, path {meta.get('path', 'unknown')}. Returning None.")
+                    return None
+               pooled_features = torch.mean(sequence_tensor.float(), dim=0) # Pool, convert to float32
+
+               label = meta['label']
+               return {'sequence': pooled_features, 'label': torch.tensor(label, dtype=torch.long)}
+
+          except IndexError as e_index:
+               print(f"Error in validation __getitem__: {e_index}")
+               return None
+          except Exception as e:
+               path_info = 'unknown'
+               metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
+               if isinstance(metadata_index_info, int) and metadata_index_info < len(self.metadata):
+                    path_info = self.metadata[metadata_index_info].get('path', 'unknown')
+               print(f"Error processing validation data for index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
+               traceback.print_exc()
+               return None
 
 
 # --- Simple Validation Dataset Wrapper ---
@@ -396,97 +466,97 @@ class ValidationSubDatasetFeatures(Dataset):
                traceback.print_exc()
                return None
 
-class BucketBatchSampler(Sampler[list[int]]):
-    """
-    Sampler that yields batches of indices, ensuring all indices in a batch
-    belong to the same bucket (same sequence length).
-
-    Args:
-        buckets (dict[int, list[int]]): Dictionary mapping sequence length to list of metadata indices.
-        batch_size (int): The desired batch size.
-        drop_last (bool): If True, drop the last incomplete batch from each bucket.
-        shuffle_buckets (bool): If True, shuffle the order of buckets each epoch.
-        shuffle_within_bucket (bool): If True, shuffle indices within each bucket each epoch.
-        seed (int): Random seed for shuffling.
-    """
-    def __init__(self, buckets: dict[int, list[int]], batch_size: int, drop_last: bool,
-                 shuffle_buckets: bool = True, shuffle_within_bucket: bool = True, seed: int = 42):
-        # Pass None as data_source since we don't use it directly here
-        super().__init__(data_source=None)
-
-        if not isinstance(batch_size, int) or batch_size <= 0:
-            raise ValueError("batch_size should be a positive integer value")
-        if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value")
-
-        self.buckets = buckets
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle_buckets = shuffle_buckets
-        self.shuffle_within_bucket = shuffle_within_bucket
-        self.seed = seed
-        self.epoch = 0
-
-        # Pre-calculate batches for length calculation
-        self.batches_per_bucket = {}
-        self.num_batches = 0
-        self.bucket_keys = sorted(list(self.buckets.keys())) # Store sorted keys
-
-        for seq_len in self.bucket_keys:
-            bucket_indices = self.buckets[seq_len]
-            num_samples_in_bucket = len(bucket_indices)
-            if num_samples_in_bucket == 0:
-                 self.batches_per_bucket[seq_len] = 0
-                 continue
-
-            num_batches_for_bucket = num_samples_in_bucket // self.batch_size
-            if not self.drop_last and num_samples_in_bucket % self.batch_size != 0:
-                num_batches_for_bucket += 1
-
-            self.batches_per_bucket[seq_len] = num_batches_for_bucket
-            self.num_batches += num_batches_for_bucket
-
-        print(f"BucketBatchSampler initialized. Total batches per epoch: {self.num_batches}")
-
-    def __iter__(self):
-        # Use epoch number and seed for deterministic shuffling across epochs/resumes
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-
-        # Determine order of buckets
-        bucket_processing_order = self.bucket_keys
-        if self.shuffle_buckets:
-            # Shuffle the keys using torch generator for reproducibility
-            rand_indices = torch.randperm(len(bucket_processing_order), generator=g).tolist()
-            bucket_processing_order = [self.bucket_keys[i] for i in rand_indices]
-
-        # Generate batches for this epoch
-        all_batches = []
-        for seq_len in bucket_processing_order:
-            bucket_indices = self.buckets[seq_len][:] # Get a copy
-            if not bucket_indices: continue # Skip empty buckets
-
-            if self.shuffle_within_bucket:
-                # Shuffle indices within the bucket using torch generator
-                rand_indices = torch.randperm(len(bucket_indices), generator=g).tolist()
-                bucket_indices = [bucket_indices[i] for i in rand_indices]
-
-            # Create mini-batches for this bucket
-            for i in range(0, len(bucket_indices), self.batch_size):
-                batch = bucket_indices[i : i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue # Skip last incomplete batch if drop_last is True
-                all_batches.append(batch)
-
-        # Shuffle the final list of batches (optional, batches are already from shuffled buckets)
-        # random.shuffle(all_batches) # Maybe not needed if buckets are shuffled
-
-        self.epoch += 1 # Increment epoch for next iteration's seed
-        return iter(all_batches)
-
-    def __len__(self) -> int:
-        return self.num_batches
-
-    def set_epoch(self, epoch: int) -> None:
-        # Allows DistributedSampler compatibility if needed later
-        self.epoch = epoch
+# class BucketBatchSampler(Sampler[list[int]]):
+#     """
+#     Sampler that yields batches of indices, ensuring all indices in a batch
+#     belong to the same bucket (same sequence length).
+#
+#     Args:
+#         buckets (dict[int, list[int]]): Dictionary mapping sequence length to list of metadata indices.
+#         batch_size (int): The desired batch size.
+#         drop_last (bool): If True, drop the last incomplete batch from each bucket.
+#         shuffle_buckets (bool): If True, shuffle the order of buckets each epoch.
+#         shuffle_within_bucket (bool): If True, shuffle indices within each bucket each epoch.
+#         seed (int): Random seed for shuffling.
+#     """
+#     def __init__(self, buckets: dict[int, list[int]], batch_size: int, drop_last: bool,
+#                  shuffle_buckets: bool = True, shuffle_within_bucket: bool = True, seed: int = 42):
+#         # Pass None as data_source since we don't use it directly here
+#         super().__init__(data_source=None)
+#
+#         if not isinstance(batch_size, int) or batch_size <= 0:
+#             raise ValueError("batch_size should be a positive integer value")
+#         if not isinstance(drop_last, bool):
+#             raise ValueError("drop_last should be a boolean value")
+#
+#         self.buckets = buckets
+#         self.batch_size = batch_size
+#         self.drop_last = drop_last
+#         self.shuffle_buckets = shuffle_buckets
+#         self.shuffle_within_bucket = shuffle_within_bucket
+#         self.seed = seed
+#         self.epoch = 0
+#
+#         # Pre-calculate batches for length calculation
+#         self.batches_per_bucket = {}
+#         self.num_batches = 0
+#         self.bucket_keys = sorted(list(self.buckets.keys())) # Store sorted keys
+#
+#         for seq_len in self.bucket_keys:
+#             bucket_indices = self.buckets[seq_len]
+#             num_samples_in_bucket = len(bucket_indices)
+#             if num_samples_in_bucket == 0:
+#                  self.batches_per_bucket[seq_len] = 0
+#                  continue
+#
+#             num_batches_for_bucket = num_samples_in_bucket // self.batch_size
+#             if not self.drop_last and num_samples_in_bucket % self.batch_size != 0:
+#                 num_batches_for_bucket += 1
+#
+#             self.batches_per_bucket[seq_len] = num_batches_for_bucket
+#             self.num_batches += num_batches_for_bucket
+#
+#         print(f"BucketBatchSampler initialized. Total batches per epoch: {self.num_batches}")
+#
+#     def __iter__(self):
+#         # Use epoch number and seed for deterministic shuffling across epochs/resumes
+#         g = torch.Generator()
+#         g.manual_seed(self.seed + self.epoch)
+#
+#         # Determine order of buckets
+#         bucket_processing_order = self.bucket_keys
+#         if self.shuffle_buckets:
+#             # Shuffle the keys using torch generator for reproducibility
+#             rand_indices = torch.randperm(len(bucket_processing_order), generator=g).tolist()
+#             bucket_processing_order = [self.bucket_keys[i] for i in rand_indices]
+#
+#         # Generate batches for this epoch
+#         all_batches = []
+#         for seq_len in bucket_processing_order:
+#             bucket_indices = self.buckets[seq_len][:] # Get a copy
+#             if not bucket_indices: continue # Skip empty buckets
+#
+#             if self.shuffle_within_bucket:
+#                 # Shuffle indices within the bucket using torch generator
+#                 rand_indices = torch.randperm(len(bucket_indices), generator=g).tolist()
+#                 bucket_indices = [bucket_indices[i] for i in rand_indices]
+#
+#             # Create mini-batches for this bucket
+#             for i in range(0, len(bucket_indices), self.batch_size):
+#                 batch = bucket_indices[i : i + self.batch_size]
+#                 if len(batch) < self.batch_size and self.drop_last:
+#                     continue # Skip last incomplete batch if drop_last is True
+#                 all_batches.append(batch)
+#
+#         # Shuffle the final list of batches (optional, batches are already from shuffled buckets)
+#         # random.shuffle(all_batches) # Maybe not needed if buckets are shuffled
+#
+#         self.epoch += 1 # Increment epoch for next iteration's seed
+#         return iter(all_batches)
+#
+#     def __len__(self) -> int:
+#         return self.num_batches
+#
+#     def set_epoch(self, epoch: int) -> None:
+#         # Allows DistributedSampler compatibility if needed later
+#         self.epoch = epoch

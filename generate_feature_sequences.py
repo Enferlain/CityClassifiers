@@ -5,6 +5,7 @@ import sys
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 import traceback
@@ -261,22 +262,78 @@ def generate_features(args, model, processor, device, compute_dtype, save_dtype,
 
                            # 3. Run Model Forward Pass
                            with torch.amp.autocast(device_type=device, enabled=(compute_dtype != torch.float32), dtype=compute_dtype):
-                               outputs = model(**inputs)
-                               feature_sequence = outputs.last_hidden_state
+                               inputs = processor(images=[img_to_process], return_tensors="pt").to(device) # Make sure inputs are created correctly
+                               outputs = model(**inputs) # Call the model
+
+                               # <<< --- DEBUG PRINT --- >>>
+                               print(f"\nDEBUG: Output type for {fname}: {type(outputs)}")
+                               output_attributes = {}
+                               if hasattr(outputs, 'keys'): # For dict-like outputs (e.g., BaseModelOutputWithPooling)
+                                   print(f"DEBUG: Output keys: {outputs.keys()}")
+                                   for key in outputs.keys():
+                                       value = outputs[key]
+                                       if isinstance(value, torch.Tensor):
+                                           output_attributes[key] = value.shape
+                                       else:
+                                           output_attributes[key] = type(value)
+                               elif isinstance(outputs, torch.Tensor): # If output is just a tensor
+                                    output_attributes['output_tensor'] = outputs.shape
+                               elif isinstance(outputs, tuple): # If output is a tuple
+                                    for i, item in enumerate(outputs):
+                                         if isinstance(item, torch.Tensor):
+                                              output_attributes[f'tuple_item_{i}'] = item.shape
+                                         else:
+                                              output_attributes[f'tuple_item_{i}'] = type(item)
+                               else: # Fallback: Use dir()
+                                   print(f"DEBUG: dir(outputs): {dir(outputs)}")
+                                   # Try checking common attributes specifically
+                                   if hasattr(outputs, 'pooler_output') and isinstance(outputs.pooler_output, torch.Tensor):
+                                        output_attributes['pooler_output'] = outputs.pooler_output.shape
+                                   if hasattr(outputs, 'last_hidden_state') and isinstance(outputs.last_hidden_state, torch.Tensor):
+                                        output_attributes['last_hidden_state'] = outputs.last_hidden_state.shape
+
+                               print(f"DEBUG: Output Attributes & Shapes: {output_attributes}")
+                               # <<< --- END DEBUG PRINT --- >>>
+
+                               # Determine feature_sequence based on availability (keep using last_hidden_state for now)
+                               feature_sequence = None
+                               if hasattr(outputs, 'last_hidden_state') and isinstance(outputs.last_hidden_state, torch.Tensor):
+                                    feature_sequence = outputs.last_hidden_state
+                                    if 'pooler_output' in output_attributes:
+                                         print(f"INFO: pooler_output exists (Shape: {output_attributes['pooler_output']}), but using last_hidden_state for now.")
+                                    else:
+                                         print(f"INFO: Using last_hidden_state (Shape: {output_attributes.get('last_hidden_state', 'N/A')}). No pooler_output found.")
+                               else:
+                                    print(f"\nError: Could not find 'last_hidden_state' in model outputs for {fname}. Skipping.")
+                                    error_count += 1; pbar.update(1); current_task_index += 1; continue
 
                            # 4. Process Output
                            if feature_sequence is None or feature_sequence.ndim != 3 or feature_sequence.shape[0] != 1:
                                 print(f"\nError: Invalid feature sequence output for {fname}. Skipping.")
-                                error_count += 1
+                                error_count += 1; pbar.update(1); current_task_index += 1; continue # Make sure to continue loop correctly
                            else:
-                                feature_sequence = feature_sequence.squeeze(0).detach().to(dtype=save_dtype).cpu()
+                                # --- Normalize the features BEFORE saving ---
+                                # Input feature_sequence shape: [1, NumPatches, Features], on device, compute_dtype
+                                try:
+                                    feature_sequence = F.normalize(feature_sequence, p=2, dim=-1) # Normalize along the feature dimension (-1)
+                                    # Optional check for NaNs after normalization
+                                    if torch.isnan(feature_sequence).any():
+                                         print(f"\nWarning: NaN detected in features for {fname} *after* normalization. Skipping save.")
+                                         error_count += 1; pbar.update(1); current_task_index += 1; continue
+                                except Exception as e_norm:
+                                     print(f"\nError during normalization for {fname}: {e_norm}. Skipping.")
+                                     error_count += 1; pbar.update(1); current_task_index += 1; continue
+                                # --- End Normalization ---
 
-                                # 5. Save Features to NPZ
-                                feature_array_np = feature_sequence.numpy()
-                                # Save ORIGINAL shape, not resized shape
-                                original_shape_np = np.array([original_height, original_width], dtype=np.int32)
-                                np.savez_compressed(output_path, sequence=feature_array_np, original_shape=original_shape_np)
+                                # Now proceed with the original steps on the *normalized* tensor
+                                feature_sequence = feature_sequence.squeeze(0).detach().to(dtype=save_dtype).cpu() # Convert normalized tensor to save_dtype (fp16) and move to CPU
+
+                                # 5. Save Normalized Features to NPZ
+                                feature_array_np = feature_sequence.numpy() # Convert normalized CPU tensor to numpy
+                                original_shape_np = np.array([original_height, original_width], dtype=np.int32) # Keep original shape info
+                                np.savez_compressed(output_path, sequence=feature_array_np, original_shape=original_shape_np) # Save normalized sequence
                                 processed_count += 1
+                                # Successfully processed and saved normalized features
 
                  except Exception as e:
                       print(f"\nError processing file {fname} during GPU/Save stage: {e}")

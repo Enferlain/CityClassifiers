@@ -20,7 +20,7 @@ data:
 # (Defines the HeadModel structure in head_model.py)
 head_params:
   features: 1024                   # <<< Input features from AIMv2 base (MUST MATCH features) >>>
-  pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
+  pooling_strategy: 'none'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
   hidden_dim: 1024                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
   dropout_rate: 0.218              # Dropout rate within the head
@@ -42,6 +42,7 @@ train:
   # (Can likely use a higher LR now since only training head)
   lr: 1e-4                         # <<< Increased LR from E2E example >>>
   batch: 32                        # <<< Increase batch size significantly - head is small! >>>
+  gradient_accumulation_steps: 2   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
   precision: "bf16"                # Mixed precision for training head
 
   # --- Loss Function ---
@@ -77,12 +78,12 @@ train:
   scheduler_warmup_steps: 500
 
   # --- Data & Other ---
-  seed: 218
+  seed: -1
   num_workers: 8                   # <<< Can use more workers now for loading NPZ >>>
   # preload_data: false            # Not applicable/needed for features mode
   nsave: 1000                      # Periodic save frequency
   log_every_n: 1                  # Log training metrics frequency
-  validate_every_n: 50            # Validation frequency (adjust based on steps/epoch)
+  validate_every_n: 100            # Validation frequency (adjust based on steps/epoch)
   save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
 
 # --- Labels ---
