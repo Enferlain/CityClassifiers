@@ -19,7 +19,7 @@ from losses import GHMC_Loss, FocalLoss # Keep these
 
 try:
     from sageattention import sageattn
-    F.scaled_dot_product_attention = sageattn
+#    F.scaled_dot_product_attention = sageattn
     print("!!! Successfully applied SageAttention monkey-patch !!!")
 except ImportError:
     print("SageAttention not found or failed to import, using default F.scaled_dot_product_attention.")
@@ -36,7 +36,8 @@ from utils import (
 
 # <<< Import Feature Sequence Dataset stuff >>>
 try:
-    from sequence_dataset import FeatureSequenceDataset, collate_sequences, ValidationSubDatasetFeaturesPooled
+    from sequence_dataset import (FeatureSequenceDataset, collate_sequences, ValidationSubDatasetFeaturesPadded,
+                                  ValidationSubDatasetFeaturesPadded)
     FEATURE_DATASET_AVAILABLE = True
 except ImportError:
     print("Error: sequence_dataset.py not found or failed to import required classes.")
@@ -132,7 +133,6 @@ def setup_dataloaders(args):
     """Sets up FeatureSequenceDataset and DataLoader.
        v1.1.0: Uses standard DataLoader with shuffle=True, pooling done in dataset.
     """
-    # ... (Configuration checks remain the same) ...
     feature_root_dir = os.path.join(args.data_root, args.feature_dir_name)
     print(f"Setting up FeatureSequenceDataset (pooling in __getitem__) from: {feature_root_dir}")
 
@@ -292,24 +292,47 @@ def setup_model_criterion(args, dataset):
     if criterion is None:
         exit("Error: Criterion setup failed.")
 
-    # --- Instantiate the HeadModel ---
-    print(f"DEBUG: Instantiating HeadModel (Classes: {num_classes}, Output Mode: {head_output_mode})")
+    # --- Instantiate the HeadModel (v1.5.0 Transformer Head) ---
+    print(f"DEBUG: Instantiating HeadModel v1.5.0 (Transformer Head)...")
     try:
-        # Get necessary args (feature dim should be known for the precomputed features)
-        # We need to add 'head_features' to args/config, e.g., 1024 for AIMv2
         head_features = getattr(args, 'head_features', None)
-        if head_features is None: exit("Error: 'head_features' (input dimension for head) not specified in args/config.")
+        if head_features is None: exit("Error: 'head_features' not specified.")
+
+        # Load Transformer Head specific params
+        trans_head_conf = getattr(args, 'transformer_head_params', {}) # Get the new section from args
+        num_trans_layers = trans_head_conf.get('num_transformer_layers', 1)
+        trans_nhead = trans_head_conf.get('transformer_nhead', 8)
+        trans_dim_ff = trans_head_conf.get('transformer_dim_feedforward', head_features * 2)
+        trans_dropout = trans_head_conf.get('transformer_dropout', 0.1)
+        pooling_after = trans_head_conf.get('pooling_after_transformer', 'avg')
+
+        # Load standard MLP head params (use original keys from args)
+        hidden_dim = getattr(args, 'head_hidden_dim', 1024)
+        num_res_blocks = getattr(args, 'head_num_res_blocks', 3)
+        dropout_rate = getattr(args, 'head_dropout_rate', 0.2)
+        output_mode = getattr(args, 'head_output_mode', 'linear')
+
+        # Load attn pool params only if needed
+        attn_pool_heads = getattr(args, 'attn_pool_heads', 16)
+        attn_pool_dropout = getattr(args, 'attn_pool_dropout', 0.2)
 
         model = HeadModel(
-            features=args.head_features,
-            num_classes=num_classes,
-            pooling_strategy=getattr(args, 'pooling_strategy', 'attn'),
-            hidden_dim=getattr(args, 'head_hidden_dim', 1024),
-            num_res_blocks=getattr(args, 'head_num_res_blocks', 3),
-            dropout_rate=getattr(args, 'head_dropout_rate', 0.2),
-            output_mode=getattr(args, 'head_output_mode', 'linear'), # Get head output mode
-            attn_pool_heads=getattr(args, 'attn_pool_heads', 16),
-            attn_pool_dropout=getattr(args, 'attn_pool_dropout', 0.2)
+            features=head_features,
+            num_classes=args.num_classes, # Use num_classes determined earlier
+            # Transformer params
+            num_transformer_layers=num_trans_layers,
+            transformer_nhead=trans_nhead,
+            transformer_dim_feedforward=trans_dim_ff,
+            transformer_dropout=trans_dropout,
+            pooling_after_transformer=pooling_after,
+            # MLP params
+            hidden_dim=hidden_dim,
+            num_res_blocks=num_res_blocks,
+            dropout_rate=dropout_rate,
+            output_mode=output_mode,
+            # Attn Pool params (passed even if not used by pooling_after)
+            attn_pool_heads=attn_pool_heads,
+            attn_pool_dropout=attn_pool_dropout
         )
     except Exception as e:
         print(f"Error details during HeadModel instantiation: {e}")
@@ -667,43 +690,44 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
 
                 loss_this_step = torch.tensor(float('nan'), device=TARGET_DEV)
                 try:
-                    # <<< Get the ALREADY POOLED features and labels from the batch >>>
-                    # 'sequence' key now holds features of shape [B, F] (Float32 from dataset pooling)
-                    feature_batch = batch_data.get('sequence')
-                    label_batch = batch_data.get('label')
-
-                    # <<< Remove the incorrect slicing >>>
-                    # input_features = sequence_batch[:, 0, :] # REMOVE THIS
-                    # input_features = input_features.to(TARGET_DEV) # REMOVE THIS
+                    # Get sequence, mask, and label from the batch
+                    sequence_batch = batch_data.get('sequence')  # Shape [B, target_len, F] (Float32 from dataset)
+                    mask_batch = batch_data.get('mask')  # Shape [B, target_len] (Bool)
+                    label_batch = batch_data.get('label')  # Shape [B] (Long)
 
                     # Check if data loaded correctly
-                    if feature_batch is None or label_batch is None:
-                         print(f"Warning: Micro-batch {i} missing 'sequence' (features) or 'label'. Skipping.")
-                         continue
+                    if sequence_batch is None or mask_batch is None or label_batch is None:
+                        print(f"Warning: Batch missing sequence, mask, or label at micro-batch {i}. Skipping.")
+                        continue
 
-                    # <<< Apply integrity check to the feature_batch >>>
-                    if not torch.isfinite(feature_batch).all():
-                        num_bad_elements = (~torch.isfinite(feature_batch)).sum().item()
-                        print(f"\n!!! WARNING: Non-finite values detected in input feature_batch at micro-batch {i}! Num bad: {num_bad_elements}. Skipping batch.")
+                    # <<< Apply integrity check to sequence_batch >>>
+                    if not torch.isfinite(sequence_batch).all():  # Check sequence_batch
+                        # <<< Correct variable name in error message >>>
+                        num_bad_elements = (~torch.isfinite(sequence_batch)).sum().item()
+                        print(
+                            f"\n!!! WARNING: Non-finite values detected in input sequence_batch at micro-batch {i}! Num bad: {num_bad_elements}. Skipping batch.")
                         continue
                     # <<< End Check >>>
 
-                    # <<< Move the correct tensors to device >>>
-                    # Feature batch should be Float32 from dataset
-                    feature_batch = feature_batch.to(TARGET_DEV)
-                    label_batch = label_batch.to(TARGET_DEV) # Label batch is Long
-                    current_batch_size = feature_batch.size(0) # Get batch size from features
+                    # <<< Move sequence, mask, and label to device >>>
+                    sequence_batch = sequence_batch.to(TARGET_DEV)  # Move sequence (Float32)
+                    mask_batch = mask_batch.to(TARGET_DEV)  # Move mask (Bool)
+                    label_batch = label_batch.to(TARGET_DEV)  # Move label (Long)
+                    # <<< Use sequence_batch to get batch size >>>
+                    current_batch_size = sequence_batch.size(0)
 
-                    # Prepare target tensor (logic remains the same)
+                    # Prepare target tensor (logic remains the same, uses label_batch)
                     target = label_batch
-                    if args.num_classes == 1: target = target.to(dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
-                    else: target = target.to(dtype=torch.long).view(current_batch_size)
+                    if args.num_classes == 1:
+                        target = target.to(dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
+                    else:
+                        target = target.to(dtype=torch.long).view(current_batch_size)
 
                     # --- Forward Pass (inside accumulation loop) ---
                     with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
-                        # <<< Pass the feature_batch [B, F] directly to the model >>>
-                        # HeadModel pooling_strategy should be 'none'
-                        y_pred = model(feature_batch)
+                        # <<< Pass the correct sequence_batch and mask_batch to the model >>>
+                        # HeadModel pooling_strategy should be 'attn'
+                        y_pred = model(sequence_batch, attention_mask=mask_batch)  # Pass sequence_batch
                         # <<< End Modification >>>
 
                         # Prepare prediction shape (logic remains the same)
@@ -895,19 +919,31 @@ def main():
     # 3. Setup Dataloaders (uses FeatureSequenceDataset, BucketBatchSampler)
     dataset, train_loader, val_loader = setup_dataloaders(args)
 
-    # 4. Calculate final training duration (after sampler length is known)
-    # args.steps_per_epoch is updated inside setup_dataloaders now
-    if args.steps_per_epoch == 0: exit("Error: steps_per_epoch is zero (sampler length is zero).")
+    # 4. Calculate final training duration (Corrected for Grad Acc)
+    if args.steps_per_epoch == 0: exit("Error: steps_per_epoch is zero.")
+
+    gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
+    # <<< Calculate GLOBAL steps per epoch >>>
+    global_steps_per_epoch = math.ceil(args.steps_per_epoch / gradient_accumulation_steps)
+    if global_steps_per_epoch == 0: global_steps_per_epoch = 1 # Avoid division by zero if epoch is too short
+    print(f"DEBUG Main: Micro-batches/epoch = {args.steps_per_epoch}, Grad Acc = {gradient_accumulation_steps}, Global Steps/epoch = {global_steps_per_epoch}")
+
+    # <<< Use global_steps_per_epoch for calculations >>>
     if args.max_train_steps is not None and args.max_train_steps > 0:
-        args.num_train_epochs = math.ceil(args.max_train_steps / args.steps_per_epoch)
+        # Calculate epochs needed based on GLOBAL steps
+        args.num_train_epochs = math.ceil(args.max_train_steps / global_steps_per_epoch)
+        print(f"DEBUG Main: Calculated num_train_epochs = {args.num_train_epochs} from max_train_steps={args.max_train_steps}")
     elif args.max_train_epochs is not None and args.max_train_epochs > 0:
         args.num_train_epochs = args.max_train_epochs
-        args.max_train_steps = args.num_train_epochs * args.steps_per_epoch
+        # Calculate total GLOBAL steps based on epochs
+        args.max_train_steps = args.num_train_epochs * global_steps_per_epoch
+        print(f"DEBUG Main: Calculated max_train_steps = {args.max_train_steps} from max_train_epochs={args.num_train_epochs}")
     else: # Default if neither specified
-        args.max_train_steps = 10000
-        args.num_train_epochs = math.ceil(args.max_train_steps / args.steps_per_epoch)
+        args.max_train_steps = 10000 # Default GLOBAL steps
+        args.num_train_epochs = math.ceil(args.max_train_steps / global_steps_per_epoch)
+        print(f"DEBUG Main: Defaulting to max_train_steps={args.max_train_steps}, calculated num_train_epochs={args.num_train_epochs}")
 
-    # 5. Setup Model (HeadModel) & Criterion
+    # 5. Setup Model & Criterion
     model, criterion = setup_model_criterion(args, dataset)
 
     # 6. Setup Optimizer, Scheduler (passing HeadModel)

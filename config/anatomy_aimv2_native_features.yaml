@@ -4,15 +4,16 @@
 # (Used for naming output files/runs)
 model:
   base: "AnatomyFlaws"
-  rev: "v9.1_adabelief_fl_AIMv2Native_3000" # New revision indicating feature mode
+  rev: "v9.6_adabelief_fl_AIMv2Native_3000" # New revision indicating feature mode
   arch: class                      # Still a classification task
-
+  base_vision_model: "apple/aimv2-large-patch14-native"
 # --- Data Configuration ---
 data:
   mode: features                   # <<< Crucial: Set mode to 'features' >>>
   data_root: ./data                # Root location for data folders
   # <<< Name of the subfolder containing the generated .npz features >>>
   feature_dir_name: "aimv2_large_patch14_native_SeqFeatures_fp16"
+
   # <<< Validation split count (applied to feature file list) >>>
   val_split_count: 300
 
@@ -20,29 +21,37 @@ data:
 # (Defines the HeadModel structure in head_model.py)
 head_params:
   features: 1024                   # <<< Input features from AIMv2 base (MUST MATCH features) >>>
-  pooling_strategy: 'none'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
+  pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
   hidden_dim: 1024                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
   dropout_rate: 0.218              # Dropout rate within the head
   output_mode: sigmoid             # <<< Output mode for the head
 
+# --- ADD New Section for Transformer Head ---
+transformer_head_params:
+  num_transformer_layers: 1 # Start with 1 layer
+  transformer_nhead: 8      # Heads (must divide features=1024)
+  transformer_dim_feedforward: 2048 # FFN dim (e.g., 2*features)
+  transformer_dropout: 0.1
+  pooling_after_transformer: 'avg' # Strategy after transformer ('avg', 'cls', 'attn')
+
 # --- Attention Pooling Parameters (Only if head_params.pooling_strategy='attn') ---
-attn_pool_params:
-  attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
-  attn_pool_dropout: 0.218         # Dropout for the Attention Pooling layer
+# attn_pool_params:
+  # attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
+  # attn_pool_dropout: 0.218         # Dropout for the Attention Pooling layer
 
 # --- Training Parameters ---
 train:
   # --- Training Duration ---
   # (Adjust based on faster training speed - maybe more steps/epochs feasible now?)
-  max_train_steps: 10000            # Example: 5k steps (adjust as needed)
-  # max_train_epochs: 20           # Can alternatively specify epochs
+  # max_train_steps: 2000            # Example: 5k steps (adjust as needed)
+  max_train_epochs: 40           # Can alternatively specify epochs
 
   # --- Core Settings ---
   # (Can likely use a higher LR now since only training head)
   lr: 1e-4                         # <<< Increased LR from E2E example >>>
   batch: 32                        # <<< Increase batch size significantly - head is small! >>>
-  gradient_accumulation_steps: 2   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
+  gradient_accumulation_steps: 1   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
   precision: "bf16"                # Mixed precision for training head
 
   # --- Loss Function ---
@@ -58,12 +67,12 @@ train:
   rectify: true
   weight_decouple: true
 
-  gamma: 0.005             # Gamma for FMARSCrop (float)
-  r_sf: 0.0                # R value for ScheduleFree (float)
-  wlpow_sf: 2.0            # Weight LR Power for ScheduleFree (float)
+  gamma: 0.005               # Gamma for FMARSCrop (float)
+  r_sf: 0.0                  # R value for ScheduleFree (float)
+  wlpow_sf: 2.0              # Weight LR Power for ScheduleFree (float)
   state_precision: parameter # Precision for optimizer state in ScheduleFree (parameter or float32)
-  adaptive_clip: 1.0       # Adaptive clipping threshold for ADOPT/FMARS/ScheduleFree variants
-  adaptive_clip_eps: 1e-3  # Epsilon for adaptive clipping
+  adaptive_clip: 1.0         # Adaptive clipping threshold for ADOPT/FMARS/ScheduleFree variants
+  adaptive_clip_eps: 1e-3    # Epsilon for adaptive clipping
 
   # --- Scheduler ---
   scheduler_name: "RexAnnealingWarmRestarts"
@@ -71,19 +80,19 @@ train:
   scheduler_gamma: 0.95
   scheduler_cycle_multiplier: 1.0
   # <<< Adjust first cycle steps to match max_train_steps >>>
-  scheduler_first_cycle_max_steps: 3000
+  scheduler_first_cycle_max_steps: 500
   scheduler_min_lr: 1e-7
   # <<< Adjust warmup steps relative to new steps/epoch (batch 64) >>>
   # If Steps/Epoch ≈ (2400 samples / 64 batch) ≈ 38 steps... maybe 50-100 warmup steps?
-  scheduler_warmup_steps: 500
+  scheduler_warmup_steps: 100
 
   # --- Data & Other ---
   seed: -1
   num_workers: 8                   # <<< Can use more workers now for loading NPZ >>>
   # preload_data: false            # Not applicable/needed for features mode
-  nsave: 1000                      # Periodic save frequency
+  nsave: 500                      # Periodic save frequency
   log_every_n: 1                  # Log training metrics frequency
-  validate_every_n: 100            # Validation frequency (adjust based on steps/epoch)
+  validate_every_n: 75            # Validation frequency (adjust based on steps/epoch)
   save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
 
 # --- Labels ---

@@ -31,76 +31,103 @@ class AttentionPool(nn.Module):
             dropout=dropout, batch_first=True
         )
         self.norm = nn.LayerNorm(embed_dim)
-    def forward(self, x):
+    # v1.1.0: Accept and use key_padding_mask
+    def forward(self, x, key_padding_mask=None): # Add mask argument
         batch_size = x.shape[0]
         query = self.query_token.expand(batch_size, -1, -1)
-        attn_output, _ = self.attention(query=query, key=x, value=x)
+        # <<< Pass key_padding_mask to attention layer >>>
+        # Mask should be True where padded (ignored), False where valid. Our mask is opposite.
+        # So we need to invert it IF MHA expects True for padding. Check docs.
+        # PyTorch MHA: key_padding_mask (bool): If specified, a mask indicating True for positions to be masked (padded).
+        # Our mask: True for real tokens, False for padding. So, invert it:
+        inverted_mask = ~key_padding_mask if key_padding_mask is not None else None
+
+        attn_output, _ = self.attention(
+            query=query, key=x, value=x,
+            key_padding_mask=inverted_mask # Pass the inverted mask
+        )
+        # <<< End Mask Passing >>>
         pooled_output = attn_output.squeeze(1)
         pooled_output = self.norm(pooled_output)
         return pooled_output
 
+
 # --- Head Model Definition ---
-# v1.1.0: Added L2 norm after pooling, less aggressive downprojection
+# v1.5.0: Use Transformer Encoder layers before pooling
 class HeadModel(nn.Module):
     """
-    Trainable Head (Pooler + MLP) for processing pre-computed feature sequences.
-    Takes sequence input [Batch, NumPatches, Features] and outputs predictions.
-    v1.1.0: Added L2 norm after pooling, less aggressive downprojection.
+    HeadModel using Transformer Encoder layers before pooling.
     """
     def __init__(self,
                  features: int,
                  num_classes: int,
-                 pooling_strategy: str = 'attn',
-                 hidden_dim: int = 1024,
-                 num_res_blocks: int = 3,
-                 dropout_rate: float = 0.2,
+                 # --- NEW Params ---
+                 num_transformer_layers: int = 1, # How many transformer layers to add
+                 transformer_nhead: int = 8,      # Heads for the new transformer layers
+                 transformer_dim_feedforward: int = None, # Dim for transformer FFN (default: features*2 or 4)
+                 transformer_dropout: float = 0.1,
+                 # --- Pooling after Transformer ---
+                 pooling_after_transformer: str = 'avg', # 'avg', 'cls', 'attn'
+                 # --- Existing MLP Params ---
+                 hidden_dim: int = 1024,        # Hidden dim for MLP *after* pooling
+                 num_res_blocks: int = 3,       # ResBlocks in MLP
+                 dropout_rate: float = 0.2,     # Dropout in MLP
                  output_mode: str = 'linear',
+                 # --- Old Pooling Params (only used if pooling_after_transformer='attn') ---
                  attn_pool_heads: int = 16,
                  attn_pool_dropout: float = 0.2
                  ):
         super().__init__()
-        self.pooling_strategy = pooling_strategy.lower()
         self.output_mode = output_mode.lower()
         self.num_classes = num_classes
-        current_features = features
+        self.pooling_after_transformer = pooling_after_transformer.lower()
 
-        # --- Logging (Unchanged) ---
-        print(f"Initializing HeadModel v1.1.0:") # Version bump
-        print(f"  Input Features: {features}, Pooling: {self.pooling_strategy}")
+        print(f"Initializing HeadModel v1.5.0 (Transformer Head):")
+        print(f"  Input Features: {features}")
+        print(f"  Transformer Layers: {num_transformer_layers}, Heads: {transformer_nhead}, Dropout: {transformer_dropout}")
+        print(f"  Pooling After Transformer: {self.pooling_after_transformer}")
         print(f"  MLP Hidden: {hidden_dim}, ResBlocks: {num_res_blocks}, Dropout: {dropout_rate}")
         print(f"  Output Mode: {self.output_mode}, Classes: {self.num_classes}")
-        print(f"  Changes: Added L2 Norm after pooling, Downprojection uses hidden_dim//2") # Log changes
 
-        # --- Optional Pooling Layer (Unchanged) ---
+        # --- Transformer Encoder Layers ---
+        if transformer_dim_feedforward is None:
+            transformer_dim_feedforward = features * 2 # A smaller FFN dim might be faster
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=features,
+            nhead=transformer_nhead,
+            dim_feedforward=transformer_dim_feedforward,
+            dropout=transformer_dropout,
+            activation='gelu', # Or 'relu'
+            batch_first=True,
+            norm_first=True # Pre-LN is often more stable
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+
+        # --- Pooling Layer (Optional: only if pooling_after_transformer='attn') ---
         self.pooler = None
-        if self.pooling_strategy == 'attn':
-             actual_attn_heads = attn_pool_heads
-             if features % attn_pool_heads != 0:
-                  possible_heads = [h for h in [1, 2, 4, 8, 16, 32] if features % h == 0]
-                  if not possible_heads: raise ValueError(f"Features ({features}) not divisible by any standard head count.")
-                  actual_attn_heads = min(possible_heads, key=lambda x:abs(x-attn_pool_heads))
-                  print(f"  Warning: Adjusting pooling attn heads from {attn_pool_heads} to {actual_attn_heads} for features={features}.")
-             self.pooler = AttentionPool(embed_dim=features, num_heads=actual_attn_heads, dropout=attn_pool_dropout)
-             print(f"  Using Attention Pooling (Heads: {actual_attn_heads}, Dropout: {attn_pool_dropout})")
-        elif self.pooling_strategy not in ['avg', 'none']:
-             print(f"Warning: Unknown pooling strategy '{self.pooling_strategy}'. Defaulting to average pooling.")
-             self.pooling_strategy = 'avg'
+        if self.pooling_after_transformer == 'attn':
+             self.pooler = AttentionPool(
+                 embed_dim=features,
+                 num_heads=attn_pool_heads, # Use separate head count for pooling?
+                 dropout=attn_pool_dropout
+             )
+             print(f"  Using Attention Pooling after Transformer")
 
-        # --- MLP Head ---
-        print("  Initializing MLP Head (v1.1.0)...")
-        self.head = nn.Sequential(
-            nn.LayerNorm(current_features), # Norm applied *before* projection now
-            nn.Linear(current_features, hidden_dim),
+        # --- MLP Head (Takes features dimension as input) ---
+        # Input dim to MLP is always `features` after pooling
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(features), # Norm the pooled features
+            nn.Linear(features, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout_rate), # Dropout after initial projection
+            nn.Dropout(dropout_rate),
             *[ResBlock(ch=hidden_dim) for _ in range(num_res_blocks)],
-            # --- MODIFIED Down projection part ---
-            nn.Linear(hidden_dim, hidden_dim // 2), # <<< CHANGED: Less aggressive reduction
+            # Use the less aggressive bottleneck
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
-            nn.Dropout(dropout_rate / 2), # <<< Optional: Reduce dropout here slightly? Default 0.1 if rate is 0.2
-            nn.Linear(hidden_dim // 2, self.num_classes) # <<< CHANGED: Final output layer
-            # --- END MODIFICATION ---
+            nn.Dropout(dropout_rate / 2),
+            nn.Linear(hidden_dim // 2, self.num_classes)
         )
 
         # --- Validate Output Mode (Unchanged) ---
@@ -109,24 +136,42 @@ class HeadModel(nn.Module):
             raise ValueError(f"Invalid output_mode '{self.output_mode}'. Must be one of {valid_modes}")
         # Warnings about num_classes vs mode remain the same...
 
-    def forward(self, sequence):
-        # Input sequence shape: [BatchSize, NumPatches, Features]
-        features = sequence
+    def forward(self, sequence, attention_mask=None):
+        # Input sequence shape: [B, SeqLen, Features] (e.g., [B, 4096, 1024])
+        # Input attention_mask shape: [B, SeqLen] (Bool: True=Real, False=Pad)
 
-        # --- Apply Pooling ---
-        if features.ndim == 3: # Only pool if it's a sequence
-            if self.pooler is not None: features = self.pooler(features) # Output: [BatchSize, Features]
-            elif self.pooling_strategy == 'avg': features = torch.mean(features, dim=1) # Average over patches -> [BatchSize, Features]
-            # If strategy is 'none', features should already be [BatchSize, Features]
-        elif features.ndim != 2:
-             raise ValueError(f"Unexpected input dimension to HeadModel forward: {features.ndim}. Expected 2 or 3.")
+        # Invert mask for TransformerEncoderLayer (True = Ignore)
+        src_key_padding_mask = ~attention_mask if attention_mask is not None else None
 
-        # <<< ADDED: Apply L2 Normalization AFTER Pooling >>>
-        # Normalize the pooled features before passing to the head MLP
-        features = F.normalize(features, p=2, dim=-1) # Normalize along the feature dimension
+        # 1. Pass through Transformer Encoder Layers
+        # Input needs to be Float32 potentially? Or handle via AMP. Assume AMP handles.
+        transformer_output = self.transformer_encoder(sequence, src_key_padding_mask=src_key_padding_mask)
+        # Output shape: [B, SeqLen, Features]
 
-        # --- Apply Head ---
-        logits = self.head(features) # Input `features` is now normalized [BatchSize, Features]
+        # 2. Pool the output sequence
+        pooled_features = None
+        if self.pooling_after_transformer == 'avg':
+             # Need to handle mask for averaging correctly! Average only non-padded tokens.
+             if attention_mask is not None:
+                  mask_expanded = attention_mask.unsqueeze(-1).expand_as(transformer_output) # [B, SeqLen, F]
+                  masked_sum = torch.sum(transformer_output * mask_expanded.float(), dim=1) # Sum only real tokens
+                  num_real_tokens = attention_mask.sum(dim=1, keepdim=True).clamp(min=1) # Count real tokens [B, 1]
+                  pooled_features = masked_sum / num_real_tokens # [B, F]
+             else: # No mask provided
+                  pooled_features = torch.mean(transformer_output, dim=1) # Simple average [B, F]
+
+        elif self.pooling_after_transformer == 'cls':
+             pooled_features = transformer_output[:, 0, :] # Take the output corresponding to the first token [B, F]
+        elif self.pooling_after_transformer == 'attn':
+             if self.pooler is None: raise ValueError("Attn pooling selected but pooler not initialized.")
+             # AttentionPool expects mask where True=Ignore (inverted mask)
+             pooled_features = self.pooler(transformer_output, key_padding_mask=src_key_padding_mask) # [B, F]
+        else:
+             raise ValueError(f"Unknown pooling_after_transformer strategy: {self.pooling_after_transformer}")
+
+        # 3. Pass pooled features through MLP Head
+        logits = self.mlp_head(pooled_features)
+
 
         # --- Apply Activation (Unchanged) ---
         output = None

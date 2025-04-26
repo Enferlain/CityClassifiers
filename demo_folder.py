@@ -1,6 +1,8 @@
 # v1.1: Improved config handling, argument clarity, pipeline call
 
 import os
+import traceback
+
 import torch
 import argparse
 from PIL import Image
@@ -10,10 +12,10 @@ import json # Needed for reading config to get labels
 
 # Make sure inference classes are imported correctly
 try:
-    from inference import CityAestheticsPipeline, CityClassifierPipeline, _load_config_helper # Import helper
+    # <<< ADD HeadSequencePipeline to imports >>>
+    from inference import CityAestheticsPipeline, CityClassifierPipeline, HeadSequencePipeline, _load_config_helper
 except ImportError:
     print("Error: Could not import pipeline classes or helpers from inference.py.")
-    print("Ensure inference.py is in the same directory or accessible in PYTHONPATH.")
     exit(1)
 
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp"]
@@ -25,7 +27,7 @@ def parse_args():
     parser.add_argument('--model', required=True, help="Path to the .safetensors model checkpoint file")
     # NEW: Optional explicit config path
     parser.add_argument('--config', default=None, help="(Optional) Path to the model's .config.json file. If None, attempts to infer from model path.")
-    parser.add_argument("--arch", choices=["score", "class"], required=True, help="Model type (score or class)") # Made required
+    parser.add_argument("--arch", choices=["score", "class", "head_sequence"], required=True, help="Model type (score, class, or head_sequence for HeadModel trained on features)")
     # Args for filtering/copying
     parser.add_argument('--min_score', type=int, default=0, help="Lower limit (inclusive) for score/probability percentage")
     parser.add_argument('--max_score', type=int, default=100, help="Upper limit (inclusive) for score/probability percentage")
@@ -44,74 +46,72 @@ def parse_args():
     if args.arch == "class" and args.target_label_name is None:
         parser.error("--target_label_name is required when --arch is class.")
 
+    # For now, let's assume target_label_name is needed for head_sequence too if filtering.
+    if args.arch == "head_sequence" and args.target_label_name is None and (args.min_score > 0 or args.max_score < 100):
+         parser.error("--target_label_name is required when filtering with --arch head_sequence.")
+
     return args
 
-# v1.2: Pass tiling args correctly using keywords
+# v1.4: Handle head_sequence arch output
 def process_file(pipeline, config_labels, args, src_path, dst_path):
     """Processes a single image file."""
     try:
         img = Image.open(src_path)
-    except Exception as e:
-        print(f"\nError opening image {src_path}: {e}. Skipping.")
-        return
+    except Exception as e: print(f"\nError opening image {src_path}: {e}. Skipping."); return
 
     try:
-        # Pass tiling arguments as KEYWORDS using values from args object
-        # v1.3: Corrected keyword for first argument
-        if args.arch == "class":
+        # Make prediction (handle different pipeline __call__ signatures)
+        pred_dict = {} # Initialize
+        if args.arch == "score":
+             score_val = pipeline(img) # Returns float
+             # Convert float score to dict format expected below
+             # Assuming score is probability of 'positive' class (label '1')
+             pos_label = config_labels.get('1', '1') # Get label name for score
+             neg_label = config_labels.get('0', '0')
+             pred_dict[pos_label] = score_val
+             pred_dict[neg_label] = 1.0 - score_val
+        elif args.arch == "class":
              pred_dict = pipeline(
-                 raw_pil_image=img,             # <<< CHANGED raw= to raw_pil_image=
+                 raw_pil_image=img,
                  tiling=args.use_tiling,
                  tile_strat=args.tile_strategy
-             )
-        else: # Score pipeline __call__ takes only one positional arg
-             pred_dict = pipeline(img)          # Keep positional for Aesthetics pipeline
+             ) # Returns dict
+        elif args.arch == "head_sequence":
+             pred_dict = pipeline(raw_pil_image=img) # Returns dict, no tiling args needed
+        else:
+             print(f"Error: Unknown arch '{args.arch}' in process_file."); return
 
-        score_to_display = -1 # Default if error
+        score_to_display = -1 # Default if error/label not found
 
-        if args.arch == "score":
-            # For score, pred_dict is just the float score
-            score_to_display = int(pred_dict * 100)
-        elif args.arch == "class":
-            # For class, pred_dict is a dictionary {'Label Name': probability}
-            # Find the probability for the target label name
-            target_prob = pred_dict.get(args.target_label_name)
-
-            if target_prob is not None:
-                score_to_display = int(target_prob * 100)
-            else:
-                print(f"\nWarning: Target label '{args.target_label_name}' not found in prediction keys: {list(pred_dict.keys())} for image {os.path.basename(src_path)}")
-                # Try finding by index as fallback (less reliable)
-                label_index = None
-                for idx, name in config_labels.items(): # Use labels from loaded config
-                     if name == args.target_label_name:
-                          label_index = idx
-                          break
-                if label_index is not None:
-                     fallback_prob = pred_dict.get(label_index) # Try getting by index string
-                     if fallback_prob is not None:
-                          print(f"  Using fallback score based on index '{label_index}'.")
-                          score_to_display = int(fallback_prob * 100)
-                     else: print("  Fallback score by index also failed.")
-                else: print("  Could not find corresponding index for target label name.")
+        # Get the score for the target label (works for class and head_sequence now)
+        if args.target_label_name:
+             target_prob = pred_dict.get(args.target_label_name)
+             if target_prob is not None:
+                 score_to_display = int(target_prob * 100)
+             else:
+                  print(f"\nWarning: Target label '{args.target_label_name}' not found in prediction keys: {list(pred_dict.keys())} for image {os.path.basename(src_path)}")
+                  # Fallback logic for class index might be complex here, skip for now
+        elif args.arch == "score": # If arch is score, just use the positive class prob
+             pos_label = config_labels.get('1', '1')
+             target_prob = pred_dict.get(pos_label)
+             if target_prob is not None: score_to_display = int(target_prob * 100)
+        else: # Classifier arch but no target label specified
+             print(f"Warning: No target_label_name specified for arch '{args.arch}'. Cannot display/filter score.")
 
     except Exception as e:
-        print(f"\nError during prediction for {src_path}: {e}")
-        score_to_display = -1 # Indicate error
+        print(f"\nError during prediction for {src_path}: {e}"); traceback.print_exc(); score_to_display = -1
 
-    # --- Display and Copy Logic ---
+    # --- Display and Copy Logic (remains mostly the same) ---
+    display_label = f" ({args.target_label_name})" if args.target_label_name else ""
     if score_to_display != -1:
-        tqdm.write(f" {score_to_display:>3}% [{os.path.basename(src_path)}]" + (f" ({args.target_label_name})" if args.arch == 'class' else ""))
+        tqdm.write(f" {score_to_display:>3}% [{os.path.basename(src_path)}]{display_label}")
         if args.min_score <= score_to_display <= args.max_score:
             if dst_path:
                 try:
-                    # Ensure destination directory exists
                     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                    shutil.copy2(src_path, dst_path) # copy2 preserves more metadata
-                except Exception as e_copy:
-                    print(f"\nError copying {src_path} to {dst_path}: {e_copy}")
+                    shutil.copy2(src_path, dst_path)
+                except Exception as e_copy: print(f"\nError copying {src_path} to {dst_path}: {e_copy}")
     else:
-        # Only print error cases if prediction failed
         tqdm.write(f" ERR [{os.path.basename(src_path)}]")
 
 
@@ -220,16 +220,19 @@ if __name__ == "__main__":
 
     pipeline = None
     try:
-        # <<< Pipeline initialization now loads the config internally >>>
+        # <<< --- ADD HeadSequencePipeline Case --- >>>
         if args.arch == "score":
             pipeline = CityAestheticsPipeline(args.model, config_path=config_path, **pipeline_args)
         elif args.arch == "class":
             pipeline = CityClassifierPipeline(args.model, config_path=config_path, **pipeline_args)
+        elif args.arch == "head_sequence":
+            # Use the new pipeline, pass head model path and config
+            pipeline = HeadSequencePipeline(args.model, config_path=config_path, **pipeline_args)
         else:
              raise ValueError(f"Unknown model architecture '{args.arch}'")
+        # <<< --- END ADD --- >>>
     except Exception as e_pipe:
-         print(f"\nError initializing pipeline: {e_pipe}")
-         exit(1)
+         print(f"\nError initializing pipeline: {e_pipe}"); traceback.print_exc(); exit(1)
     # --- End Pipeline Setup ---
 
     # <<< GET Labels AFTER Pipeline Init >>>

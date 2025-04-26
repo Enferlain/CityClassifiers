@@ -2,6 +2,8 @@
 
 import os
 import json
+import traceback
+
 import torch
 import torchvision.transforms.functional as TF # This might already be there for tiling?
 import torch.nn.functional as F # <<< ADD THIS LINE or make sure it exists!
@@ -11,13 +13,13 @@ from transformers import AutoProcessor, AutoModel
 from PIL import Image
 import math # For isnan checks maybe
 
-# Ensure model and utility functions are imported correctly
+# --- Import Models ---
 try:
-    from model import PredictorModel
-    from utils import get_embed_params
+    from model import PredictorModel # For old pipelines
+    from head_model import HeadModel # <<< ADD THIS IMPORT >>>
+    from utils import get_embed_params # Keep utils import
 except ImportError as e:
-    print(f"Error importing PredictorModel or get_embed_params: {e}")
-    print("Ensure model.py and utils.py are in the same directory or accessible.")
+    print(f"Error importing model classes or get_embed_params: {e}")
     raise
 
 try:
@@ -27,6 +29,9 @@ try:
 except ImportError:
     print("Warning: timm library not found. Cannot use TIMM models for inference.")
     TIMM_AVAILABLE = False
+
+# Define target_len, maybe make it configurable later
+TARGET_LEN_INFERENCE = 4096
 
 
 # --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
@@ -159,10 +164,10 @@ def _load_model_helper(model_path, expected_features, expected_outputs=None):
 #        Base Pipeline Class
 # ================================================
 class BasePipeline:
-    """Base class for inference pipelines."""
+    # v1.1.0: Read base config keys directly
     def __init__(self, model_path: str, config_path: str = None, device: str = "cpu", clip_dtype: torch.dtype = torch.float32):
         self.device = device
-        self.clip_dtype = clip_dtype # Dtype for vision model computation
+        self.clip_dtype = clip_dtype
         self.model_path = model_path
 
         # --- Config Loading ---
@@ -174,31 +179,28 @@ class BasePipeline:
         self.config_path = config_path
         self.config = _load_config_helper(self.config_path)
         if self.config is None: raise ValueError("Failed to load configuration.")
-        # --- End Config Loading ---
+        print(f"DEBUG: Config keys loaded: {list(self.config.keys())}") # Add print
 
-        # --- Store Embed Version ---
-        self.embed_ver = self.config.get("model", {}).get("embed_ver", "unknown")
+        # --- Store Embed Version (Read directly) ---
+        # <<< FIX 1: Read 'embed_ver' from top level >>>
+        self.embed_ver = self.config.get("embed_ver") # Can be None if not present
+        if self.embed_ver is None: self.embed_ver = "unknown" # Default if None or missing
         print(f"DEBUG BasePipeline: Found embed_ver: {self.embed_ver}")
-        # --- End Store Embed Version ---
 
-        # --- Vision Model Setup ---
-        self.base_vision_model_name = self.config.get("model", {}).get("base_vision_model")
+        # --- Vision Model Setup (Read directly) ---
+        # <<< FIX 2: Read 'base_vision_model' from top level >>>
+        self.base_vision_model_name = self.config.get("base_vision_model")
         if not self.base_vision_model_name:
-            # Fallback if missing (shouldn't happen with new config)
+            # Now this error is correct if the key is truly missing from the top level
             raise ValueError("Missing 'base_vision_model' in config file.")
+        print(f"DEBUG BasePipeline: Found base_vision_model: {self.base_vision_model_name}")
 
-        # <<< Initialize vision model attributes >>>
-        self.vision_model_type = "unknown" # To store 'hf' or 'timm'
-        self.vision_model = None           # Stores the actual model (HF AutoModel or TIMM model)
-        self.hf_processor = None           # Stores HF processor (if HF model)
-        self.timm_transforms = None        # Stores TIMM transforms (if TIMM model)
-        self.proc_size = 512               # Default/HF processor size
-        # <<< End Initialize >>>
+        # --- Initialize vision model attributes ---
+        self.vision_model_type = "unknown"; self.vision_model = None; self.hf_processor = None;
+        self.timm_transforms = None; self.proc_size = 512;
+        self._init_vision_model() # Call the init function
 
-        self._init_vision_model() # Call the updated init function
-        # --- End Vision Model Setup ---
-
-        # <<< START NEW: Select Preprocessing Function >>>
+        # --- Preprocessing function selection ---
         self.preprocess_func = None
         if "NaflexResize" in self.embed_ver or "naflex" in self.embed_ver.lower(): # Check if it's a NaFlex embedding
             print("DEBUG BasePipeline: Selecting NaFlex resize preprocessing.")
@@ -290,7 +292,7 @@ class BasePipeline:
             self.vision_model_type = "hf"
             print("  Detected Hugging Face model type.")
             try:
-                self.hf_processor = AutoProcessor.from_pretrained(model_name)
+                self.hf_processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
                 self.vision_model = AutoModel.from_pretrained(
                     model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
                 ).to(self.device).eval()
@@ -649,6 +651,124 @@ class BasePipeline:
         # Return predictions on CPU
         return pred.detach().cpu()
 
+    # <<< --- NEW METHOD to Load HeadModel --- >>>
+    # v1.9.1: Load HeadModel params from top-level config keys
+    def _load_head_model(self, head_model_path: str):
+        """Loads the HeadModel state dict using config (reading top-level keys)."""
+        print(f"DEBUG _load_head_model: Loading head from {os.path.basename(head_model_path)}...")
+        if not self.config: raise ValueError("Pipeline configuration not loaded.")
+
+        # --- Get Parameters directly from self.config ---
+        # No longer expect head_params_conf dictionary
+
+        # Load necessary params (use self.config.get)
+        expected_features = self.config.get("head_features") # <<< Read from top level
+        if expected_features is None:
+            if self.vision_model and hasattr(self.vision_model, 'config') and hasattr(self.vision_model.config,
+                                                                                      'hidden_size'):
+                expected_features = self.vision_model.config.hidden_size
+                print(f"DEBUG: Inferred head input features from vision model config: {expected_features}")
+            else:
+                try:
+                    expected_features = get_embed_params(self.embed_ver)["features"]
+                except Exception as e:
+                    raise ValueError(
+                        f"Could not determine features for HeadModel from config, vision model, or embed_ver '{self.embed_ver}': {e}")
+
+            # Determine num_classes (remains the same logic, reads from top level)
+        num_classes = self.config.get("num_classes", self.config.get("num_labels"))
+        if num_classes is None:
+             # Try inferring from state dict as last resort (less ideal)
+             print("Warning: 'num_classes'/'num_labels' not found in config. Inferring from state dict.")
+             try:
+                 # NOTE: The key finding logic needs to be robust here, assuming sequential head
+                 sd_temp = load_file(head_model_path)
+                 head_keys = [k for k in sd_temp if k.startswith("head.")]
+                 final_layer_key = None
+                 if head_keys:
+                     try:
+                         max_idx = max(int(k.split('.')[1]) for k in head_keys if k.split('.')[1].isdigit())
+                         potential_key = f"head.{max_idx}.bias"
+                         if potential_key in sd_temp: final_layer_key = potential_key
+                     except:
+                         pass
+                 if final_layer_key is None: raise KeyError("Could not determine final layer bias key")
+                 outputs_in_file = sd_temp[final_layer_key].shape[0]
+                 del sd_temp
+                 num_classes = outputs_in_file
+             except Exception as e_sd:
+                 raise ValueError(f"Cannot determine num_classes from config or state dict: {e_sd}")
+             num_classes = int(num_classes)
+
+        # --- Load other HeadModel parameters directly from self.config ---
+        pooling_strategy = self.config.get('pooling_strategy', 'attn') # <<< Read from top level
+        hidden_dim = self.config.get('head_hidden_dim', 1024)        # <<< Read from top level
+        num_res_blocks = self.config.get('head_num_res_blocks', 3)     # <<< Read from top level
+        dropout_rate = self.config.get('head_dropout_rate', 0.2)      # <<< Read from top level
+        output_mode = self.config.get('head_output_mode', 'linear')   # <<< Read from top level
+        # Get attn pool params even if pooling is none, for robust init
+        attn_pool_heads = self.config.get('attn_pool_heads', 16)       # <<< Read from top level (might be missing if not used)
+        attn_pool_dropout = self.config.get('attn_pool_dropout', 0.2) # <<< Read from top level (might be missing if not used)
+
+        # --- Load State Dict ---
+        # Adapt _load_model_helper if needed, or load directly here
+        if not os.path.isfile(head_model_path):
+            raise FileNotFoundError(f"HeadModel file not found: {head_model_path}")
+        try:
+             sd = load_file(head_model_path)
+             # Re-check outputs_in_file here too for safety
+             head_keys = [k for k in sd if k.startswith("head.")]
+             final_layer_key = None
+             if head_keys:
+                 try:
+                      max_idx = max(int(k.split('.')[1]) for k in head_keys if k.split('.')[1].isdigit())
+                      potential_key = f"head.{max_idx}.bias"
+                      if potential_key in sd: final_layer_key = potential_key
+                 except: pass
+             if final_layer_key is None: raise KeyError("Could not determine final layer bias key")
+             outputs_in_file = sd[final_layer_key].shape[0]
+
+             if num_classes != outputs_in_file:
+                  print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}). Using state dict value.")
+                  num_classes = outputs_in_file
+        except Exception as e: raise ValueError(f"Error re-checking state dict outputs: {e}")
+
+        # --- Consistency Check ---
+        if num_classes != outputs_in_file:
+             print(f"Warning: Configured num_classes ({num_classes}) != Outputs in state dict ({outputs_in_file}). Using state dict value.")
+             num_classes = outputs_in_file # Prioritize state dict
+
+        # --- Instantiate HeadModel ---
+        try:
+            model = HeadModel(
+                features=expected_features, # Input feature dim
+                num_classes=num_classes,    # Verified number of classes
+                pooling_strategy=pooling_strategy, # From config ('none' expected)
+                hidden_dim=hidden_dim,
+                num_res_blocks=num_res_blocks,
+                dropout_rate=dropout_rate,
+                output_mode=output_mode,
+                attn_pool_heads=attn_pool_heads,
+                attn_pool_dropout=attn_pool_dropout
+            )
+        except Exception as e:
+            raise TypeError(f"Failed to instantiate HeadModel: {e}") from e
+
+        # --- Load State Dict into Model ---
+        model.eval()
+        try:
+             # Use strict=True unless migrating requires False
+             missing_keys, unexpected_keys = model.load_state_dict(sd, strict=True)
+             if unexpected_keys: print(f"Warning: Unexpected keys found loading HeadModel state dict: {unexpected_keys}")
+             if missing_keys: print(f"Warning: Missing keys loading HeadModel state dict: {missing_keys}")
+        except RuntimeError as e:
+            print(f"ERROR: State dict mismatch loading into HeadModel for {head_model_path}.")
+            raise e
+
+        model.to(self.device)
+        print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling='{model.pooling_strategy}', output_mode='{model.output_mode}').")
+        self.model = model # Assign to instance variable (overwrites PredictorModel if loaded before)
+
 # ================================================
 #        Aesthetics Pipeline (Scorer)
 # ================================================
@@ -998,6 +1118,180 @@ class CityClassifierMultiModelPipeline(BasePipeline):
             value = pred_to_format[k].item() if isinstance(pred_to_format[k], torch.Tensor) else pred_to_format[k]
             out[key] = float(value)
         return out
+
+
+# ================================================
+#        Head Sequence Pipeline
+# ================================================
+class HeadSequencePipeline(BasePipeline):
+    """Pipeline for HeadModels trained on pre-computed sequences with padding/masking."""
+    # v1.1.0: Updated for padding/masking inference
+    def __init__(self, head_model_path: str, config_path: str = None, device: str = "cpu", clip_dtype: torch.dtype = torch.float32):
+        super().__init__(model_path=head_model_path, config_path=config_path, device=device, clip_dtype=clip_dtype)
+
+        self.labels = self.config.get("labels", {})
+        if not self.labels:
+             num_classes = self.config.get("num_classes", self.config.get("num_labels", 0))
+             self.labels = {str(i): str(i) for i in range(num_classes)}
+
+        # <<< --- Get target_len used during training (if saved, else use default) --- >>>
+        # Check if 'fixed_len' or similar was saved in config, otherwise use default
+        self.target_len = self.config.get("fixed_len", TARGET_LEN_INFERENCE)
+        print(f"HeadSequencePipeline: Using target_len={self.target_len} for padding/masking.")
+
+        # Load the HeadModel (expects pooling_strategy='attn' in config now)
+        self._load_head_model(head_model_path)
+        if not hasattr(self.model, 'pooling_strategy') or self.model.pooling_strategy != 'attn':
+             print(f"Warning: Loaded HeadModel pooling is '{getattr(self.model, 'pooling_strategy', 'N/A')}', but padding/masking pipeline expects 'attn'.")
+
+        self.num_labels = self.model.num_classes
+
+        print(f"HeadSequencePipeline (Padding/Masking Mode): Init OK (Labels: {self.labels}, TargetLen: {self.target_len}, Outputs: {self.num_labels})")
+
+    # --- Helper: Extract and Normalize Sequence ---
+    # v1.1.0: Renamed and simplified: only extracts and normalizes
+    @torch.no_grad()
+    def _extract_and_normalize_sequence(self, pil_image: Image.Image) -> torch.Tensor | None:
+        """Extracts sequence using vision model and normalizes it."""
+        if self.vision_model is None or self.hf_processor is None:
+             print("Error: Vision model/processor not initialized."); return None
+
+        # 1. Preprocess Image (Handle >4096 patches resize)
+        img_to_process = pil_image
+        try:
+            original_width, original_height = pil_image.size
+            if original_width <= 0 or original_height <= 0: raise ValueError("Invalid image dimensions")
+
+            TARGET_MAX_PATCHES = self.target_len # Use pipeline's target_len
+            PATCH_SIZE = 14
+
+            patches_w_initial = math.floor(original_width / PATCH_SIZE)
+            patches_h_initial = math.floor(original_height / PATCH_SIZE)
+            total_patches_initial = patches_w_initial * patches_h_initial
+
+            if total_patches_initial > TARGET_MAX_PATCHES:
+                # Replicate the resizing logic from generate_features
+                scale_factor = math.sqrt(TARGET_MAX_PATCHES / total_patches_initial)
+                resize_needed = True
+                max_iterations = 10
+                iterations = 0
+                while iterations < max_iterations:
+                    target_w = int(original_width * scale_factor + 0.5)
+                    target_h = int(original_height * scale_factor + 0.5)
+                    if target_w < 1: target_w = 1;
+                    if target_h < 1: target_h = 1;
+                    new_patches_w = math.floor(target_w / PATCH_SIZE)
+                    new_patches_h = math.floor(target_h / PATCH_SIZE)
+                    if new_patches_w * new_patches_h <= TARGET_MAX_PATCHES:
+                        # print(f"  - Resizing ({original_width}x{original_height}, {total_patches_initial}p) -> ({target_w}x{target_h}, {new_patches_w * new_patches_h}p)")
+                        img_to_process = pil_image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                        resize_needed = False
+                        break
+                    scale_factor *= 0.995
+                    iterations += 1
+                if resize_needed: print(
+                    f"Warning: Could not find suitable resize. Using original."); img_to_process = pil_image;
+
+        except Exception as e_resize: print(f"Error during inference resize check: {e_resize}"); return None
+
+        # 2. Extract Sequence (last_hidden_state)
+        feature_sequence = None
+        try:
+            with torch.amp.autocast(device_type=self.device, enabled=(self.clip_dtype != torch.float32), dtype=self.clip_dtype):
+                 inputs = self.hf_processor(images=[img_to_process], return_tensors="pt").to(self.device)
+                 outputs = self.vision_model(**inputs)
+                 if hasattr(outputs, 'last_hidden_state'):
+                     feature_sequence = outputs.last_hidden_state # Shape [1, N, F]
+                 else: raise ValueError("Model output missing 'last_hidden_state'")
+        except Exception as e_extract: print(f"Error extracting features: {e_extract}"); return None
+
+        if feature_sequence is None or feature_sequence.ndim != 3 or feature_sequence.shape[0] != 1:
+             print(f"Error: Invalid feature sequence shape {feature_sequence.shape if feature_sequence is not None else 'None'}."); return None
+
+        # 3. Normalize Sequence
+        try:
+             feature_sequence = F.normalize(feature_sequence, p=2, dim=-1) # Normalize [1, N, F] along F dim
+             if torch.isnan(feature_sequence).any(): raise ValueError("NaN detected after normalization")
+        except Exception as e_norm: print(f"Error during sequence normalization: {e_norm}"); return None
+
+        # <<< --- Return the normalized sequence on GPU --- >>>
+        # Keep on GPU, convert to Float32 for subsequent processing
+        return feature_sequence.squeeze(0).float() # Shape [N, F], Float32
+
+    # --- Main Call Method ---
+    # v1.1.0: Implements padding/masking before calling HeadModel
+    def __call__(self, raw_pil_image: Image.Image) -> dict:
+        """Processes image, extracts+normalizes sequence, pads/masks, runs HeadModel."""
+
+        # 1. Extract and Normalize Sequence
+        # Returns shape [N, F] on GPU, Float32
+        norm_sequence = self._extract_and_normalize_sequence(raw_pil_image)
+
+        if norm_sequence is None:
+            return {"error": "Failed to extract or normalize sequence"}
+
+        # 2. Pad/Truncate Sequence and Create Mask
+        try:
+            current_len = norm_sequence.shape[0]
+            features_dim = norm_sequence.shape[1]
+            # Create tensors on the same device as the sequence
+            final_sequence_gpu = torch.zeros((self.target_len, features_dim), dtype=torch.float32, device=norm_sequence.device)
+            attention_mask_gpu = torch.zeros(self.target_len, dtype=torch.bool, device=norm_sequence.device)
+
+            if current_len == 0:
+                 print("Warning: Empty normalized sequence. Using zero padding.")
+            elif current_len > self.target_len:
+                 # This shouldn't happen if generation capped length, but handle defensively
+                 print(f"Warning: Inference sequence length {current_len} > target {self.target_len}. Truncating.")
+                 final_sequence_gpu = norm_sequence[:self.target_len, :]
+                 attention_mask_gpu[:] = True # All real tokens
+            else: # Pad
+                 final_sequence_gpu[:current_len, :] = norm_sequence
+                 attention_mask_gpu[:current_len] = True # Mark real tokens
+
+            # Add batch dimension for the model
+            final_sequence_batch = final_sequence_gpu.unsqueeze(0) # Shape [1, target_len, F]
+            attention_mask_batch = attention_mask_gpu.unsqueeze(0) # Shape [1, target_len]
+
+        except Exception as e_pad:
+             print(f"Error during padding/masking: {e_pad}"); return {"error": "Padding/masking failed"}
+
+        # 3. Run Head Model Prediction
+        # self.model is the loaded HeadModel, expects Float32 input [B, Seq, F] and mask [B, Seq]
+        try:
+            with torch.no_grad():
+                 # Pass sequence AND mask
+                 pred = self.model(final_sequence_batch, attention_mask=attention_mask_batch)
+        except Exception as e_pred:
+             print(f"Error during HeadModel prediction: {e_pred}"); traceback.print_exc(); return {"error": "Prediction failed"}
+
+        # 4. Format Output (remains the same as before)
+        pred_cpu = pred.detach().cpu()
+        formatted_output = {}
+        try:
+            if self.num_labels == 1:
+                scalar_value = pred_cpu.item()
+                final_score = scalar_value
+                if self.model.output_mode == 'linear': final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
+                pos_label_name = self.labels.get('1', '1')
+                neg_label_name = self.labels.get('0', '0')
+                formatted_output[neg_label_name] = float(1.0 - final_score)
+                formatted_output[pos_label_name] = float(final_score)
+            elif self.num_labels > 1:
+                probabilities = pred_cpu.squeeze(0)  # Shape [C]
+                if self.model.output_mode == 'linear': probabilities = F.softmax(probabilities, dim=-1)
+                for k in range(self.num_labels):
+                    label_index_str = str(k)
+                    key = self.labels.get(label_index_str, label_index_str)
+                    value = probabilities[k].item()
+                    formatted_output[key] = float(value)
+            else:
+                formatted_output = {"error": f"Invalid num_labels: {self.num_labels}"}
+        except Exception as e_format:
+            print(f"Error formatting prediction: {e_format}"); return {"error": "Formatting failed"}
+
+        return formatted_output
+
 
 # --- get_model_path (Utility) ---
 # v1.1: Corrected path joining for local dir

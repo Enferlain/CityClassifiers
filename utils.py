@@ -19,19 +19,12 @@ LOSS_MEMORY = 500 # How many recent steps' training loss to average for display
 SAVE_FOLDER = "models" # Folder to save models and configs
 
 
-# --- Argument Parsing and Config Loading ---
-# Version 3.0.0: Loads ONLY from YAML config, supports 3 data modes.
+# Version 3.1.0: Always load base_vision_model and embed_ver for inference needs.
 def parse_and_load_args(config_path: str):
     """
-    Loads configuration SOLELY from a YAML file based on specified data_mode.
-
-    Args:
-        config_path (str): Path to the YAML configuration file.
-
-    Returns:
-        argparse.Namespace: Populated namespace object with configuration values.
+    Loads configuration SOLELY from a YAML file.
+    Ensures base_vision_model is always loaded for inference compatibility.
     """
-    # Load YAML config
     if not os.path.isfile(config_path):
          raise FileNotFoundError(f"Config file '{config_path}' not found.")
     try:
@@ -66,34 +59,40 @@ def parse_and_load_args(config_path: str):
          except (KeyError, TypeError):
              return default # Return default if key path doesn't exist
 
-    # --- Load Common / Top-Level Settings ---
+    # --- Load Common / Top-Level Settings (no changes here) ---
     args.data_root = get_optional_config("data_root", conf, default="data")
     args.wandb_project = get_optional_config("wandb_project", conf, default="city-classifiers")
-    args.resume = get_optional_config("resume", conf, default=None) # Allow resuming
+    args.resume = get_optional_config("resume", conf, default=None)
 
-    # --- Load Model Info ---
+    # --- Load Model Info (ALWAYS Load These Keys) ---
     args.base = get_required_config("model.base", conf)
     args.rev = get_required_config("model.rev", conf)
     args.arch = get_optional_config("model.arch", conf, default="class")
     args.name = f"{args.base}-{args.rev}"
+    # <<< --- ALWAYS LOAD these for inference compatibility --- >>>
+    args.base_vision_model = get_required_config("model.base_vision_model", conf)
+    args.embed_ver = get_optional_config("model.embed_ver", conf) # Optional, but useful context
+    # <<< --- END ALWAYS LOAD --- >>>
 
     # --- Load Data Mode ---
     args.data_mode = get_required_config("data.mode", conf) # e.g., 'embeddings', 'features', 'images'
 
     # --- Mode-Specific Loading ---
+    # (These sections now only load params SPECIFIC to that mode's training)
     if args.data_mode == 'embeddings':
         print("DEBUG: Loading config for EMBEDDINGS mode...")
-        args.is_end_to_end = False # Explicitly set mode flag
-        args.embed_ver = get_required_config("data.embed_ver", conf)
+        args.is_end_to_end = False
+        if not args.embed_ver:  # embed_ver is essential for this mode
+            raise ValueError("Config Error: 'model.embed_ver' must be specified for embeddings mode.")
+        try:
+            embed_params = get_embed_params(args.embed_ver)
+        except ValueError as e:
+            raise ValueError(f"Config Error: {e}") from e
+        args.features = embed_params['features']  # Input features for PredictorModel
+        default_hidden = embed_params.get('hidden', 1280)
         args.preload_data = get_optional_config("train.preload_data", conf, default=True)
 
-        # Get embed params
-        try: embed_params = get_embed_params(args.embed_ver)
-        except ValueError as e: raise ValueError(f"Config Error: {e}") from e
-        args.features = embed_params['features'] # Required
-        default_hidden = embed_params.get('hidden', 1280)
-
-        # Load PredictorModel params (optional section?)
+        # Load PredictorModel params (these define the trainable head for this mode)
         predictor_conf = get_optional_config("predictor_params", conf, default={})
         args.hidden_dim = predictor_conf.get("hidden_dim", default_hidden)
         args.use_attention = predictor_conf.get("use_attention", True)
@@ -101,55 +100,59 @@ def parse_and_load_args(config_path: str):
         args.attn_dropout = predictor_conf.get("attn_dropout", 0.1)
         args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
         args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
+        # Output mode is REQUIRED for the predictor model
         args.output_mode = get_required_config("predictor_params.output_mode", conf)
 
     elif args.data_mode == 'features':
         print("DEBUG: Loading config for FEATURES mode...")
-        args.is_end_to_end = False # This mode trains head only
+        args.is_end_to_end = False
         args.feature_dir_name = get_required_config("data.feature_dir_name", conf)
-        args.preload_data = False # Cannot preload features easily
+        args.preload_data = False  # Cannot easily preload large features
 
-        # Load HeadModel params
+        # Load HeadModel params (these define the trainable head for this mode)
         head_conf = get_optional_config("head_params", conf, default={})
-        args.head_features = get_required_config("head_params.features", conf) # Input feature dim MUST be specified
+        args.head_features = get_required_config("head_params.features", conf)  # Input features REQUIRED
         args.head_hidden_dim = head_conf.get("hidden_dim", 1024)
-        args.pooling_strategy = head_conf.get("pooling_strategy", 'attn') # Head pooling strategy
-        args.head_num_res_blocks = head_conf.get("num_res_blocks", 2)
+        args.pooling_strategy = head_conf.get("pooling_strategy", 'attn')  # Pooling used *during training*
+        args.head_num_res_blocks = head_conf.get("num_res_blocks", 3)
         args.head_dropout_rate = head_conf.get("dropout_rate", 0.2)
+        # Output mode is REQUIRED for the head model
         args.head_output_mode = get_required_config("head_params.output_mode", conf)
-
-        # Load Attn Pool specific args (if needed)
+        # Load Attn Pool specific args only if needed by the strategy
         if args.pooling_strategy == 'attn':
             attn_conf = get_optional_config("attn_pool_params", conf, default={})
-            args.attn_pool_heads = attn_conf.get("attn_pool_heads", 8)
-            args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.1)
+            args.attn_pool_heads = attn_conf.get("attn_pool_heads", 16)
+            args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.2)
 
     elif args.data_mode == 'images':
         print("DEBUG: Loading config for E2E IMAGES mode...")
-        args.is_end_to_end = True # This is the E2E mode flag
-        args.base_vision_model = get_required_config("model.base_vision_model", conf)
-        args.preload_data = False # Cannot preload images
+        args.is_end_to_end = True
+        args.preload_data = False  # Cannot preload images easily
+        # base_vision_model already loaded
 
-        # Load EarlyExtract specific args (optional section?)
+        # Load EarlyExtract specific args (if section exists)
         e2e_conf = get_optional_config("e2e_params", conf, default={})
         args.extract_layer = e2e_conf.get("extract_layer", -1)
-        args.pooling_strategy = e2e_conf.get("pooling_strategy", 'attn') # Pooling after base model
+        args.pooling_strategy = e2e_conf.get("pooling_strategy", 'attn')  # Pooling after base model
         args.freeze_base_model = e2e_conf.get("freeze_base_model", True)
 
-        # Load Head specific args
+        # Load Head specific args (defines the trainable head added on top)
         head_conf = get_optional_config("head_params", conf, default={})
+        # Head features determined by base model output
         args.head_hidden_dim = head_conf.get("hidden_dim", 1024)
         args.head_num_res_blocks = head_conf.get("num_res_blocks", 2)
         args.head_dropout_rate = head_conf.get("dropout_rate", 0.2)
+        # Output mode is REQUIRED for the head model
         args.head_output_mode = get_required_config("head_params.output_mode", conf)
-
-        # Load Attn Pool specific args (if needed)
+        # Load Attn Pool specific args only if needed by the strategy
         if args.pooling_strategy == 'attn':
             attn_conf = get_optional_config("attn_pool_params", conf, default={})
             args.attn_pool_heads = attn_conf.get("attn_pool_heads", 8)
             args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.1)
+
     else:
-        raise ValueError(f"Invalid data.mode '{args.data_mode}' in config. Must be 'embeddings', 'features', or 'images'.")
+        raise ValueError(
+            f"Invalid data.mode '{args.data_mode}' in config. Must be 'embeddings', 'features', or 'images'.")
 
     # --- Load Training Params (Common to all modes) ---
     train_conf = get_required_config("train", conf) # Train section is required
@@ -157,31 +160,29 @@ def parse_and_load_args(config_path: str):
     args.batch = get_optional_config("batch", train_conf, default=4)
     args.loss_function = get_optional_config("loss_function", train_conf) # Default set later based on arch
     args.optimizer = get_optional_config("optimizer", train_conf, default='AdamW')
-    args.betas = get_optional_config("betas", train_conf) # Let default be handled by optimizer
+    args.betas = get_optional_config("betas", train_conf)
     args.eps = get_optional_config("eps", train_conf)
     args.weight_decay = get_optional_config("weight_decay", train_conf)
     args.max_train_epochs = get_optional_config("max_train_epochs", train_conf)
     args.max_train_steps = get_optional_config("max_train_steps", train_conf)
     args.precision = get_optional_config("precision", train_conf, default='fp32')
-    args.nsave = get_optional_config("nsave", train_conf, default=0) # Default 0 = disabled
-    args.val_split_count = get_optional_config("val_split_count", conf.get("data",{}), default=0) # Look in data section too
+    args.nsave = get_optional_config("nsave", train_conf, default=0)
+    args.val_split_count = get_optional_config("val_split_count", conf.get("data",{}), default=0)
     args.seed = get_optional_config("seed", train_conf, default=42)
     args.num_workers = get_optional_config("num_workers", train_conf, default=0)
     args.save_full_model = get_optional_config("save_full_model", train_conf, default=False)
     args.log_every_n = get_optional_config("log_every_n", train_conf, default=50)
-    args.validate_every_n = get_optional_config("validate_every_n", train_conf, default=0) # Default 0 = disabled
-
-    # Copy ALL OTHER keys from train_conf (for optimizer/scheduler specific args)
+    args.validate_every_n = get_optional_config("validate_every_n", train_conf, default=0)
+    # Copy ALL OTHER keys from train_conf
     known_train_keys = {'lr', 'batch', 'loss_function', 'optimizer', 'betas', 'eps',
                         'weight_decay', 'max_train_epochs', 'max_train_steps', 'precision',
                         'nsave', 'seed', 'num_workers', 'preload_data', 'save_full_model',
                         'log_every_n', 'validate_every_n'}
     for key, value in train_conf.items():
-         # Convert lists to tuples for consistency if they are likely hyperparameters
          if isinstance(value, list): value = tuple(value)
-         # Set attribute if not already handled and not None
          if key not in known_train_keys and not hasattr(args, key) and value is not None:
               setattr(args, key, value)
+
 
     # --- Load Labels/Weights (Only relevant for arch: class) ---
     if args.arch == "class":
