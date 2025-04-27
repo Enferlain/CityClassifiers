@@ -532,6 +532,88 @@ class BasePipeline:
         # and PREPROCESSED images for manual modes (FitPad/CenterCrop).
         return self.get_clip_emb(img_list)
 
+    # v1.9.3: Better output inference - find last linear layer bias/weight in mlp_head
+    def _infer_outputs_from_state_dict(self, state_dict, model_path):
+        """Infers the number of output classes from a state dictionary."""
+        print(f"DEBUG: Inferring outputs for {os.path.basename(model_path)}...")
+        # Find all linear layer weights/biases specifically within mlp_head (if exists) or top level
+        linear_layer_keys = {}
+        prefix = "mlp_head." # Assume final layer is in mlp_head
+        potential_keys = [k for k in state_dict if k.startswith(prefix) and "weight" in k or "bias" in k]
+
+        if not potential_keys: # Fallback if no mlp_head prefix found
+            prefix = ""
+            potential_keys = [k for k in state_dict if "weight" in k or "bias" in k]
+            print("  No 'mlp_head.' prefix found, checking top-level keys.")
+
+        if not potential_keys: raise ValueError("No weight/bias keys found.")
+
+        # Group keys by layer index/name (extracting module path before weight/bias)
+        layers = {}
+        for key in potential_keys:
+            parts = key.split('.')
+            if len(parts) < 2: continue # Skip top-level weights/biases if prefix was empty
+            layer_base = ".".join(parts[:-1]) # e.g., "mlp_head.8" or "transformer_encoder.layers.0.linear1"
+            param_type = parts[-1] # "weight" or "bias"
+            if layer_base not in layers: layers[layer_base] = {}
+            layers[layer_base][param_type] = state_dict[key]
+
+        # Find the layer with the highest index within the MLP head if possible
+        target_layer_base = None
+        if prefix == "mlp_head.":
+            max_mlp_idx = -1
+            for layer_base in layers:
+                 if layer_base.startswith("mlp_head."):
+                      try:
+                          idx = int(layer_base.split('.')[1])
+                          if idx > max_mlp_idx:
+                               max_mlp_idx = idx
+                               target_layer_base = layer_base
+                      except (IndexError, ValueError): continue # Ignore if not indexed correctly
+            if target_layer_base: print(f"  Identified potential final layer in MLP head: {target_layer_base}")
+
+        # If couldn't find indexed layer in mlp_head, fallback needs refinement.
+        # Maybe look for the layer with fewest parameters? Or assume last key alphabetically?
+        # Let's stick with max index in mlp_head for now, or fail if not found clearly.
+        if not target_layer_base:
+            # Fallback: Find the weight matrix with the smallest output dimension?
+            # This is still heuristic. Let's require clear naming for now.
+            # Try finding a key ending like 'final_layer.bias' or similar standard names?
+            print("  Could not reliably determine final layer index in mlp_head. Attempting simple search...")
+            # Look for specific names first
+            final_bias_key = None; final_weight_key = None
+            for key in state_dict:
+                 if key.endswith("final_layer.bias"): final_bias_key = key; break
+                 if key.endswith("final_layer.weight"): final_weight_key = key;
+            if final_bias_key: target_layer_base = ".".join(final_bias_key.split('.')[:-1])
+            elif final_weight_key: target_layer_base = ".".join(final_weight_key.split('.')[:-1])
+
+            if not target_layer_base:
+                 # Last resort: Maybe the layer with the absolute smallest output dimension?
+                 min_out_dim = float('inf')
+                 for layer_base, params in layers.items():
+                      if 'weight' in params:
+                           out_dim = params['weight'].shape[0]
+                           if out_dim < min_out_dim and not any(norm in layer_base for norm in ['norm', 'bn', 'ln']):
+                                min_out_dim = out_dim
+                                target_layer_base = layer_base
+                 if target_layer_base: print(f"  Fallback: Using layer with smallest output dim: {target_layer_base} ({min_out_dim})")
+
+        if not target_layer_base or target_layer_base not in layers:
+            raise ValueError(f"Could not identify final classification layer in {model_path}. Keys found: {list(layers.keys())}")
+
+        # Get output dimension from the identified layer's bias or weight
+        if 'bias' in layers[target_layer_base]:
+            inferred_outputs = layers[target_layer_base]['bias'].shape[0]
+            print(f"  Inferred outputs from bias of '{target_layer_base}': {inferred_outputs}")
+            return inferred_outputs
+        elif 'weight' in layers[target_layer_base]:
+            inferred_outputs = layers[target_layer_base]['weight'].shape[0]
+            print(f"  Inferred outputs from weight of '{target_layer_base}': {inferred_outputs}")
+            return inferred_outputs
+        else:
+            raise ValueError(f"Identified layer '{target_layer_base}' has no bias or weight key.")
+
     # --- v1.7.12: Loads PredictorModel v2 using enhanced config ---
     def _load_predictor_head(self, required_outputs: int | None = None):
         """Loads the MLP head model state dict using enhanced config from self.config."""
@@ -651,123 +733,112 @@ class BasePipeline:
         # Return predictions on CPU
         return pred.detach().cpu()
 
-    # <<< --- NEW METHOD to Load HeadModel --- >>>
-    # v1.9.1: Load HeadModel params from top-level config keys
+    # v1.9.4: Corrected structure for loading HeadModel, using inferred outputs robustly
     def _load_head_model(self, head_model_path: str):
-        """Loads the HeadModel state dict using config (reading top-level keys)."""
+        """Loads the HeadModel state dict using config."""
         print(f"DEBUG _load_head_model: Loading head from {os.path.basename(head_model_path)}...")
         if not self.config: raise ValueError("Pipeline configuration not loaded.")
+        if not os.path.isfile(head_model_path): raise FileNotFoundError(f"HeadModel file not found: {head_model_path}")
 
-        # --- Get Parameters directly from self.config ---
-        # No longer expect head_params_conf dictionary
+        # --- 1. Load State Dict Once ---
+        sd = None
+        try:
+            sd = load_file(head_model_path)
+        except Exception as e_load:
+            raise ValueError(f"Error loading state dict from {head_model_path}: {e_load}")
 
-        # Load necessary params (use self.config.get)
-        expected_features = self.config.get("head_features") # <<< Read from top level
+        # --- 2. Determine Input Features ---
+        expected_features = self.config.get("head_features")
         if expected_features is None:
-            if self.vision_model and hasattr(self.vision_model, 'config') and hasattr(self.vision_model.config,
-                                                                                      'hidden_size'):
+            if self.vision_model and hasattr(self.vision_model, 'config') and hasattr(self.vision_model.config, 'hidden_size'):
                 expected_features = self.vision_model.config.hidden_size
                 print(f"DEBUG: Inferred head input features from vision model config: {expected_features}")
             else:
-                try:
-                    expected_features = get_embed_params(self.embed_ver)["features"]
-                except Exception as e:
-                    raise ValueError(
-                        f"Could not determine features for HeadModel from config, vision model, or embed_ver '{self.embed_ver}': {e}")
+                try: expected_features = get_embed_params(self.embed_ver)["features"]
+                except Exception as e: raise ValueError(f"Could not determine input features: {e}")
 
-            # Determine num_classes (remains the same logic, reads from top level)
-        num_classes = self.config.get("num_classes", self.config.get("num_labels"))
-        if num_classes is None:
-             # Try inferring from state dict as last resort (less ideal)
-             print("Warning: 'num_classes'/'num_labels' not found in config. Inferring from state dict.")
-             try:
-                 # NOTE: The key finding logic needs to be robust here, assuming sequential head
-                 sd_temp = load_file(head_model_path)
-                 head_keys = [k for k in sd_temp if k.startswith("head.")]
-                 final_layer_key = None
-                 if head_keys:
-                     try:
-                         max_idx = max(int(k.split('.')[1]) for k in head_keys if k.split('.')[1].isdigit())
-                         potential_key = f"head.{max_idx}.bias"
-                         if potential_key in sd_temp: final_layer_key = potential_key
-                     except:
-                         pass
-                 if final_layer_key is None: raise KeyError("Could not determine final layer bias key")
-                 outputs_in_file = sd_temp[final_layer_key].shape[0]
-                 del sd_temp
-                 num_classes = outputs_in_file
-             except Exception as e_sd:
-                 raise ValueError(f"Cannot determine num_classes from config or state dict: {e_sd}")
-             num_classes = int(num_classes)
-
-        # --- Load other HeadModel parameters directly from self.config ---
-        pooling_strategy = self.config.get('pooling_strategy', 'attn') # <<< Read from top level
-        hidden_dim = self.config.get('head_hidden_dim', 1024)        # <<< Read from top level
-        num_res_blocks = self.config.get('head_num_res_blocks', 3)     # <<< Read from top level
-        dropout_rate = self.config.get('head_dropout_rate', 0.2)      # <<< Read from top level
-        output_mode = self.config.get('head_output_mode', 'linear')   # <<< Read from top level
-        # Get attn pool params even if pooling is none, for robust init
-        attn_pool_heads = self.config.get('attn_pool_heads', 16)       # <<< Read from top level (might be missing if not used)
-        attn_pool_dropout = self.config.get('attn_pool_dropout', 0.2) # <<< Read from top level (might be missing if not used)
-
-        # --- Load State Dict ---
-        # Adapt _load_model_helper if needed, or load directly here
-        if not os.path.isfile(head_model_path):
-            raise FileNotFoundError(f"HeadModel file not found: {head_model_path}")
+        # --- 3. Determine Number of Classes (Config vs State Dict) ---
+        num_classes_config = self.config.get("num_classes", self.config.get("num_labels"))
+        outputs_in_file = None
         try:
-             sd = load_file(head_model_path)
-             # Re-check outputs_in_file here too for safety
-             head_keys = [k for k in sd if k.startswith("head.")]
-             final_layer_key = None
-             if head_keys:
-                 try:
-                      max_idx = max(int(k.split('.')[1]) for k in head_keys if k.split('.')[1].isdigit())
-                      potential_key = f"head.{max_idx}.bias"
-                      if potential_key in sd: final_layer_key = potential_key
-                 except: pass
-             if final_layer_key is None: raise KeyError("Could not determine final layer bias key")
-             outputs_in_file = sd[final_layer_key].shape[0]
+            outputs_in_file = self._infer_outputs_from_state_dict(sd, head_model_path) # Use helper
+        except Exception as e_infer:
+             raise ValueError(f"Failed to infer outputs from state dict for {head_model_path}: {e_infer}")
 
-             if num_classes != outputs_in_file:
-                  print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}). Using state dict value.")
-                  num_classes = outputs_in_file
-        except Exception as e: raise ValueError(f"Error re-checking state dict outputs: {e}")
+        # Decide final num_classes
+        final_num_classes = None
+        if num_classes_config is not None:
+             num_classes_config = int(num_classes_config)
+             if num_classes_config != outputs_in_file:
+                  print(f"Warning: Config num_classes ({num_classes_config}) != state dict outputs ({outputs_in_file}). Using state dict value.")
+                  final_num_classes = outputs_in_file
+             else:
+                  final_num_classes = num_classes_config # Config matches state dict
+        else:
+             print(f"Inferred num_classes from state dict: {outputs_in_file}")
+             final_num_classes = outputs_in_file # Use inferred value if config missing
 
-        # --- Consistency Check ---
-        if num_classes != outputs_in_file:
-             print(f"Warning: Configured num_classes ({num_classes}) != Outputs in state dict ({outputs_in_file}). Using state dict value.")
-             num_classes = outputs_in_file # Prioritize state dict
+        if final_num_classes is None or final_num_classes <= 0:
+             raise ValueError("Failed to determine a valid number of classes for the model.")
 
-        # --- Instantiate HeadModel ---
+        # --- 4. Load Other Model Parameters from Config ---
+        # MLP Head Params
+        hidden_dim = self.config.get('head_hidden_dim', 1024)
+        num_res_blocks = self.config.get('head_num_res_blocks', 3)
+        dropout_rate = self.config.get('head_dropout_rate', 0.2)
+        output_mode = self.config.get('head_output_mode', 'linear')
+
+        # Transformer Head Params (check both sub-dict and top-level)
+        trans_conf = self.config.get('transformer_head_params', self.config)
+        num_trans_layers = trans_conf.get('num_transformer_layers', 1)
+        trans_nhead = trans_conf.get('transformer_nhead', 8)
+        trans_dim_ff = trans_conf.get('transformer_dim_feedforward', expected_features * 2)
+        trans_dropout = trans_conf.get('transformer_dropout', 0.1)
+        pooling_after = trans_conf.get('pooling_after_transformer', 'avg') # This determines pooling *after* transformer layers
+
+        # Attn Pool Params (check both sub-dict and top-level, needed if pooling_after='attn')
+        attn_conf = self.config.get('attn_pool_params', self.config)
+        attn_pool_heads = attn_conf.get('attn_pool_heads', 16)
+        attn_pool_dropout = attn_conf.get('attn_pool_dropout', 0.2)
+
+        # --- 5. Instantiate HeadModel (with correct final_num_classes) ---
         try:
+            # Assuming HeadModel v1.5.0+ signature
             model = HeadModel(
-                features=expected_features, # Input feature dim
-                num_classes=num_classes,    # Verified number of classes
-                pooling_strategy=pooling_strategy, # From config ('none' expected)
+                features=expected_features,
+                num_classes=final_num_classes, # <<< Use the verified number of classes >>>
+                # Transformer params
+                num_transformer_layers=num_trans_layers,
+                transformer_nhead=trans_nhead,
+                transformer_dim_feedforward=trans_dim_ff,
+                transformer_dropout=trans_dropout,
+                pooling_after_transformer=pooling_after, # Pass correct pooling strategy
+                # MLP params
                 hidden_dim=hidden_dim,
                 num_res_blocks=num_res_blocks,
                 dropout_rate=dropout_rate,
                 output_mode=output_mode,
+                # Attn Pool params (passed even if pooling_after != 'attn')
                 attn_pool_heads=attn_pool_heads,
                 attn_pool_dropout=attn_pool_dropout
             )
         except Exception as e:
             raise TypeError(f"Failed to instantiate HeadModel: {e}") from e
 
-        # --- Load State Dict into Model ---
+        # --- 6. Load State Dict into Instantiated Model ---
         model.eval()
         try:
-             # Use strict=True unless migrating requires False
-             missing_keys, unexpected_keys = model.load_state_dict(sd, strict=True)
-             if unexpected_keys: print(f"Warning: Unexpected keys found loading HeadModel state dict: {unexpected_keys}")
-             if missing_keys: print(f"Warning: Missing keys loading HeadModel state dict: {missing_keys}")
+             missing_keys, unexpected_keys = model.load_state_dict(sd, strict=True) # Use the sd loaded earlier
+             if unexpected_keys: print(f"Warning: Unexpected keys found loading HeadModel: {unexpected_keys}")
+             if missing_keys: print(f"Warning: Missing keys loading HeadModel: {missing_keys}")
         except RuntimeError as e:
             print(f"ERROR: State dict mismatch loading into HeadModel for {head_model_path}.")
             raise e
 
         model.to(self.device)
-        print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling='{model.pooling_strategy}', output_mode='{model.output_mode}').")
-        self.model = model # Assign to instance variable (overwrites PredictorModel if loaded before)
+        # <<< Update Print Statement >>>
+        print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling_after_transformer='{model.pooling_after_transformer}', output_mode='{model.output_mode}').")
+        self.model = model # Assign to instance variable
 
 # ================================================
 #        Aesthetics Pipeline (Scorer)

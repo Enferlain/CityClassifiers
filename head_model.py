@@ -1,23 +1,72 @@
-# Version 1.0.0: Defines the trainable head for feature sequences.
+# Version 2.0.0: Defines the trainable head for feature sequences.
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math # Added math
+import functools # Needed for RMSNorm partial
 
-# --- ResBlock Definition (v1.0.0 - Unchanged for now) ---
-class ResBlock(nn.Module):
-    """Standard Residual Block with LayerNorm."""
-    def __init__(self, ch): # No scale_factor for now
+
+# --- RMSNorm ---
+# Use torch.nn.RMSNorm directly if available (PyTorch 1.11+)
+# Otherwise, define it (basic implementation):
+# if not hasattr(nn, 'RMSNorm'):
+#     class RMSNorm(nn.Module):
+#         def __init__(self, dim, eps=1e-6):
+#             super().__init__()
+#             self.eps = eps
+#             self.weight = nn.Parameter(torch.ones(dim))
+#         def _norm(self, x):
+#             return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+#         def forward(self, x):
+#             output = self._norm(x.float()).type_as(x)
+#             return output * self.weight
+# else:
+# Use the built-in one
+RMSNorm = nn.RMSNorm
+
+
+# --- SwiGLUFFN adapted for HeadModel MLP ---
+# This replaces a standard Linear -> Activation -> Linear block
+class SwiGLUFFNHead(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int = None, out_features: int = None, act_layer: nn.Module = nn.SiLU, dropout: float = 0.):
         super().__init__()
-        self.norm = nn.LayerNorm(ch)
-        self.long = nn.Sequential(
-            nn.Linear(ch, ch), nn.GELU(),
-            nn.Linear(ch, ch), nn.GELU(),
-            nn.Linear(ch, ch),
-        )
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        # Project to hidden dim * 2 for SwiGLU gate and value
+        self.w12 = nn.Linear(in_features, hidden_features * 2, bias=False)
+        self.act = act_layer()
+        self.dropout1 = nn.Dropout(dropout) # Dropout after activation * value
+        self.w3 = nn.Linear(hidden_features, out_features, bias=False)
+        self.dropout2 = nn.Dropout(dropout) # Dropout before final output
+
     def forward(self, x):
-        return x + self.long(self.norm(x))
+        # Split the output of the first linear layer into two parts
+        gate, value = self.w12(x).chunk(2, dim=-1)
+        # Apply activation to gate, multiply by value, apply dropout
+        x = self.dropout1(self.act(gate) * value)
+        # Apply final linear layer and dropout
+        x = self.dropout2(self.w3(x))
+        return x
+
+
+# --- ResBlock (Modified to use RMSNorm, potentially SwiGLU FFN) ---
+# v1.6.0: Uses RMSNorm and SwiGLUFFNHead
+class ResBlock(nn.Module):
+    def __init__(self, ch, dropout=0.0): # Added dropout pass-through
+        super().__init__()
+        self.norm = RMSNorm(ch) # <<< Use RMSNorm >>>
+        # Use SwiGLUFFNHead instead of the 3 linear layers + GELU
+        # Note: SwiGLUFFNHead includes internal dropout
+        self.ffn = SwiGLUFFNHead(in_features=ch, dropout=dropout)
+        # Keep residual connection
+        # Maybe add LayerScale? (optional, from original ViT/AIM)
+        # self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True) if layer_scale_init_value > 0 else None
+
+    def forward(self, x):
+        # return x + self.gamma * self.ffn(self.norm(x)) # With LayerScale
+        return x + self.ffn(self.norm(x)) # Without LayerScale
+
 
 # --- Attention Pooling Layer (v1.0.0 - Unchanged) ---
 class AttentionPool(nn.Module):
@@ -53,88 +102,82 @@ class AttentionPool(nn.Module):
 
 
 # --- Head Model Definition ---
-# v1.5.0: Use Transformer Encoder layers before pooling
+# v1.6.0: Uses RMSNorm and SwiGLUFFN in MLP Head
 class HeadModel(nn.Module):
     """
     HeadModel using Transformer Encoder layers before pooling.
     """
-    def __init__(self,
-                 features: int,
-                 num_classes: int,
-                 # --- NEW Params ---
-                 num_transformer_layers: int = 1, # How many transformer layers to add
-                 transformer_nhead: int = 8,      # Heads for the new transformer layers
-                 transformer_dim_feedforward: int = None, # Dim for transformer FFN (default: features*2 or 4)
-                 transformer_dropout: float = 0.1,
-                 # --- Pooling after Transformer ---
-                 pooling_after_transformer: str = 'avg', # 'avg', 'cls', 'attn'
-                 # --- Existing MLP Params ---
-                 hidden_dim: int = 1024,        # Hidden dim for MLP *after* pooling
-                 num_res_blocks: int = 3,       # ResBlocks in MLP
-                 dropout_rate: float = 0.2,     # Dropout in MLP
+    def __init__(self, features: int, num_classes: int,
+                 num_transformer_layers: int = 1, transformer_nhead: int = 8,
+                 transformer_dim_feedforward: int = None, transformer_dropout: float = 0.1,
+                 pooling_after_transformer: str = 'avg',
+                 hidden_dim: int = 1024, num_res_blocks: int = 3,
+                 dropout_rate: float = 0.2, # Main dropout for projections
                  output_mode: str = 'linear',
-                 # --- Old Pooling Params (only used if pooling_after_transformer='attn') ---
-                 attn_pool_heads: int = 16,
-                 attn_pool_dropout: float = 0.2
-                 ):
+                 attn_pool_heads: int = 16, attn_pool_dropout: float = 0.2):
         super().__init__()
         self.output_mode = output_mode.lower()
         self.num_classes = num_classes
         self.pooling_after_transformer = pooling_after_transformer.lower()
 
-        print(f"Initializing HeadModel v1.5.0 (Transformer Head):")
+        print(f"Initializing HeadModel v1.6.0 (Transformer Head + SwiGLU/RMSNorm MLP):")
         print(f"  Input Features: {features}")
-        print(f"  Transformer Layers: {num_transformer_layers}, Heads: {transformer_nhead}, Dropout: {transformer_dropout}")
+        print(
+            f"  Transformer Layers: {num_transformer_layers}, Heads: {transformer_nhead}, Dropout: {transformer_dropout}")
         print(f"  Pooling After Transformer: {self.pooling_after_transformer}")
-        print(f"  MLP Hidden: {hidden_dim}, ResBlocks: {num_res_blocks}, Dropout: {dropout_rate}")
         print(f"  Output Mode: {self.output_mode}, Classes: {self.num_classes}")
+        print(f"  MLP using SwiGLU/RMSNorm. Hidden: {hidden_dim}, ResBlocks: {num_res_blocks}, Dropout: {dropout_rate}")
 
-        # --- Transformer Encoder Layers ---
+        # --- Transformer Encoder Layers (Keep as is) ---
         if transformer_dim_feedforward is None:
-            transformer_dim_feedforward = features * 2 # A smaller FFN dim might be faster
+            transformer_dim_feedforward = features * 2  # A smaller FFN dim might be faster
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=features,
             nhead=transformer_nhead,
             dim_feedforward=transformer_dim_feedforward,
             dropout=transformer_dropout,
-            activation='gelu', # Or 'relu'
+            activation='gelu',  # Or 'relu'
             batch_first=True,
-            norm_first=True # Pre-LN is often more stable
+            norm_first=True  # Pre-LN is often more stable
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
 
-        # --- Pooling Layer (Optional: only if pooling_after_transformer='attn') ---
+        # --- Pooling Layer (Keep as is, optional) ---
         self.pooler = None
-        if self.pooling_after_transformer == 'attn':
-             self.pooler = AttentionPool(
-                 embed_dim=features,
-                 num_heads=attn_pool_heads, # Use separate head count for pooling?
-                 dropout=attn_pool_dropout
-             )
-             print(f"  Using Attention Pooling after Transformer")
+        if self.pooling_after_transformer == 'attn': self.pooler = AttentionPool(...) # Same definition
 
-        # --- MLP Head (Takes features dimension as input) ---
-        # Input dim to MLP is always `features` after pooling
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(features), # Norm the pooled features
-            nn.Linear(features, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            *[ResBlock(ch=hidden_dim) for _ in range(num_res_blocks)],
-            # Use the less aggressive bottleneck
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout_rate / 2),
-            nn.Linear(hidden_dim // 2, self.num_classes)
-        )
+        # --- MLP Head (Modified to use RMSNorm/SwiGLU) ---
+        mlp_layers = []
+        mlp_layers.append(RMSNorm(features)) # <<< Initial RMSNorm >>>
+        mlp_layers.append(nn.Linear(features, hidden_dim)) # Initial projection
+        # No activation/dropout here, handled by ResBlocks now
 
-        # --- Validate Output Mode (Unchanged) ---
+        # Use updated ResBlocks
+        for _ in range(num_res_blocks):
+            mlp_layers.append(ResBlock(ch=hidden_dim, dropout=dropout_rate)) # Pass dropout to ResBlock's FFN
+
+        # Down projection using SwiGLU FFN blocks? Or keep Linear + Norm + Act?
+        # Let's try keeping the Linear -> Norm -> Act structure but use RMSNorm/SiLU
+        mlp_layers.extend([
+            # nn.Linear(hidden_dim, hidden_dim // 2), # Keep simple projection
+            RMSNorm(hidden_dim),                      # <<< RMSNorm before down-projection? Or after? Let's try before like ResBlock.
+            SwiGLUFFNHead(hidden_dim, hidden_features=hidden_dim//2, out_features=hidden_dim // 2, dropout=dropout_rate/2), # Example projection FFN
+            RMSNorm(hidden_dim // 2),                 # <<< RMSNorm >>>
+            # Maybe one more SwiGLU stage? Or go to final linear?
+            nn.Linear(hidden_dim // 2, self.num_classes) # Final layer
+        ])
+
+        self.mlp_head = nn.Sequential(*mlp_layers)
+
+        # --- Validate Output Mode ---
         valid_modes = ['linear', 'sigmoid', 'softmax', 'tanh_scaled']
         if self.output_mode not in valid_modes:
             raise ValueError(f"Invalid output_mode '{self.output_mode}'. Must be one of {valid_modes}")
-        # Warnings about num_classes vs mode remain the same...
+        if self.output_mode == 'softmax' and self.num_classes <= 1:
+             print(f"  Warning: output_mode='softmax' usually used with num_classes > 1 (got {self.num_classes}).")
+        if self.output_mode in ['sigmoid', 'tanh_scaled'] and self.num_classes != 1:
+             print(f"  Warning: output_mode='{self.output_mode}' usually used with num_classes=1 (got {self.num_classes}).")
 
     def forward(self, sequence, attention_mask=None):
         # Input sequence shape: [B, SeqLen, Features] (e.g., [B, 4096, 1024])
@@ -171,7 +214,6 @@ class HeadModel(nn.Module):
 
         # 3. Pass pooled features through MLP Head
         logits = self.mlp_head(pooled_features)
-
 
         # --- Apply Activation (Unchanged) ---
         output = None

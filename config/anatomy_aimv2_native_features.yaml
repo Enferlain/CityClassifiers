@@ -4,7 +4,7 @@
 # (Used for naming output files/runs)
 model:
   base: "AnatomyFlaws"
-  rev: "v9.6_adabelief_fl_AIMv2Native_3000" # New revision indicating feature mode
+  rev: "v9.8_adabelief_fl_AIMv2Native_3000" # New revision indicating feature mode
   arch: class                      # Still a classification task
   base_vision_model: "apple/aimv2-large-patch14-native"
 # --- Data Configuration ---
@@ -21,24 +21,24 @@ data:
 # (Defines the HeadModel structure in head_model.py)
 head_params:
   features: 1024                   # <<< Input features from AIMv2 base (MUST MATCH features) >>>
-  pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
+  # pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
   hidden_dim: 1024                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
   dropout_rate: 0.218              # Dropout rate within the head
-  output_mode: sigmoid             # <<< Output mode for the head
+  output_mode: linear             # <<< Output mode for the head
 
 # --- ADD New Section for Transformer Head ---
 transformer_head_params:
   num_transformer_layers: 1 # Start with 1 layer
   transformer_nhead: 8      # Heads (must divide features=1024)
   transformer_dim_feedforward: 2048 # FFN dim (e.g., 2*features)
-  transformer_dropout: 0.1
-  pooling_after_transformer: 'avg' # Strategy after transformer ('avg', 'cls', 'attn')
+  transformer_dropout: 0.218
+  pooling_after_transformer: 'attn' # Strategy after transformer ('avg', 'cls', 'attn')
 
 # --- Attention Pooling Parameters (Only if head_params.pooling_strategy='attn') ---
 # attn_pool_params:
-  # attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
-  # attn_pool_dropout: 0.218         # Dropout for the Attention Pooling layer
+  attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
+  attn_pool_dropout: 0.218         # Dropout for the Attention Pooling layer
 
 # --- Training Parameters ---
 train:
@@ -91,7 +91,7 @@ train:
   num_workers: 8                   # <<< Can use more workers now for loading NPZ >>>
   # preload_data: false            # Not applicable/needed for features mode
   nsave: 500                      # Periodic save frequency
-  log_every_n: 1                  # Log training metrics frequency
+  log_every_n: 10                  # Log training metrics frequency
   validate_every_n: 75            # Validation frequency (adjust based on steps/epoch)
   save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
 

@@ -651,6 +651,7 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
     global_step = initial_global_step
     best_eval_loss = float('inf')
     last_eval_loss_val = float('nan')
+    avg_loss_value_log = float('nan')
 
     # <<< Update Progress Bar Description >>>
     progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc=f"Training Head (Eff Bsz {effective_batch_size})", unit="step", dynamic_ncols=True)
@@ -763,7 +764,7 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
 
                 except Exception as e:
                     print(f"\nError processing micro-batch {i} (Global Step approx {global_step}): {e}")
-                    import traceback; traceback.print_exc()
+                    traceback.print_exc()
                     # Try to continue to next micro-batch
 
                 # --- Optimizer Step Check ---
@@ -835,7 +836,14 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                              print(f"\n--- Running Validation @ Step {global_step} ---")
                              eval_loss_val = float('nan')
                              if val_loader:
-                                 eval_loss_val = run_validation_sequences(model=model, val_loader=val_loader, criterion=criterion, device=TARGET_DEV, scaler=scaler)
+                                 eval_loss_val = run_validation_sequences(
+                                     model=model,
+                                     val_loader=val_loader,
+                                     criterion=criterion,
+                                     device=TARGET_DEV,
+                                     scaler=scaler,
+                                     num_labels=args.num_labels
+                                 )
                                  last_eval_loss_val = eval_loss_val
                                  model.train()
                              else: print("--- Validation skipped (no val_loader) ---")
