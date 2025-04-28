@@ -574,42 +574,31 @@ class ModelWrapper:
                   self.losses.pop(0)
 
 
-    # Version 3.0.0: Removed CSV logging, stdout logging
-    def log_main(self, step, train_loss_batch, eval_loss=None): # eval_loss is now optional input
-        """Logs metrics to Wandb ONLY. Updates internal best loss."""
-        self.update_step(step)
-        # Add the latest batch loss (or maybe avg loss over log_every_n steps?)
-        self.log_step(train_loss_batch) # Assumes train_loss_batch is avg over log period
+    # v3.2.0: Logs only frequently updated metrics passed from train_loop
+    def log_main(self, step, current_train_loss, current_val_loss):
+        """Logs frequently updated metrics (like current train loss and last validation loss) to Wandb."""
+        self.update_step(step) # Update internal step counter
 
-        # Calculate long-term average loss from buffer for potential WandB logging
-        train_loss_avg = sum(self.losses) / len(self.losses) if self.losses else float('nan')
         lr = float(self.optimizer.param_groups[0]['lr']) if self.optimizer.param_groups else 0.0
 
-        # <<< REMOVED Stdout via tqdm.write() >>>
-
-        # Wandb Logging (Primary Log Target)
+        # Wandb Logging
         if self.wandb_run:
             log_data = {
-                "train/loss_step": train_loss_batch, # Log the loss passed in (avg over log_every_n)
-                "train/loss_avg_buffer": train_loss_avg, # Log the longer-term buffer average
-                "train/learning_rate": lr
+                "loss/current": current_train_loss, # Log avg train loss over current window
+                "train/learning_rate": lr # Keep logging LR
             }
-            # Log eval_loss ONLY if a valid value is passed in
-            if eval_loss is not None and not math.isnan(eval_loss):
-                log_data["eval/loss"] = eval_loss
+            # Log current_val_loss (creates the stepped graph)
+            if current_val_loss is not None and not math.isnan(current_val_loss):
+                log_data["loss/current_val_loss"] = current_val_loss
             try:
                 self.wandb_run.log(log_data, step=step)
             except Exception as e_wandb:
                 print(f"Warning: Failed to log to WandB at step {step}: {e_wandb}")
 
-        # <<< REMOVED CSV Logging >>>
-
-        # Update internal best loss tracking if eval_loss provided
-        if eval_loss is not None and not math.isnan(eval_loss):
-            if eval_loss < self.best_val_loss:
-                 print(f"  ---> New best validation loss recorded: {eval_loss:.4e} (previous: {self.best_val_loss:.4e})")
-                 self.best_val_loss = eval_loss
-                 # Saving happens in train loop based on this updated value
+        # Update internal best loss tracking - Now happens in train_loop after validation
+        # if current_val_loss is not None and not math.isnan(current_val_loss):
+        #     if current_val_loss < self.best_val_loss:
+        #          self.best_val_loss = current_val_loss
 
     # --- Model Saving ---
     # Version 2.9.1: Optional full model save based on args.save_full_model

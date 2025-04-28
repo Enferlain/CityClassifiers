@@ -4,7 +4,7 @@
 # (Used for naming output files/runs)
 model:
   base: "AnatomyFlaws"
-  rev: "v9.8_adabelief_fl_AIMv2Native_3000" # New revision indicating feature mode
+  rev: "v10.3_adoptaosf_fl_AIMv2Native_3000" # New revision indicating feature mode
   arch: class                      # Still a classification task
   base_vision_model: "apple/aimv2-large-patch14-native"
 # --- Data Configuration ---
@@ -21,36 +21,28 @@ data:
 # (Defines the HeadModel structure in head_model.py)
 head_params:
   features: 1024                   # <<< Input features from AIMv2 base (MUST MATCH features) >>>
-  # pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
+  pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
   hidden_dim: 1024                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
-  dropout_rate: 0.218              # Dropout rate within the head
-  output_mode: linear             # <<< Output mode for the head
-
-# --- ADD New Section for Transformer Head ---
-transformer_head_params:
-  num_transformer_layers: 1 # Start with 1 layer
-  transformer_nhead: 8      # Heads (must divide features=1024)
-  transformer_dim_feedforward: 2048 # FFN dim (e.g., 2*features)
-  transformer_dropout: 0.218
-  pooling_after_transformer: 'attn' # Strategy after transformer ('avg', 'cls', 'attn')
+  dropout_rate: 0.1              # Dropout rate within the head
+  output_mode: sigmoid             # <<< Output mode for the head
 
 # --- Attention Pooling Parameters (Only if head_params.pooling_strategy='attn') ---
-# attn_pool_params:
+attn_pool_params:
   attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
-  attn_pool_dropout: 0.218         # Dropout for the Attention Pooling layer
+  attn_pool_dropout: 0.1         # Dropout for the Attention Pooling layer
 
 # --- Training Parameters ---
 train:
   # --- Training Duration ---
   # (Adjust based on faster training speed - maybe more steps/epochs feasible now?)
   # max_train_steps: 2000            # Example: 5k steps (adjust as needed)
-  max_train_epochs: 40           # Can alternatively specify epochs
+  max_train_epochs: 80           # Can alternatively specify epochs
 
   # --- Core Settings ---
   # (Can likely use a higher LR now since only training head)
   lr: 1e-4                         # <<< Increased LR from E2E example >>>
-  batch: 32                        # <<< Increase batch size significantly - head is small! >>>
+  batch: 128                        # <<< Increase batch size significantly - head is small! >>>
   gradient_accumulation_steps: 1   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
   precision: "bf16"                # Mixed precision for training head
 
@@ -59,9 +51,9 @@ train:
   focal_loss_gamma: 2.0
 
   # --- Optimizer ---
-  optimizer: "adabelief" # ADOPTAOScheduleFree
+  optimizer: "ADOPTAOScheduleFree"
   # -- Optimizer Hyperparameters --
-  betas: [0.9, 0.95]
+  betas: [0.9, 0.999]
   eps: 1e-8
   weight_decay: 1e-3               # Regularization might still be useful for head
   rectify: true
@@ -75,24 +67,24 @@ train:
   adaptive_clip_eps: 1e-3    # Epsilon for adaptive clipping
 
   # --- Scheduler ---
-  scheduler_name: "RexAnnealingWarmRestarts"
+  scheduler_name: "none" # "RexAnnealingWarmRestarts"
   # -- Scheduler Arguments --
-  scheduler_gamma: 0.95
-  scheduler_cycle_multiplier: 1.0
+  # scheduler_gamma: 0.95
+  # scheduler_cycle_multiplier: 1.0
   # <<< Adjust first cycle steps to match max_train_steps >>>
-  scheduler_first_cycle_max_steps: 500
-  scheduler_min_lr: 1e-7
+  # scheduler_first_cycle_max_steps: 500
+  # scheduler_min_lr: 1e-7
   # <<< Adjust warmup steps relative to new steps/epoch (batch 64) >>>
   # If Steps/Epoch ≈ (2400 samples / 64 batch) ≈ 38 steps... maybe 50-100 warmup steps?
-  scheduler_warmup_steps: 100
+  # scheduler_warmup_steps: 100
 
   # --- Data & Other ---
   seed: -1
-  num_workers: 8                   # <<< Can use more workers now for loading NPZ >>>
+  num_workers: 4                   # <<< Can use more workers now for loading NPZ >>>
   # preload_data: false            # Not applicable/needed for features mode
-  nsave: 500                      # Periodic save frequency
+  nsave: 1000                      # Periodic save frequency
   log_every_n: 10                  # Log training metrics frequency
-  validate_every_n: 75            # Validation frequency (adjust based on steps/epoch)
+  validate_every_n: 19            # Validation frequency (adjust based on steps/epoch)
   save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
 
 # --- Labels ---
@@ -102,4 +94,4 @@ labels:
  '1': { name: "Good Anatomy", loss: 1.0 }
 
 # --- Logging ---
-wandb_project: "city-classifiers" # Or maybe "city-classifiers-features"
+wandb_project: "lumi-classifiers" # Or maybe "city-classifiers-features"

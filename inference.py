@@ -532,87 +532,83 @@ class BasePipeline:
         # and PREPROCESSED images for manual modes (FitPad/CenterCrop).
         return self.get_clip_emb(img_list)
 
-    # v1.9.3: Better output inference - find last linear layer bias/weight in mlp_head
+    # v1.9.4: More robust output inference - handle nested keys better
     def _infer_outputs_from_state_dict(self, state_dict, model_path):
         """Infers the number of output classes from a state dictionary."""
         print(f"DEBUG: Inferring outputs for {os.path.basename(model_path)}...")
-        # Find all linear layer weights/biases specifically within mlp_head (if exists) or top level
-        linear_layer_keys = {}
-        prefix = "mlp_head." # Assume final layer is in mlp_head
-        potential_keys = [k for k in state_dict if k.startswith(prefix) and "weight" in k or "bias" in k]
 
-        if not potential_keys: # Fallback if no mlp_head prefix found
-            prefix = ""
-            potential_keys = [k for k in state_dict if "weight" in k or "bias" in k]
-            print("  No 'mlp_head.' prefix found, checking top-level keys.")
+        potential_final_layer_key = None
 
-        if not potential_keys: raise ValueError("No weight/bias keys found.")
+        # --- Strategy 1: Look for explicit 'final_layer' name ---
+        for key in state_dict:
+            if key.endswith("final_layer.bias"): potential_final_layer_key = key; break
+            if key.endswith("final_layer.weight") and not potential_final_layer_key: potential_final_layer_key = key;
+        if potential_final_layer_key:
+             print(f"  Found explicit 'final_layer' key: {potential_final_layer_key}")
 
-        # Group keys by layer index/name (extracting module path before weight/bias)
-        layers = {}
-        for key in potential_keys:
-            parts = key.split('.')
-            if len(parts) < 2: continue # Skip top-level weights/biases if prefix was empty
-            layer_base = ".".join(parts[:-1]) # e.g., "mlp_head.8" or "transformer_encoder.layers.0.linear1"
-            param_type = parts[-1] # "weight" or "bias"
-            if layer_base not in layers: layers[layer_base] = {}
-            layers[layer_base][param_type] = state_dict[key]
+        # --- Strategy 2: Find highest indexed layer within 'head.' or 'mlp_head.' ---
+        if not potential_final_layer_key:
+            prefixes_to_check = ["mlp_head.", "head."]
+            found_prefix = ""
+            max_layer_idx = -1
+            potential_target_base = None
 
-        # Find the layer with the highest index within the MLP head if possible
-        target_layer_base = None
-        if prefix == "mlp_head.":
-            max_mlp_idx = -1
-            for layer_base in layers:
-                 if layer_base.startswith("mlp_head."):
-                      try:
-                          idx = int(layer_base.split('.')[1])
-                          if idx > max_mlp_idx:
-                               max_mlp_idx = idx
-                               target_layer_base = layer_base
-                      except (IndexError, ValueError): continue # Ignore if not indexed correctly
-            if target_layer_base: print(f"  Identified potential final layer in MLP head: {target_layer_base}")
+            for prefix in prefixes_to_check:
+                for key in state_dict:
+                     if key.startswith(prefix):
+                          found_prefix = prefix # Found keys with this prefix
+                          parts = key[len(prefix):].split('.') # Get parts after prefix
+                          if len(parts) > 0 and parts[0].isdigit():
+                               try:
+                                    idx = int(parts[0])
+                                    if idx > max_layer_idx:
+                                         max_layer_idx = idx
+                                         potential_target_base = f"{prefix}{idx}" # Store base like "head.11"
+                               except ValueError: continue
+                if potential_target_base: break # Stop if found in first prefix
 
-        # If couldn't find indexed layer in mlp_head, fallback needs refinement.
-        # Maybe look for the layer with fewest parameters? Or assume last key alphabetically?
-        # Let's stick with max index in mlp_head for now, or fail if not found clearly.
-        if not target_layer_base:
-            # Fallback: Find the weight matrix with the smallest output dimension?
-            # This is still heuristic. Let's require clear naming for now.
-            # Try finding a key ending like 'final_layer.bias' or similar standard names?
-            print("  Could not reliably determine final layer index in mlp_head. Attempting simple search...")
-            # Look for specific names first
-            final_bias_key = None; final_weight_key = None
-            for key in state_dict:
-                 if key.endswith("final_layer.bias"): final_bias_key = key; break
-                 if key.endswith("final_layer.weight"): final_weight_key = key;
-            if final_bias_key: target_layer_base = ".".join(final_bias_key.split('.')[:-1])
-            elif final_weight_key: target_layer_base = ".".join(final_weight_key.split('.')[:-1])
+            if potential_target_base:
+                # Now look for .weight or .bias associated with this base index
+                bias_key = f"{potential_target_base}.bias"
+                weight_key = f"{potential_target_base}.weight"
+                if bias_key in state_dict:
+                    potential_final_layer_key = bias_key
+                    print(f"  Found layer by max index '{potential_target_base}' using bias key: {bias_key}")
+                elif weight_key in state_dict:
+                    potential_final_layer_key = weight_key
+                    print(f"  Found layer by max index '{potential_target_base}' using weight key: {weight_key}")
+                else:
+                     print(f"  Found max index '{potential_target_base}' but no corresponding weight/bias key.")
+            else:
+                 print("  Could not find indexed layers starting with 'mlp_head.' or 'head.'.")
 
-            if not target_layer_base:
-                 # Last resort: Maybe the layer with the absolute smallest output dimension?
-                 min_out_dim = float('inf')
-                 for layer_base, params in layers.items():
-                      if 'weight' in params:
-                           out_dim = params['weight'].shape[0]
-                           if out_dim < min_out_dim and not any(norm in layer_base for norm in ['norm', 'bn', 'ln']):
-                                min_out_dim = out_dim
-                                target_layer_base = layer_base
-                 if target_layer_base: print(f"  Fallback: Using layer with smallest output dim: {target_layer_base} ({min_out_dim})")
+        # --- Strategy 3: Fallback (e.g., smallest output dim - optional/less reliable) ---
+        # Add only if needed, might still be unreliable.
+        # if not potential_final_layer_key:
+        #     print("  Fallback: Searching for layer with smallest output dimension...")
+        #     min_out_dim = float('inf')
+        #     target_base = None
+        #     # ... (logic to find smallest dim weight/bias not belonging to norm) ...
+        #     if target_base: potential_final_layer_key = f"{target_base}.bias" # or .weight
 
-        if not target_layer_base or target_layer_base not in layers:
-            raise ValueError(f"Could not identify final classification layer in {model_path}. Keys found: {list(layers.keys())}")
+        # --- Determine Output Size ---
+        if not potential_final_layer_key:
+            raise ValueError(f"Could not identify final classification layer key in {model_path}.")
 
-        # Get output dimension from the identified layer's bias or weight
-        if 'bias' in layers[target_layer_base]:
-            inferred_outputs = layers[target_layer_base]['bias'].shape[0]
-            print(f"  Inferred outputs from bias of '{target_layer_base}': {inferred_outputs}")
-            return inferred_outputs
-        elif 'weight' in layers[target_layer_base]:
-            inferred_outputs = layers[target_layer_base]['weight'].shape[0]
-            print(f"  Inferred outputs from weight of '{target_layer_base}': {inferred_outputs}")
-            return inferred_outputs
+        if potential_final_layer_key.endswith(".bias"):
+            if potential_final_layer_key in state_dict:
+                 inferred_outputs = state_dict[potential_final_layer_key].shape[0]
+                 print(f"  Inferred outputs from bias key '{potential_final_layer_key}': {inferred_outputs}")
+                 return inferred_outputs
+            else: raise ValueError(f"Logic error: Bias key '{potential_final_layer_key}' not found.")
+        elif potential_final_layer_key.endswith(".weight"):
+             if potential_final_layer_key in state_dict:
+                  inferred_outputs = state_dict[potential_final_layer_key].shape[0]
+                  print(f"  Inferred outputs from weight key '{potential_final_layer_key}': {inferred_outputs}")
+                  return inferred_outputs
+             else: raise ValueError(f"Logic error: Weight key '{potential_final_layer_key}' not found.")
         else:
-            raise ValueError(f"Identified layer '{target_layer_base}' has no bias or weight key.")
+            raise ValueError(f"Identified key '{potential_final_layer_key}' is not a bias or weight key.")
 
     # --- v1.7.12: Loads PredictorModel v2 using enhanced config ---
     def _load_predictor_head(self, required_outputs: int | None = None):
@@ -788,14 +784,6 @@ class BasePipeline:
         dropout_rate = self.config.get('head_dropout_rate', 0.2)
         output_mode = self.config.get('head_output_mode', 'linear')
 
-        # Transformer Head Params (check both sub-dict and top-level)
-        trans_conf = self.config.get('transformer_head_params', self.config)
-        num_trans_layers = trans_conf.get('num_transformer_layers', 1)
-        trans_nhead = trans_conf.get('transformer_nhead', 8)
-        trans_dim_ff = trans_conf.get('transformer_dim_feedforward', expected_features * 2)
-        trans_dropout = trans_conf.get('transformer_dropout', 0.1)
-        pooling_after = trans_conf.get('pooling_after_transformer', 'avg') # This determines pooling *after* transformer layers
-
         # Attn Pool Params (check both sub-dict and top-level, needed if pooling_after='attn')
         attn_conf = self.config.get('attn_pool_params', self.config)
         attn_pool_heads = attn_conf.get('attn_pool_heads', 16)
@@ -807,12 +795,6 @@ class BasePipeline:
             model = HeadModel(
                 features=expected_features,
                 num_classes=final_num_classes, # <<< Use the verified number of classes >>>
-                # Transformer params
-                num_transformer_layers=num_trans_layers,
-                transformer_nhead=trans_nhead,
-                transformer_dim_feedforward=trans_dim_ff,
-                transformer_dropout=trans_dropout,
-                pooling_after_transformer=pooling_after, # Pass correct pooling strategy
                 # MLP params
                 hidden_dim=hidden_dim,
                 num_res_blocks=num_res_blocks,
@@ -837,7 +819,7 @@ class BasePipeline:
 
         model.to(self.device)
         # <<< Update Print Statement >>>
-        print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling_after_transformer='{model.pooling_after_transformer}', output_mode='{model.output_mode}').")
+        # print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling_after_transformer='{model.pooling_after_transformer}', output_mode='{model.output_mode}').")
         self.model = model # Assign to instance variable
 
 # ================================================

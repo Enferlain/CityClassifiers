@@ -19,7 +19,7 @@ from losses import GHMC_Loss, FocalLoss # Keep these
 
 try:
     from sageattention import sageattn
-#    F.scaled_dot_product_attention = sageattn
+    F.scaled_dot_product_attention = sageattn
     print("!!! Successfully applied SageAttention monkey-patch !!!")
 except ImportError:
     print("SageAttention not found or failed to import, using default F.scaled_dot_product_attention.")
@@ -62,8 +62,6 @@ except ImportError as e:
     custom_modules_available = False
 
 # --- Global Settings ---
-# LOG_EVERY_N = 1 # How often to log metrics and check validation
-# VALIDATE_EVERY_N = 50 # Run validation less often
 TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -144,7 +142,7 @@ def setup_dataloaders(args):
             validation_split_count=args.val_split_count,
             seed=args.seed,
             preload=getattr(args, 'preload_data', False), # Check if preload is in args
-            preload_limit_gb=getattr(args, 'preload_limit_gb', 10.0) # Get limit from args if exists
+            preload_limit_gb=getattr(args, 'preload_limit_gb', 30.0) # Get limit from args if exists
         )
         args.num_labels = dataset.num_labels
         print(f"DEBUG: Updated args.num_labels from FeatureSequenceDataset: {args.num_labels}")
@@ -298,14 +296,6 @@ def setup_model_criterion(args, dataset):
         head_features = getattr(args, 'head_features', None)
         if head_features is None: exit("Error: 'head_features' not specified.")
 
-        # Load Transformer Head specific params
-        trans_head_conf = getattr(args, 'transformer_head_params', {}) # Get the new section from args
-        num_trans_layers = trans_head_conf.get('num_transformer_layers', 1)
-        trans_nhead = trans_head_conf.get('transformer_nhead', 8)
-        trans_dim_ff = trans_head_conf.get('transformer_dim_feedforward', head_features * 2)
-        trans_dropout = trans_head_conf.get('transformer_dropout', 0.1)
-        pooling_after = trans_head_conf.get('pooling_after_transformer', 'avg')
-
         # Load standard MLP head params (use original keys from args)
         hidden_dim = getattr(args, 'head_hidden_dim', 1024)
         num_res_blocks = getattr(args, 'head_num_res_blocks', 3)
@@ -319,12 +309,6 @@ def setup_model_criterion(args, dataset):
         model = HeadModel(
             features=head_features,
             num_classes=args.num_classes, # Use num_classes determined earlier
-            # Transformer params
-            num_transformer_layers=num_trans_layers,
-            transformer_nhead=trans_nhead,
-            transformer_dim_feedforward=trans_dim_ff,
-            transformer_dropout=trans_dropout,
-            pooling_after_transformer=pooling_after,
             # MLP params
             hidden_dim=hidden_dim,
             num_res_blocks=num_res_blocks,
@@ -614,61 +598,78 @@ def load_checkpoint(args, model, optimizer, scheduler, scaler):
 # ================================================
 #        Main Training Loop (for Feature Sequences)
 # ================================================
-# Version 1.1.0 (Feature Sequence Mode with Gradient Accumulation)
+# Version 1.2.0 logging changes
 def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                train_loader, val_loader, wrapper, start_epoch, initial_global_step,
                enabled_amp, amp_dtype, is_schedule_free):
     """
-    Runs the main training loop for pre-computed feature sequences with bucketing
-    and gradient accumulation.
+    Runs the main training loop for sequence models with gradient accumulation
+    and detailed logging metrics.
+    Logs: loss/current, loss/epoch, loss/current_val_loss, loss/average_val_loss
     """
     # --- Initial Setup ---
-    if not hasattr(args, 'num_train_epochs') or not hasattr(args, 'steps_per_epoch') or not hasattr(args, 'max_train_steps'):
-         print("ERROR: num_train_epochs, steps_per_epoch, or max_train_steps missing from args.")
+    if not all(hasattr(args, attr) for attr in ['num_train_epochs', 'steps_per_epoch', 'max_train_steps', 'num_labels']):
+         print("ERROR: Missing required args attributes (num_train_epochs, steps_per_epoch, max_train_steps, num_labels).")
          return
 
-    model.train() # Ensure model (HeadModel) is in train mode
+    model.train()
     if hasattr(optimizer, 'train') and callable(optimizer.train):
         try: optimizer.train()
         except Exception as e: print(f"Warning: Error calling optimizer.train(): {e}")
 
-    # <<< Get Gradient Accumulation Steps >>>
     gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
     effective_batch_size = args.batch * gradient_accumulation_steps
     print(f"Using Gradient Accumulation: {gradient_accumulation_steps} steps (Micro Bsz: {args.batch}, Eff Bsz: {effective_batch_size})")
 
     total_steps_to_run = args.max_train_steps
     total_epochs_to_run = args.num_train_epochs
-    steps_per_epoch = getattr(args, 'steps_per_epoch', len(train_loader)) # Micro-batches per epoch
+    # steps_per_epoch should be MICRO-batches per epoch if using standard loader,
+    # or GLOBAL steps per epoch if using calculated value (ensure consistency from main())
+    steps_per_epoch = getattr(args, 'steps_per_epoch', len(train_loader))
 
-    log_every_n = getattr(args, 'log_every_n', 10) # Logging frequency (based on GLOBAL steps)
-    validate_every_n = getattr(args, 'validate_every_n', steps_per_epoch // gradient_accumulation_steps if gradient_accumulation_steps > 0 else steps_per_epoch) # Default validate once per epoch (approx)
-    if validate_every_n == 0: validate_every_n = 1 # Ensure it's at least 1
+    log_every_n = getattr(args, 'log_every_n', 100) # Logging frequency (GLOBAL steps)
+    validate_every_n = getattr(args, 'validate_every_n', 0) # Validation frequency (GLOBAL steps, 0=disabled)
+    if validate_every_n <= 0: # Default to once per epoch if disabled or invalid
+         global_steps_per_epoch = math.ceil(steps_per_epoch / gradient_accumulation_steps) if gradient_accumulation_steps > 0 else steps_per_epoch
+         validate_every_n = global_steps_per_epoch if global_steps_per_epoch > 0 else 1
+         print(f"Validation frequency not set or invalid, defaulting to once per epoch ({validate_every_n} steps).")
+    if log_every_n <= 0: log_every_n = 1 # Ensure logging happens
 
-    print(f"Starting Feature Sequence training loop. Target Epochs: {total_epochs_to_run}, Target Steps: {total_steps_to_run}")
+    print(f"Starting Training Loop. Target Epochs: {total_epochs_to_run}, Target Steps: {total_steps_to_run}")
     print(f"Micro-batches per epoch: {steps_per_epoch}. Logging every {log_every_n} steps. Validating every {validate_every_n} steps.")
 
+    # --- State Variables ---
     global_step = initial_global_step
-    best_eval_loss = float('inf')
-    last_eval_loss_val = float('nan')
-    avg_loss_value_log = float('nan')
+    best_eval_loss = wrapper.best_val_loss if wrapper.best_val_loss is not None and not math.isnan(wrapper.best_val_loss) else float('inf')
+    last_eval_loss_val = float('nan') # Holds the most recent validation result for stepped graph
+    current_train_loss_avg = float('nan') # Holds the most recent logged train loss avg
 
-    # <<< Update Progress Bar Description >>>
-    progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc=f"Training Head (Eff Bsz {effective_batch_size})", unit="step", dynamic_ncols=True)
+    # Accumulators for logging metrics
+    current_window_loss_sum = torch.tensor(0.0, device=TARGET_DEV) # For loss/current
+    current_window_steps = 0                                  # For loss/current
+    epoch_loss_sum = torch.tensor(0.0, device=TARGET_DEV)         # For loss/epoch
+    epoch_steps = 0                                           # For loss/epoch
+    all_validation_losses = []                                # For loss/average_val_loss
 
-    # Accumulator for logging loss over a log_every_n cycle
-    accumulated_loss_for_log = torch.tensor(0.0, device=TARGET_DEV)
-    accumulation_steps_for_log = 0 # Counts micro-batches within a logging cycle
+    progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc=f"Training (Eff Bsz {effective_batch_size})", unit="it", dynamic_ncols=True)
+    # --- End State Variables ---
 
     # --- Outer Epoch Loop ---
     try:
         for epoch in range(start_epoch, total_epochs_to_run):
             if global_step >= total_steps_to_run: break
 
-            # Set epoch for sampler
-            if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
-                 train_loader.batch_sampler.set_epoch(epoch)
+            # Reset Epoch Accumulators
+            epoch_loss_sum.zero_()
+            epoch_steps = 0
+
+            # Set sampler epoch if applicable (might not be used with standard loader)
+            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
                  print(f"\n--- Starting Epoch {epoch + 1}/{total_epochs_to_run} (Sampler Epoch Set) ---")
+                 train_loader.sampler.set_epoch(epoch)
+            elif hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
+                 print(f"\n--- Starting Epoch {epoch + 1}/{total_epochs_to_run} (Batch Sampler Epoch Set) ---")
+                 train_loader.batch_sampler.set_epoch(epoch)
             else:
                  print(f"\n--- Starting Epoch {epoch + 1}/{total_epochs_to_run} ---")
 
@@ -676,32 +677,31 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
             model.train()
             if hasattr(optimizer, 'train') and callable(optimizer.train): optimizer.train()
 
-            # <<< Zero gradients ONCE before starting accumulation for the epoch/resume >>>
-            # We will zero them again after each optimizer step later.
+            # Zero gradients ONCE before starting accumulation cycle for the epoch
+            # We zero again after optimizer step
             optimizer.zero_grad(set_to_none=True)
 
-            # --- Step Loop (Iterates through MICRO-batches) ---
+            # --- Inner Step Loop (Iterates through MICRO-batches) ---
+            # Use enumerate(train_loader) - assumes standard loader now
             for i, batch_data in enumerate(train_loader):
-                # Check global step limit before processing micro-batch
-                # No need to break inner loop here, optimizer step check handles it
+                # Check global step limit before processing
+                if global_step >= total_steps_to_run: break
 
+                # Handle bad batches
                 if batch_data is None or not batch_data:
                      print(f"Warning: Skipping micro-batch {i} due to invalid batch_data.")
-                     continue # Skip to next micro-batch
+                     continue
 
+                # --- Process Micro-Batch ---
                 loss_this_step = torch.tensor(float('nan'), device=TARGET_DEV)
                 try:
-                    # Get sequence, mask, and label from the batch
-                    sequence_batch = batch_data.get('sequence')  # Shape [B, target_len, F] (Float32 from dataset)
-                    mask_batch = batch_data.get('mask')  # Shape [B, target_len] (Bool)
-                    label_batch = batch_data.get('label')  # Shape [B] (Long)
+                    # Get sequence, mask, label (logic for padding/masking setup)
+                    sequence_batch = batch_data.get('sequence')
+                    mask_batch = batch_data.get('mask')
+                    label_batch = batch_data.get('label')
+                    if sequence_batch is None or mask_batch is None or label_batch is None: continue
 
-                    # Check if data loaded correctly
-                    if sequence_batch is None or mask_batch is None or label_batch is None:
-                        print(f"Warning: Batch missing sequence, mask, or label at micro-batch {i}. Skipping.")
-                        continue
-
-                    # <<< Apply integrity check to sequence_batch >>>
+                    # Data Integrity Check
                     if not torch.isfinite(sequence_batch).all():  # Check sequence_batch
                         # <<< Correct variable name in error message >>>
                         num_bad_elements = (~torch.isfinite(sequence_batch)).sum().item()
@@ -710,187 +710,202 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                         continue
                     # <<< End Check >>>
 
-                    # <<< Move sequence, mask, and label to device >>>
-                    sequence_batch = sequence_batch.to(TARGET_DEV)  # Move sequence (Float32)
-                    mask_batch = mask_batch.to(TARGET_DEV)  # Move mask (Bool)
-                    label_batch = label_batch.to(TARGET_DEV)  # Move label (Long)
-                    # <<< Use sequence_batch to get batch size >>>
-                    current_batch_size = sequence_batch.size(0)
+                    # Move to device
+                    sequence_batch = sequence_batch.to(TARGET_DEV)
+                    mask_batch = mask_batch.to(TARGET_DEV)
+                    label_batch = label_batch.to(TARGET_DEV)
+                    current_micro_batch_size = sequence_batch.size(0)
 
-                    # Prepare target tensor (logic remains the same, uses label_batch)
+                    # Prepare target tensor
                     target = label_batch
-                    if args.num_classes == 1:
-                        target = target.to(dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
-                    else:
-                        target = target.to(dtype=torch.long).view(current_batch_size)
+                    if args.num_classes == 1: target = target.to(dtype=torch.float32).view(current_micro_batch_size, -1).squeeze(-1)
+                    else: target = target.to(dtype=torch.long).view(current_micro_batch_size)
 
-                    # --- Forward Pass (inside accumulation loop) ---
+                    # --- Forward/Backward Pass ---
                     with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
-                        # <<< Pass the correct sequence_batch and mask_batch to the model >>>
-                        # HeadModel pooling_strategy should be 'attn'
-                        y_pred = model(sequence_batch, attention_mask=mask_batch)  # Pass sequence_batch
-                        # <<< End Modification >>>
-
-                        # Prepare prediction shape (logic remains the same)
-                        y_pred_for_loss = y_pred
+                        # Pass sequence AND mask to model (ensure HeadModel uses mask)
+                        y_pred = model(sequence_batch, attention_mask=mask_batch)
+                        # Prepare prediction shape for loss
+                        y_pred_for_loss = y_pred # ... (squeeze if needed based on loss/num_classes) ...
                         if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and args.num_classes == 1:
-                            if y_pred.ndim > 1 and y_pred.shape[-1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
+                            if y_pred.ndim == 2 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
 
-                        # Calculate loss (logic remains the same)
-                        # <<< Ensure loss_input is correct type (model output might be AMP dtype) >>>
+                        # Calculate loss
                         loss_input = y_pred_for_loss.to(torch.float32)
-                        target_for_loss = target.to(loss_input.device) # Match target device/type
+                        target_for_loss = target.to(loss_input.device)
                         if isinstance(criterion, nn.NLLLoss): loss_input = F.log_softmax(loss_input, dim=-1)
                         loss = criterion(loss_input, target_for_loss.long() if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)) else target_for_loss.float())
 
                         # Store the *un-normalized* loss for logging
-                        loss_this_step = loss
+                        loss_this_step = loss.detach().item() # Get scalar value
 
-                        # Normalize loss for accumulation (logic remains the same)
+                        # Normalize loss for accumulation
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
 
                     if torch.isnan(loss) or torch.isinf(loss):
                         print(f"Warning: NaN/Inf loss detected at micro-batch {i}. Skipping backward.")
-                        loss = None
+                        loss = None # Prevent backward pass
                     else:
-                        # Accumulate gradients (logic remains the same)
+                        # Accumulate gradients
                         scaler.scale(loss).backward()
-
-                    # Accumulate non-normalized loss for logging (logic remains the same)
-                    if loss_this_step is not None and not math.isnan(loss_this_step.item()):
-                        accumulated_loss_for_log += loss_this_step.item()
-                        accumulation_steps_for_log += 1
 
                 except Exception as e:
                     print(f"\nError processing micro-batch {i} (Global Step approx {global_step}): {e}")
                     traceback.print_exc()
-                    # Try to continue to next micro-batch
+                    loss = None # Prevent accumulation if error occurred
+
+                # Accumulate Losses for Logging (if loss was valid)
+                if loss is not None and not math.isnan(loss_this_step):
+                     current_window_loss_sum += loss_this_step
+                     current_window_steps += 1
+                     epoch_loss_sum += loss_this_step
+                     epoch_steps += 1
 
                 # --- Optimizer Step Check ---
-                # Check if we have processed enough micro-batches for one optimizer step
+                # Check using micro-batch index 'i' and grad acc steps
                 if (i + 1) % gradient_accumulation_steps == 0:
-
                     # --- Skipping Logic for Resume ---
-                    # Check if the *upcoming* optimizer step should be skipped
                     if global_step < initial_global_step:
-                        # We performed backward passes but skip the optimizer step.
-                        # Need to zero gradients manually as the optimizer step won't do it.
-                        # Note: Scaler state should not be updated.
-                        if gradient_accumulation_steps > 1: # Only necessary if accumulating
-                            optimizer.zero_grad(set_to_none=True)
-
-                        global_step += 1 # Increment global step to track skipped steps
-                        progress_bar.update(1)
-                        continue # Continue to the next micro-batch, effectively skipping optim/log/val/save
+                        if gradient_accumulation_steps > 1: optimizer.zero_grad(set_to_none=True)
+                        global_step += 1; progress_bar.update(1); continue
 
                     # --- Perform Optimizer Step ---
+                    optimizer_stepped = False
                     try:
-                        scaler.step(optimizer) # Perform optimizer step using accumulated gradients
-                        scaler.update() # Update scaler
-                        optimizer_stepped = True # Flag that step was taken
+                        # <<< --- ADD GRADIENT CLIPPING --- >>>
+                        # Unscale the gradients before clipping
+                        scaler.unscale_(optimizer)
+
+                        # Clip the norm of the gradients
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Example: max_norm=1.0
+
+                        # Log grad_norm if desired (helps monitor clipping)
+                        if wrapper.wandb_run and global_step % log_every_n == 0: # Log at the same frequency as loss
+                             try: wrapper.wandb_run.log({"train/grad_norm": grad_norm.item()}, step=global_step)
+                             except Exception as e_gn: print(f"Wandb grad_norm log error: {e_gn}")
+
+                        # Scaler step will skip update if gradients are invalid (NaN/Inf)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer_stepped = True
                     except Exception as e_step:
                          print(f"\nError during optimizer step {global_step}: {e_step}")
                          traceback.print_exc()
-                         optimizer_stepped = False # Don't proceed if step failed
-
+                         optimizer_stepped = False
                     # <<< Zero gradients AFTER stepping >>>
                     optimizer.zero_grad(set_to_none=True)
 
-                    # <<< Scheduler Step (AFTER optimizer step) >>>
+                    # Scheduler Step (AFTER optimizer step)
                     if scheduler is not None and not is_schedule_free and optimizer_stepped:
                         try: scheduler.step()
                         except Exception as e_sched: print(f"Warning: Error during scheduler step: {e_sched}")
 
-                    # <<< Increment global_step only AFTER a successful-ish optimizer step >>>
+                    # Increment global_step only AFTER a potential optimizer step
                     if optimizer_stepped:
                          global_step += 1
                          progress_bar.update(1)
                          wrapper.update_step(global_step)
 
-                         # --- Logging & Validation (Now tied to GLOBAL step completion) ---
+                         # --- Logging (Every LOG_EVERY_N global steps) ---
                          if global_step % log_every_n == 0 and global_step > 0:
-                             avg_loss_value_log = float('nan')
-                             if accumulation_steps_for_log > 0:
-                                 # Log the average loss over the micro-batches SINCE THE LAST LOG
-                                 avg_loss_value_log = accumulated_loss_for_log / accumulation_steps_for_log
+                             # Calculate loss/current
+                             if current_window_steps > 0:
+                                 current_train_loss_avg = (current_window_loss_sum / current_window_steps).item()
+                             else: current_train_loss_avg = float('nan')
+                             # Reset CURRENT window accumulators
+                             current_window_loss_sum.zero_()
+                             current_window_steps = 0
 
-                             # Log to wrapper (WandB etc.)
-                             wrapper.log_main(step=global_step, train_loss_batch=avg_loss_value_log, eval_loss=last_eval_loss_val)
-
-                             # <<< Reset log accumulator AFTER logging >>>
-                             accumulated_loss_for_log = torch.tensor(0.0, device=TARGET_DEV)
-                             accumulation_steps_for_log = 0
-
-                             # Update progress bar postfix (remains the same)
+                             # Log to wrapper
+                             wrapper.log_main(
+                                 step=global_step,
+                                 current_train_loss=current_train_loss_avg,
+                                 current_val_loss=last_eval_loss_val # Pass last known validation loss
+                             )
+                             # Update Postfix
                              lr = optimizer.param_groups[0]['lr']
-                             postfix_dict = collections.OrderedDict()
-                             postfix_dict["Epoch"] = epoch + 1
-                             postfix_dict["AvgLoss"] = f"{avg_loss_value_log:.3e}" if not math.isnan(avg_loss_value_log) else "N/A"
-                             if not math.isnan(last_eval_loss_val): postfix_dict["LastEval"] = f"{last_eval_loss_val:.3e}"
-                             postfix_dict["LR"] = f"{lr:.1e}"
-                             progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False)
+                             postfix_dict = collections.OrderedDict(); postfix_dict["Epoch"] = epoch + 1
+                             postfix_dict["Loss(curr)"] = f"{current_train_loss_avg:.3e}" if not math.isnan(current_train_loss_avg) else "N/A"
+                             if not math.isnan(last_eval_loss_val): postfix_dict["Loss(val)"] = f"{last_eval_loss_val:.3e}"
+                             postfix_dict["LR"] = f"{lr:.1e}"; progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False)
+                         # --- End Logging ---
 
-                         # --- Validation & Saving (also tied to GLOBAL step completion) ---
-                         if global_step % validate_every_n == 0 and global_step > 0:
+                         # --- Validation (Every VALIDATE_EVERY_N global steps) ---
+                         if validate_every_n > 0 and global_step % validate_every_n == 0 and global_step > 0:
                              print(f"\n--- Running Validation @ Step {global_step} ---")
-                             eval_loss_val = float('nan')
-                             if val_loader:
-                                 eval_loss_val = run_validation_sequences(
-                                     model=model,
-                                     val_loader=val_loader,
-                                     criterion=criterion,
-                                     device=TARGET_DEV,
-                                     scaler=scaler,
-                                     num_labels=args.num_labels
-                                 )
-                                 last_eval_loss_val = eval_loss_val
-                                 model.train()
-                             else: print("--- Validation skipped (no val_loader) ---")
+                             eval_loss_val = run_validation_sequences(model, val_loader, criterion, TARGET_DEV, scaler, args.num_labels)
+                             model.train() # Ensure back in train mode
 
-                             if wrapper.wandb_run and not math.isnan(eval_loss_val):
-                                 try: wrapper.wandb_run.log({"eval/loss_on_val_step": eval_loss_val}, step=global_step)
-                                 except Exception as e: print(f"Wandb eval log error: {e}")
+                             if not math.isnan(eval_loss_val):
+                                 last_eval_loss_val = eval_loss_val # Update last known
+                                 all_validation_losses.append(eval_loss_val) # Store for average
+                                 print(f"--- Validation Complete: Eval Loss = {eval_loss_val:.4e} ---")
 
-                             if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Step {global_step}.")
-                             else: print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_val:.4e} ---")
+                                 # Calculate and Log Average Validation Loss
+                                 avg_val_loss = sum(all_validation_losses) / len(all_validation_losses)
+                                 print(f"--- Average Validation Loss So Far: {avg_val_loss:.4e} ---")
+                                 if wrapper.wandb_run:
+                                      try:
+                                           wrapper.wandb_run.log({
+                                                # Log the specific result for this run
+                                                "loss/eval_run_result": eval_loss_val,
+                                                # Log the running average
+                                                "loss/average_val_loss": avg_val_loss
+                                                }, step=global_step)
+                                      except Exception as e: print(f"Wandb val log error: {e}")
 
-                             # Update postfix again (remains the same logic)
-                             avg_loss_postfix = avg_loss_value_log if not math.isnan(avg_loss_value_log) else "?" # Use the last logged avg loss
-                             lr = optimizer.param_groups[0]['lr']
-                             postfix_dict = collections.OrderedDict()
-                             postfix_dict["Epoch"] = epoch + 1
-                             postfix_dict["AvgLoss"] = f"{avg_loss_postfix:.3e}"
-                             if not math.isnan(eval_loss_val): postfix_dict["EvalLoss"] = f"{eval_loss_val:.3e}"
-                             postfix_dict["LR"] = f"{lr:.1e}"
-                             progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False)
+                                 # Update progress bar postfix
+                                 lr = optimizer.param_groups[0]['lr']
+                                 postfix_dict = collections.OrderedDict(); postfix_dict["Epoch"] = epoch + 1
+                                 # Use the value calculated during logging step if available, else NaN
+                                 postfix_dict["Loss(curr)"] = f"{current_train_loss_avg:.3e}" if not math.isnan(current_train_loss_avg) else "N/A"
+                                 postfix_dict["Loss(val)"] = f"{eval_loss_val:.3e}"
+                                 postfix_dict["Loss(avg_val)"] = f"{avg_val_loss:.3e}"
+                                 postfix_dict["LR"] = f"{lr:.1e}"; progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False)
 
-                             # Check / Save best model (remains the same logic)
-                             if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
-                                 print(f"New best val loss: {eval_loss_val:.4e} (was {best_eval_loss:.4e}). Saving best model...")
-                                 best_eval_loss = eval_loss_val
-                                 wrapper.best_val_loss = best_eval_loss
-                                 wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args) # Save aux=False for best? Or True? Let's keep False for now.
-                             elif not math.isnan(eval_loss_val): print(f"Validation loss {eval_loss_val:.4e} did not improve on best {best_eval_loss:.4e}")
+                                 # Check / Save best model
+                                 if eval_loss_val < best_eval_loss:
+                                      best_eval_loss = eval_loss_val
+                                      wrapper.best_val_loss = best_eval_loss
+                                      print(f"New best val loss: {best_eval_loss:.4e}. Saving best model...")
+                                      wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args)
+                                 else:
+                                      print(f"Validation loss {eval_loss_val:.4e} did not improve on best {best_eval_loss:.4e}")
+                             else: # Handle NaN validation loss
+                                 print(f"Warning: Eval loss is NaN at Step {global_step}. Cannot update averages or save best.")
+                         # --- End Validation ---
 
-                         # Periodic saving (remains the same logic)
+                         # --- Periodic saving ---
                          if args.nsave > 0 and global_step % args.nsave == 0:
-                             if global_step > initial_global_step: # Avoid saving at step 0 if resuming
-                                 print(f"\nSaving periodic checkpoint @ step {global_step}...")
-                                 # Save aux states with periodic saves? Maybe True here.
-                                 wrapper.save_model(step=global_step, epoch=epoch, save_aux=False, args=args)
+                             if global_step > initial_global_step:
+                                  print(f"\nSaving periodic checkpoint @ step {global_step}...")
+                                  wrapper.save_model(step=global_step, epoch=epoch, save_aux=False, args=args)
 
                          # Check global step limit AFTER potentially saving
                          if global_step >= total_steps_to_run: break
+                # --- End Optimizer Step Check ---
 
                 # Check global step limit again before next micro-batch
                 if global_step >= total_steps_to_run: break
-            # --- End Micro-Batch Loop ---
+            # --- End Inner Step (micro-batch) Loop ---
+
+            # --- Log Epoch Average Loss ---
+            if epoch_steps > 0:
+                epoch_avg_loss = (epoch_loss_sum / epoch_steps).item()
+                print(f"--- Epoch {epoch + 1} Finished. Average Train Loss: {epoch_avg_loss:.4e} ---")
+                if wrapper.wandb_run:
+                    try: wrapper.wandb_run.log({"loss/epoch": epoch_avg_loss}, step=global_step)
+                    except Exception as e: print(f"Wandb epoch log error: {e}")
+            # --- End Epoch Logging ---
+
             if global_step >= total_steps_to_run: break
-        # --- End Epoch Loop ---
+        # --- End Outer Epoch Loop ---
 
     except KeyboardInterrupt: print("\nTraining interrupted by user.")
-    finally: progress_bar.close(); print(f"\nTraining loop finished. Reached Global Step: {global_step}")
+    finally:
+        progress_bar.close()
+        print(f"\nTraining loop finished. Reached Global Step: {global_step}")
 
 
 # ================================================
