@@ -34,163 +34,153 @@ def collate_sequences(batch):
          return None
 
 
-# --- Main Dataset Class ---
+# --- Main Dataset Class (Modified for Fixed Length) ---
 class FeatureSequenceDataset(Dataset):
     """
     Dataset for loading pre-computed feature sequences saved as .npz files.
-    Reads sequence lengths, handles train/val split, and prepares for bucketing.
+    ASSUMES sequences are already generated at a fixed length (TARGET_LEN).
+    Handles train/val split and provides fixed-length sequences with masks.
+    (Removed bucketing logic).
     """
     def __init__(self, feature_root_dir: str, validation_split_count: int = 0, seed: int = 42, preload: bool = False, preload_limit_gb: float = 10.0):
         """
         Args:
-            feature_root_dir (str): Path to the directory containing class subfolders
-                                     (e.g., data/aimv2..._SeqFeatures_fp16/).
+            feature_root_dir (str): Path to dir with class subfolders of .npz files.
             validation_split_count (int): Number of samples per class for validation.
             seed (int): Random seed for shuffling and splitting.
             preload (bool): Whether to preload features into RAM.
             preload_limit_gb (float): Approx RAM limit in GB for preloading.
         """
-        print(f"Initializing FeatureSequenceDataset from: {feature_root_dir}")
+        print(f"Initializing FeatureSequenceDataset v1.2.0 (Fixed Length Mode) from: {feature_root_dir}")
         if not os.path.isdir(feature_root_dir):
              raise FileNotFoundError(f"Feature root directory not found: {feature_root_dir}")
 
-        self.target_len = TARGET_LEN  # Store target length
+        # <<< Store TARGET_LEN from constant >>>
+        self.target_len = TARGET_LEN
+        print(f"  Expecting sequences of fixed length: {self.target_len}")
+
         self.feature_root_dir = feature_root_dir
         self.validation_split_count = validation_split_count
         self.seed = seed
         self.preload = preload
 
         # Data storage
-        self.metadata = [] # List of dicts: {'path': str, 'label': int, 'seq_len': int, 'orig_shape': tuple(int, int)}
-        self.preloaded_data = None # Holds tensors if preload=True
+        # <<< Simplified metadata: No seq_len needed >>>
+        self.metadata = [] # List of dicts: {'path': str, 'label': int}
+        self.preloaded_data = None
         self.label_map = {}
         self.idx_to_label = {}
         self.num_labels = 0
 
-        # Bucketing info
-        self.buckets = defaultdict(list) # {seq_len: [metadata_idx1, ...]}
-        self.bucket_lengths = []
+        # <<< REMOVED Bucketing info >>>
+        # self.buckets = defaultdict(list)
+        # self.bucket_lengths = []
 
         # Train/Validation split (stores indices into self.metadata)
         self.train_indices = []
         self.val_indices = []
 
         # --- Initialization Steps ---
-        self._scan_and_load_metadata()
+        self._scan_and_load_metadata() # Modified to skip length loading
         if not self.metadata: exit("Initialization failed: No valid feature files found.")
 
         if self.preload:
-            self._preload_features(preload_limit_gb) # Attempt preload after scanning
+            self._preload_features(preload_limit_gb) # Modified to not need seq_len
 
-        self._make_buckets()
-        self._split_data()
+        # <<< REMOVED _make_buckets() call >>>
+        self._split_data() # Splits indices directly
         # --- End Initialization ---
 
-        # Final print summary
+        # Final print summary (Removed bucket info)
         print(f"Dataset Initialized.")
         print(f"  Total sequences found: {len(self.metadata)}")
         print(f"  Classes found: {self.num_labels} ({list(self.label_map.keys())})")
-        print(f"  Buckets created (by sequence length): {len(self.buckets)}")
         print(f"  Training samples: {len(self.train_indices)}")
         print(f"  Validation samples: {len(self.val_indices)}")
         print(f"  Preloading enabled: {self.preload} ({len(self.preloaded_data) if self.preloaded_data else 0} items preloaded)")
 
+    # <<< Modified _scan_and_load_metadata >>>
     def _scan_and_load_metadata(self):
-        """Scans directories, loads .npz, extracts sequence length metadata."""
-        print("Scanning for .npz feature files and reading sequence lengths...")
+        """Scans directories, finds .npz files, assigns labels."""
+        print("Scanning for .npz feature files...")
         found_classes = sorted([d for d in os.listdir(self.feature_root_dir) if os.path.isdir(os.path.join(self.feature_root_dir, d)) and not d.startswith('.')])
 
         for class_folder in tqdm(found_classes, desc="Scanning Classes"):
             if not class_folder.isdigit():
-                print(f"Warning: Skipping non-digit folder '{class_folder}'.")
-                continue
-
-            # Assign sequential integer labels starting from 0
+                print(f"Warning: Skipping non-digit folder '{class_folder}'."); continue
             if class_folder not in self.label_map:
-                 label_idx = self.num_labels
-                 self.label_map[class_folder] = label_idx
-                 self.idx_to_label[label_idx] = class_folder
-                 self.num_labels += 1
-            else:
-                 label_idx = self.label_map[class_folder]
+                 label_idx = self.num_labels; self.label_map[class_folder] = label_idx
+                 self.idx_to_label[label_idx] = class_folder; self.num_labels += 1
+            else: label_idx = self.label_map[class_folder]
 
             class_dir = os.path.join(self.feature_root_dir, class_folder)
-            try:
-                 files_in_dir = os.listdir(class_dir)
-            except OSError as e:
-                 print(f"Warning: Could not list files in {class_dir}: {e}. Skipping folder.")
-                 continue
+            try: files_in_dir = os.listdir(class_dir)
+            except OSError as e: print(f"Warning: Could not list files in {class_dir}: {e}. Skipping."); continue
 
             for filename in tqdm(files_in_dir, desc=f"Class {class_folder}", leave=False):
                 if filename.lower().endswith(".npz") and not filename.startswith('.'):
                     filepath = os.path.join(class_dir, filename)
-                    try:
-                        # Efficiently get shape without loading full array?
-                        # np.load allows mmap, maybe fast enough? Let's try loading.
-                        with np.load(filepath) as data:
-                            if 'sequence' not in data:
-                                print(f"Warning: 'sequence' key missing in {filepath}. Skipping.")
-                                continue
-                            # Get sequence length (number of patches)
-                            seq_len = data['sequence'].shape[0]
-                            # Store metadata
-                            self.metadata.append({'path': filepath, 'label': label_idx, 'seq_len': seq_len})
-                    except Exception as e:
-                        print(f"Warning: Could not load or read shape from {filepath}: {e}. Skipping.")
+                    # <<< Store path and label ONLY >>>
+                    # No need to open the file here just for length
+                    self.metadata.append({'path': filepath, 'label': label_idx})
 
-        print(f"Scan complete. Found {len(self.metadata)} valid sequences.")
+        print(f"Scan complete. Found {len(self.metadata)} candidate sequences.")
 
+    # <<< Modified _preload_features >>>
     def _preload_features(self, limit_gb):
          """Attempts to preload feature sequences into RAM if enabled and within limit."""
          if not self.metadata: return
          print(f"Preloading requested. Estimating memory usage...")
-         estimated_size = 0
-         # Estimate based on first few files? Or assume average? Let's estimate roughly.
-         # Assume average seq_len * hidden_dim * bytes_per_elem
-         avg_seq_len = sum(m['seq_len'] for m in self.metadata) / len(self.metadata)
-         # Get hidden dim from first file? Assume 1024 for now. Assume fp16 save.
-         hidden_dim = 1024
+         # Estimate assuming fixed length TARGET_LEN and fp16 save
+         hidden_dim = 1024 # Assume this, or try to get from config if available
          bytes_per_elem = 2 # fp16
-         estimated_size = len(self.metadata) * avg_seq_len * hidden_dim * bytes_per_elem
+         estimated_size = len(self.metadata) * self.target_len * hidden_dim * bytes_per_elem
          estimated_gb = estimated_size / (1024**3)
-         print(f"  Estimated RAM needed: {estimated_gb:.2f} GB (Limit: {limit_gb:.2f} GB)")
+         print(f"  Estimated RAM needed: {estimated_gb:.2f} GB (Based on {self.target_len} length, {hidden_dim} dim, fp16)")
+         print(f"  Limit: {limit_gb:.2f} GB")
 
          if estimated_gb > limit_gb:
               print(f"  Estimated size exceeds limit. Preloading DISABLED.")
-              self.preload = False
-              return
+              self.preload = False; return
 
          print(f"  Preloading features into RAM...")
          self.preloaded_data = [None] * len(self.metadata)
          load_errors = 0
+         loaded_bytes = 0
          for i, meta in enumerate(tqdm(self.metadata, desc="Preloading")):
+              # Check limit dynamically
+              if loaded_bytes / (1024**3) > limit_gb * 0.95: # Stop if near limit
+                   print(f"\nApproaching RAM limit ({limit_gb} GB). Stopping preload.")
+                   # Clear remaining Nones? Or just leave them? Leave them.
+                   self.preloaded_data = self.preloaded_data[:i] # Trim list
+                   break
               try:
                    with np.load(meta['path']) as data:
+                        if 'sequence' not in data: raise KeyError("'sequence' key missing")
                         sequence_np = data['sequence']
-                        # Preload as fp16 tensor on CPU
-                        self.preloaded_data[i] = torch.from_numpy(sequence_np).to(torch.float16)
+                        # <<< Verify shape BEFORE storing >>>
+                        if sequence_np.shape[0] != self.target_len:
+                             # Maybe allow slight variations if padding handles it? For now, strict check.
+                             print(f"Warning: Preload shape mismatch for {meta['path']}. Expected length {self.target_len}, got {sequence_np.shape[0]}. Skipping preload for this item.")
+                             self.preloaded_data[i] = None # Don't preload wrong shape
+                             continue
+                        # Store as fp16 tensor on CPU
+                        tensor_data = torch.from_numpy(sequence_np).to(torch.float16)
+                        self.preloaded_data[i] = tensor_data
+                        loaded_bytes += tensor_data.nelement() * tensor_data.element_size()
               except Exception as e:
                    print(f"Error preloading {meta['path']}: {e}")
-                   self.preloaded_data[i] = None # Mark as failed
-                   load_errors += 1
+                   self.preloaded_data[i] = None; load_errors += 1
 
-         if load_errors > 0:
-              print(f"Warning: Failed to preload {load_errors} feature files.")
-         print("Preloading complete.")
+         # Clean up None entries if stopped early or errors occurred
+         loaded_count = sum(1 for item in self.preloaded_data if item is not None)
+         self.preloaded_data = [item for item in self.preloaded_data if item is not None] # Filter Nones
+         # We need a way to map original metadata index to new preloaded_data index if we filter...
+         # This is getting complicated. Maybe just mark as None and handle in __getitem__? Yes.
+         # Keep self.preloaded_data as [None] * len(self.metadata) and handle None check.
 
-    def _make_buckets(self):
-        """Groups metadata indices into buckets based on sequence length."""
-        print("Creating buckets based on sequence length...")
-        for i, meta in enumerate(self.metadata):
-            seq_len = meta['seq_len']
-            self.buckets[seq_len].append(i) # Store index of metadata item
-
-        self.bucket_lengths = sorted(self.buckets.keys())
-
-        # Optional: Log bucket counts
-        print(f"Created {len(self.bucket_lengths)} buckets.")
-        # for length in self.bucket_lengths:
-        #     print(f"  Length {length}: {len(self.buckets[length])} sequences")
+         if load_errors > 0: print(f"Warning: Failed to preload {load_errors} feature files.")
+         print(f"Preloading complete. Loaded {loaded_count} sequences.")
 
     def _split_data(self):
         """Splits metadata indices into train/validation stratified by class."""
@@ -270,265 +260,261 @@ class FeatureSequenceDataset(Dataset):
              meta_info = self.metadata[metadata_index] if 'metadata_index' in locals() and 0 <= metadata_index < len(self.metadata) else {'path': 'unknown'}
              print(f"Error processing metadata index {metadata_index} (path: {meta_info.get('path', 'unknown')}): {e}"); traceback.print_exc(); return None
 
-    # --- Modified __getitem__ ---
-    # v1.3.0: Pad/Truncate to target_len and return mask
+    # <<< RESTORED Padding/Masking in __getitem__ >>>
     def __getitem__(self, index):
         metadata_index = -1
         try:
-            if index >= len(self.train_indices): raise IndexError(f"...")
+            # Get metadata index from training split
+            if index >= len(self.train_indices): raise IndexError(f"Training index {index} out of bounds.")
             metadata_index = self.train_indices[index]
-            if metadata_index >= len(self.metadata): raise IndexError(f"...")
+            if metadata_index >= len(self.metadata): raise IndexError(f"Metadata index {metadata_index} out of bounds.")
             meta = self.metadata[metadata_index]
 
-            # Load sequence tensor [N, F] (fp16)
-            if self.preload and ... : # Preload logic
+            # --- Load sequence tensor (fp16) ---
+            sequence_tensor = None
+            # Try preloaded data first
+            if self.preload and self.preloaded_data is not None and \
+               metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
                  sequence_tensor = self.preloaded_data[metadata_index]
-            else: # Load from disk logic
+            # Load from disk if not preloaded or preload failed
+            if sequence_tensor is None:
                  filepath = meta['path']
                  try:
-                     with np.load(filepath) as data: sequence_np = data['sequence']
-                     sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
+                     with np.load(filepath) as data:
+                         if 'sequence' not in data: raise KeyError("'sequence' key missing")
+                         sequence_np = data['sequence']
+                         # Shape check is now less critical here, as we pad/truncate next
+                         sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
                  except Exception as e_load:
-                      print(f"Error loading npz file {filepath}: {e_load}"); return None
+                      print(f"Error loading npz file {filepath}: {e_load}")
+                      return None # Skip this item
 
             # --- Pad/Truncate and Create Mask ---
             current_len = sequence_tensor.shape[0]
-            features_dim = sequence_tensor.shape[1]
-            final_sequence = torch.zeros((self.target_len, features_dim), dtype=torch.float16) # Initialize with padding value (0)
-            attention_mask = torch.zeros(self.target_len, dtype=torch.bool) # Mask: True for real, False for padding
+            features_dim = sequence_tensor.shape[1] # Assume consistent feature dim
+            # Initialize tensors for final fixed length
+            final_sequence = torch.zeros((self.target_len, features_dim), dtype=torch.float16)
+            attention_mask = torch.zeros(self.target_len, dtype=torch.bool) # False = padding
 
             if current_len == 0:
                 print(f"Warning: Empty sequence tensor for {meta.get('path', 'unknown')}. Returning padded zeros.")
                 # final_sequence and attention_mask are already zeros
             elif current_len > self.target_len:
-                # This shouldn't happen if generation script caps at 4096, but handle defensively
+                # Truncate if longer than target
                 print(f"Warning: Sequence length {current_len} > target {self.target_len} for {meta.get('path', 'unknown')}. Truncating.")
                 final_sequence = sequence_tensor[:self.target_len, :]
-                attention_mask[:] = True # All are real tokens
+                attention_mask[:] = True # All are real tokens up to target_len
             else: # current_len <= self.target_len (Pad)
-                final_sequence[:current_len, :] = sequence_tensor
-                attention_mask[:current_len] = True # Mark real tokens
+                final_sequence[:current_len, :] = sequence_tensor # Copy sequence data
+                attention_mask[:current_len] = True # Mark real tokens as True
 
             label = meta['label']
             # Return sequence [target_len, F], mask [target_len], label
             return {
-                'sequence': final_sequence.float(), # Convert to Float32 for model input
+                'sequence': final_sequence.float(), # Convert final seq to Float32 for model input
+                'mask': attention_mask,
+                'label': torch.tensor(label, dtype=torch.long)
+            }
+
+        except IndexError as e_index: print(f"Error in __getitem__ with index {index}: {e_index}"); return None
+        except Exception as e:
+             path_info = self.metadata[metadata_index].get('path', 'unknown') if metadata_index != -1 and metadata_index < len(self.metadata) else 'unknown'
+             print(f"Error processing data index {index} (metadata index {metadata_index}, path: {path_info}): {e}"); traceback.print_exc(); return None
+
+    # --- get_validation_loader (Modified to use Correct SubDataset) ---
+    def get_validation_loader(self, batch_size, num_workers=0, prefetch_factor=2):
+        print("Creating validation loader (Fixed Length Mode)...")
+        if not self.val_indices: print("Validation set is empty."); return None
+
+        # <<< Use ValidationSubDatasetFeaturesPadded >>>
+        val_dataset = ValidationSubDatasetFeaturesPadded(
+            self.metadata,           # Pass full metadata list
+            self.val_indices,        # Pass only validation indices
+            self.preload,            # Pass preload flag
+            self.preloaded_data,     # Pass preloaded data (or None)
+            self.target_len          # Pass the target length
+        )
+        if len(val_dataset) == 0: print("Warning: ValidationSubDataset is empty."); return None
+
+        val_loader = DataLoader(
+             val_dataset, batch_size=batch_size, shuffle=False,
+             num_workers=num_workers, collate_fn=collate_sequences, # Use same collate
+             persistent_workers=(num_workers > 0), prefetch_factor=prefetch_factor if num_workers > 0 else None
+        )
+        return val_loader
+
+
+# --- Validation SubDataset (Keep the Padded version) ---
+class ValidationSubDatasetFeaturesPadded(Dataset):
+    def __init__(self, metadata_list, validation_indices, preload, preloaded_data, target_len):
+        self.metadata = metadata_list;
+        self.val_indices = validation_indices
+        self.preload = preload;
+        self.preloaded_data = preloaded_data
+        self.target_len = target_len
+        print(f"ValidationSubDatasetFeaturesPadded initialized with {len(self.val_indices)} indices.")
+
+    def __len__(self): return len(self.val_indices)
+
+    # <<< RESTORED Padding/Masking in __getitem__ >>>
+    def __getitem__(self, index):
+        metadata_index = -1
+        try:
+            # Get metadata index from validation list
+            if index >= len(self.val_indices): raise IndexError(...)
+            metadata_index = self.val_indices[index]
+            if metadata_index >= len(self.metadata): raise IndexError(...)
+            meta = self.metadata[metadata_index]
+
+            # Load sequence tensor (fp16) - Reuse logic from main dataset
+            sequence_tensor = None
+            if self.preload and self.preloaded_data is not None and \
+                    metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
+                sequence_tensor = self.preloaded_data[metadata_index]
+            if sequence_tensor is None:
+                filepath = meta['path']
+                try:
+                    with np.load(filepath) as data:
+                        if 'sequence' not in data: raise KeyError(...)
+                        sequence_np = data['sequence']
+                        sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
+                except Exception as e_load:
+                    print(f"Error loading VAL npz {filepath}: {e_load}"); return None
+
+            # Pad/Truncate and Create Mask (Same logic as main dataset __getitem__)
+            current_len = sequence_tensor.shape[0]
+            features_dim = sequence_tensor.shape[1]
+            final_sequence = torch.zeros((self.target_len, features_dim), dtype=torch.float16)
+            attention_mask = torch.zeros(self.target_len, dtype=torch.bool)  # False = padding
+            if current_len == 0:
+                pass  # Already zeros
+            elif current_len > self.target_len:
+                final_sequence = sequence_tensor[:self.target_len, :]
+                attention_mask[:] = True
+            else:  # Pad
+                final_sequence[:current_len, :] = sequence_tensor
+                attention_mask[:current_len] = True
+
+            label = meta['label']
+            return {
+                'sequence': final_sequence.float(),  # Convert final seq to Float32
                 'mask': attention_mask,
                 'label': torch.tensor(label, dtype=torch.long)
             }
 
         except IndexError as e_index:
-             print(f"Error in __getitem__ with training index {index}: {e_index}")
-             return None
+            print(f"Error in validation __getitem__: {e_index}"); return None
         except Exception as e:
-             metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
-             path_info = self.metadata[metadata_index_info].get('path', 'unknown') if isinstance(metadata_index_info, int) and 0 <= metadata_index_info < len(self.metadata) else 'unknown'
-             print(f"Error processing data for training index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
-             traceback.print_exc()
-             return None
-
-    # --- get_validation_loader ---
-    # v1.3.0: Update validation loader call
-    def get_validation_loader(self, batch_size, num_workers=0, prefetch_factor=2):
-        print("Creating validation loader (using individual pooling)...")
-        if not self.val_indices:
-             print("Validation set is empty."); return None
-
-        # --- Create a SubDataset for Validation that also pools ---
-        val_dataset = ValidationSubDatasetFeaturesPadded(
-            self.metadata,
-            self.val_indices,
-            self.preload,
-            self.preloaded_data,
-            self.target_len
-        )
-        if len(val_dataset) == 0:
-             print("Warning: ValidationSubDataset is empty.")
-             return None
-
-        # --- Use Standard DataLoader for Validation ---
-        val_loader = DataLoader(
-             val_dataset,
-             batch_size=batch_size,
-             shuffle=False,
-             num_workers=num_workers,
-             collate_fn=collate_sequences, # Need to update collate_fn too
-             persistent_workers=True if num_workers > 0 else False,
-             prefetch_factor=prefetch_factor if num_workers > 0 else None
-        )
-        return val_loader
+            path_info = self.metadata[metadata_index].get('path',
+                                                          'unknown') if metadata_index != -1 and metadata_index < len(
+                self.metadata) else 'unknown'
+            print(
+                f"Error processing validation data index {index} (metadata index {metadata_index}, path: {path_info}): {e}")
+            traceback.print_exc()
+            return None
 
 
-# New/Renamed Validation SubDataset for Padding
-class ValidationSubDatasetFeaturesPadded(Dataset):
-     def __init__(self, metadata_list, validation_indices, preload, preloaded_data, target_len):
-          self.metadata = metadata_list
-          self.val_indices = validation_indices
-          self.preload = preload
-          self.preloaded_data = preloaded_data
-          self.target_len = target_len # Store target length
-          # ...
-
-     def __len__(self): return len(self.val_indices)
-
-     def __getitem__(self, index):
-          metadata_index = -1
-          try:
-               if index >= len(self.val_indices):
-                    raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
-               metadata_index = self.val_indices[index] # Get index into main metadata
-
-               if metadata_index >= len(self.metadata):
-                    raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
-               meta = self.metadata[metadata_index]
-
-               # Load sequence tensor (fp16 on CPU or preloaded) - Reuse logic from main dataset
-               if self.preload and self.preloaded_data is not None and metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
-                   sequence_tensor = self.preloaded_data[metadata_index]
-               else:
-                   filepath = meta['path']
-                   try:
-                       with np.load(filepath) as data: sequence_np = data['sequence']
-                       sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
-                   except Exception as e_load:
-                       print(f"Error loading validation npz file {filepath}: {e_load}")
-                       return None
-
-               # Pad/Truncate and Create Mask (Same logic as main dataset)
-               current_len = sequence_tensor.shape[0]
-               features_dim = sequence_tensor.shape[1]
-               final_sequence = torch.zeros((self.target_len, features_dim), dtype=torch.float16)
-               attention_mask = torch.zeros(self.target_len, dtype=torch.bool)
-               if current_len == 0:
-                   pass  # Already zeros
-               elif current_len > self.target_len:
-                   final_sequence = sequence_tensor[:self.target_len, :]
-                   attention_mask[:] = True
-               else:
-                   final_sequence[:current_len, :] = sequence_tensor
-                   attention_mask[:current_len] = True
-
-               label = meta['label']
-               return {
-                   'sequence': final_sequence.float(),  # Convert to Float32
-                   'mask': attention_mask,
-                   'label': torch.tensor(label, dtype=torch.long)
-               }
-
-          except IndexError as e_index:
-               print(f"Error in validation __getitem__: {e_index}")
-               return None
-          except Exception as e:
-               path_info = 'unknown'
-               metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
-               if isinstance(metadata_index_info, int) and metadata_index_info < len(self.metadata):
-                    path_info = self.metadata[metadata_index_info].get('path', 'unknown')
-               print(f"Error processing validation data for index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
-               traceback.print_exc()
-               return None
-
-
-# --- New Validation SubDataset ---
-# Needs to replicate the pooling logic from __getitem__
-class ValidationSubDatasetFeaturesPooled(Dataset):
-     def __init__(self, metadata_list, validation_indices, preload, preloaded_data):
-          self.metadata = metadata_list
-          self.val_indices = validation_indices
-          self.preload = preload
-          self.preloaded_data = preloaded_data
-          print(f"ValidationSubDatasetFeaturesPooled initialized with {len(self.val_indices)} indices.")
-
-     def __len__(self):
-          return len(self.val_indices)
-
-     def __getitem__(self, index):
-          metadata_index = -1 # Initialize
-          try:
-               if index >= len(self.val_indices):
-                    raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
-               metadata_index = self.val_indices[index] # Get index into main metadata
-
-               if metadata_index >= len(self.metadata):
-                    raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
-               meta = self.metadata[metadata_index]
-
-               # Load sequence tensor (fp16 on CPU or preloaded) - Reuse logic from main dataset
-               if self.preload and self.preloaded_data is not None and metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
-                   sequence_tensor = self.preloaded_data[metadata_index]
-               else:
-                   filepath = meta['path']
-                   try:
-                       with np.load(filepath) as data: sequence_np = data['sequence']
-                       sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
-                   except Exception as e_load:
-                       print(f"Error loading validation npz file {filepath}: {e_load}")
-                       return None
-
-               # Apply Mean Pooling
-               if sequence_tensor.numel() == 0:
-                    print(f"Warning: Empty sequence tensor encountered for validation metadata index {metadata_index}, path {meta.get('path', 'unknown')}. Returning None.")
-                    return None
-               pooled_features = torch.mean(sequence_tensor.float(), dim=0) # Pool, convert to float32
-
-               label = meta['label']
-               return {'sequence': pooled_features, 'label': torch.tensor(label, dtype=torch.long)}
-
-          except IndexError as e_index:
-               print(f"Error in validation __getitem__: {e_index}")
-               return None
-          except Exception as e:
-               path_info = 'unknown'
-               metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
-               if isinstance(metadata_index_info, int) and metadata_index_info < len(self.metadata):
-                    path_info = self.metadata[metadata_index_info].get('path', 'unknown')
-               print(f"Error processing validation data for index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
-               traceback.print_exc()
-               return None
-
-
-# --- Simple Validation Dataset Wrapper ---
-# (Assumes indices map to the main dataset's metadata)
-class ValidationSubDatasetFeatures(Dataset):
-     def __init__(self, metadata_list, validation_indices):
-          self.metadata = metadata_list
-          self.val_indices = validation_indices
-          print(f"ValidationSubDataset initialized with {len(self.val_indices)} indices.")
-
-     def __len__(self):
-          return len(self.val_indices)
-
-     def __getitem__(self, index):
-          metadata_index = -1 # Initialize
-          try:
-               if index >= len(self.val_indices):
-                    raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
-               metadata_index = self.val_indices[index] # Get index into main metadata
-               if metadata_index >= len(self.metadata):
-                    raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
-               meta = self.metadata[metadata_index]
-               filepath = meta['path']
-               label = meta['label']
-
-               try:
-                   data = np.load(filepath)
-                   sequence_np = data['sequence']
-               except Exception as e_load:
-                    print(f"Error loading validation npz file {filepath}: {e_load}")
-                    return None
-
-               sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
-               return {'sequence': sequence_tensor, 'label': torch.tensor(label, dtype=torch.long)}
-
-          except IndexError as e_index:
-               print(f"Error in validation __getitem__: {e_index}")
-               return None
-          except Exception as e:
-               path_info = 'unknown'
-               if metadata_index != -1 and metadata_index < len(self.metadata):
-                    path_info = self.metadata[metadata_index].get('path', 'unknown')
-               print(f"Error processing validation data for index {index} (metadata index {metadata_index}, path: {path_info}): {e}")
-               traceback.print_exc()
-               return None
+# # --- New Validation SubDataset ---
+# # Needs to replicate the pooling logic from __getitem__
+# class ValidationSubDatasetFeaturesPooled(Dataset):
+#      def __init__(self, metadata_list, validation_indices, preload, preloaded_data):
+#           self.metadata = metadata_list
+#           self.val_indices = validation_indices
+#           self.preload = preload
+#           self.preloaded_data = preloaded_data
+#           print(f"ValidationSubDatasetFeaturesPooled initialized with {len(self.val_indices)} indices.")
+#
+#      def __len__(self):
+#           return len(self.val_indices)
+#
+#      def __getitem__(self, index):
+#           metadata_index = -1 # Initialize
+#           try:
+#                if index >= len(self.val_indices):
+#                     raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
+#                metadata_index = self.val_indices[index] # Get index into main metadata
+#
+#                if metadata_index >= len(self.metadata):
+#                     raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
+#                meta = self.metadata[metadata_index]
+#
+#                # Load sequence tensor (fp16 on CPU or preloaded) - Reuse logic from main dataset
+#                if self.preload and self.preloaded_data is not None and metadata_index < len(self.preloaded_data) and self.preloaded_data[metadata_index] is not None:
+#                    sequence_tensor = self.preloaded_data[metadata_index]
+#                else:
+#                    filepath = meta['path']
+#                    try:
+#                        with np.load(filepath) as data: sequence_np = data['sequence']
+#                        sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
+#                    except Exception as e_load:
+#                        print(f"Error loading validation npz file {filepath}: {e_load}")
+#                        return None
+#
+#                # Apply Mean Pooling
+#                if sequence_tensor.numel() == 0:
+#                     print(f"Warning: Empty sequence tensor encountered for validation metadata index {metadata_index}, path {meta.get('path', 'unknown')}. Returning None.")
+#                     return None
+#                pooled_features = torch.mean(sequence_tensor.float(), dim=0) # Pool, convert to float32
+#
+#                label = meta['label']
+#                return {'sequence': pooled_features, 'label': torch.tensor(label, dtype=torch.long)}
+#
+#           except IndexError as e_index:
+#                print(f"Error in validation __getitem__: {e_index}")
+#                return None
+#           except Exception as e:
+#                path_info = 'unknown'
+#                metadata_index_info = metadata_index if 'metadata_index' in locals() else 'unknown'
+#                if isinstance(metadata_index_info, int) and metadata_index_info < len(self.metadata):
+#                     path_info = self.metadata[metadata_index_info].get('path', 'unknown')
+#                print(f"Error processing validation data for index {index} (metadata index {metadata_index_info}, path: {path_info}): {e}")
+#                traceback.print_exc()
+#                return None
+#
+#
+# # --- Simple Validation Dataset Wrapper ---
+# # (Assumes indices map to the main dataset's metadata)
+# class ValidationSubDatasetFeatures(Dataset):
+#      def __init__(self, metadata_list, validation_indices):
+#           self.metadata = metadata_list
+#           self.val_indices = validation_indices
+#           print(f"ValidationSubDataset initialized with {len(self.val_indices)} indices.")
+#
+#      def __len__(self):
+#           return len(self.val_indices)
+#
+#      def __getitem__(self, index):
+#           metadata_index = -1 # Initialize
+#           try:
+#                if index >= len(self.val_indices):
+#                     raise IndexError(f"Validation index {index} out of bounds for val_indices (len {len(self.val_indices)})")
+#                metadata_index = self.val_indices[index] # Get index into main metadata
+#                if metadata_index >= len(self.metadata):
+#                     raise IndexError(f"Validation metadata index {metadata_index} out of bounds for metadata (len {len(self.metadata)})")
+#                meta = self.metadata[metadata_index]
+#                filepath = meta['path']
+#                label = meta['label']
+#
+#                try:
+#                    data = np.load(filepath)
+#                    sequence_np = data['sequence']
+#                except Exception as e_load:
+#                     print(f"Error loading validation npz file {filepath}: {e_load}")
+#                     return None
+#
+#                sequence_tensor = torch.from_numpy(sequence_np).to(torch.float16)
+#                return {'sequence': sequence_tensor, 'label': torch.tensor(label, dtype=torch.long)}
+#
+#           except IndexError as e_index:
+#                print(f"Error in validation __getitem__: {e_index}")
+#                return None
+#           except Exception as e:
+#                path_info = 'unknown'
+#                if metadata_index != -1 and metadata_index < len(self.metadata):
+#                     path_info = self.metadata[metadata_index].get('path', 'unknown')
+#                print(f"Error processing validation data for index {index} (metadata index {metadata_index}, path: {path_info}): {e}")
+#                traceback.print_exc()
+#                return None
 
 # class BucketBatchSampler(Sampler[list[int]]):
 #     """

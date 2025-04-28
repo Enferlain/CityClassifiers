@@ -4,8 +4,9 @@
 # (Used for naming output files/runs)
 model:
   base: "AnatomyFlaws"
-  rev: "v10.3_adoptaosf_fl_AIMv2Native_3000" # New revision indicating feature mode
+  rev: "v10.5_adoptaosf_bce_AIMv2Native_3000" # New revision indicating feature mode
   arch: class                      # Still a classification task
+  num_classes: 1
   base_vision_model: "apple/aimv2-large-patch14-native"
 # --- Data Configuration ---
 data:
@@ -24,13 +25,13 @@ head_params:
   pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
   hidden_dim: 1024                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
-  dropout_rate: 0.1              # Dropout rate within the head
-  output_mode: sigmoid             # <<< Output mode for the head
+  dropout_rate: 0.3              # Dropout rate within the head
+  output_mode: linear             # <<< Output mode for the head
 
 # --- Attention Pooling Parameters (Only if head_params.pooling_strategy='attn') ---
 attn_pool_params:
   attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
-  attn_pool_dropout: 0.1         # Dropout for the Attention Pooling layer
+  attn_pool_dropout: 0.3         # Dropout for the Attention Pooling layer
 
 # --- Training Parameters ---
 train:
@@ -47,7 +48,7 @@ train:
   precision: "bf16"                # Mixed precision for training head
 
   # --- Loss Function ---
-  loss_function: "focal"
+  loss_function: "bce"
   focal_loss_gamma: 2.0
 
   # --- Optimizer ---

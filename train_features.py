@@ -189,132 +189,157 @@ def setup_dataloaders(args):
 
     return dataset, train_loader, val_loader
 
+# <<< REWRITTEN setup_model_criterion v1.1.0 >>>
 def setup_model_criterion(args, dataset):
-    """Sets up the HeadModel and criterion for feature sequence training."""
-    print("DEBUG setup_model_criterion: Setting up HeadModel and criterion...")
+    """
+    Sets up the HeadModel and criterion based on args config,
+    validating against the dataset's discovered labels.
+    """
+    print("DEBUG setup_model_criterion v1.1.0: Setting up HeadModel and criterion...")
 
-    # --- Common Setup ---
-    loss_function_name = getattr(args, 'loss_function')
-    # num_labels should have been updated by setup_dataloaders based on the dataset
-    num_classes = getattr(args, 'num_labels', None)
-    if num_classes is None:
-        exit("Error: num_labels not set by dataset loader. Cannot determine model output size.")
-    if args.arch == 'score' and num_classes != 1:
-        print(f"Warning: arch is 'score' but dataset seems to have {num_classes} labels? Forcing num_classes=1.")
-        num_classes = 1
-    if args.arch == 'class' and num_classes == 0:
-         exit("Error: arch is 'class' but dataset found 0 labels.")
-    if args.arch == 'class' and num_classes == 1:
-         print("Warning: arch is 'class' but dataset only has 1 label (e.g., only '0' folder). Consider adding more classes or using 'score' arch.")
-         # Defaulting to 2 classes for binary classification if only one label found might be confusing.
-         # Let's proceed with num_classes=1 for BCE loss, but CE/Focal/NLL/GHM will fail.
-         # num_classes = 2 # Force to 2? Or let it fail later? Let's keep 1 for now.
+    # --- 1. Determine Intended num_classes from Config ---
+    config_loss_function = getattr(args, 'loss_function', None)
+    config_arch = getattr(args, 'arch', 'class') # Default to class if missing
+    intended_num_classes = None
+    loss_requires_num_classes_1 = config_loss_function in ['bce', 'l1', 'mse']
+    loss_requires_num_classes_multi = config_loss_function in ['crossentropy', 'focal', 'nll', 'ghm']
 
-    args.num_classes = num_classes # Store the final determined number of classes back to args
+    if config_arch == 'score':
+        intended_num_classes = 1
+        if config_loss_function is None: config_loss_function = 'l1' # Default for score
+        elif not loss_requires_num_classes_1:
+             print(f"Warning: arch='score' usually implies num_classes=1, but loss_function='{config_loss_function}' suggests multi-class. Prioritizing loss function needs.")
+             # This case is ambiguous, let's rely on loss function requirement
+             if loss_requires_num_classes_multi: intended_num_classes = 2 # Assume 2 if loss needs it
+             else: print("Warning: Ambiguous config for arch='score' and loss. Assuming num_classes=1.")
 
+    elif config_arch == 'class':
+        if loss_requires_num_classes_1:
+            intended_num_classes = 1
+        elif loss_requires_num_classes_multi:
+            intended_num_classes = 2 # Default to 2 for multi-class losses if dataset doesn't specify more
+        elif config_loss_function is None:
+            # Default loss for class arch if none specified (e.g., focal)
+            config_loss_function = 'focal'
+            intended_num_classes = 2 # Default to 2 if loss defaults to multi-class type
+            print(f"DEBUG: No loss_function specified for arch='class', defaulting to '{config_loss_function}' (implies num_classes=2+).")
+        else: # Loss specified but doesn't fit category? Should have been caught by parse_args
+             exit(f"Error: Unknown loss function '{config_loss_function}' behavior for arch='class'.")
+    else:
+        exit(f"Error: Unknown model architecture '{config_arch}'.")
+
+    if intended_num_classes is None: # Safety check
+         exit("Error: Could not determine intended number of classes from configuration.")
+
+    print(f"DEBUG: Intended num_classes based on config (arch='{config_arch}', loss='{config_loss_function}'): {intended_num_classes}")
+
+    # --- 2. Get num_labels from Dataset ---
+    num_labels_from_dataset = getattr(dataset, 'num_labels', 0)
+    print(f"DEBUG: Labels found by dataset: {num_labels_from_dataset}")
+
+    # --- 3. Validate Intended vs. Dataset Labels ---
+    final_num_classes = intended_num_classes
+
+    if num_labels_from_dataset == 0:
+        # This shouldn't happen if dataset init works, but handle it.
+        exit("Error: Dataset reported finding 0 labels/classes. Check data directory structure.")
+
+    if intended_num_classes == 1:
+        if num_labels_from_dataset > 2:
+            # Cannot do binary loss if dataset has 3+ classes (e.g., folders 0, 1, 2)
+            exit(f"Config Error: Intended num_classes=1 (e.g., for BCE loss), but dataset found {num_labels_from_dataset} classes. Ambiguous target for binary loss.")
+        elif num_labels_from_dataset == 1:
+             # Only one class found (e.g., only folder '0'), cannot train binary.
+             exit(f"Config Error: Intended num_classes=1 (e.g., for BCE loss), but dataset only found 1 class (folder '{getattr(dataset, 'idx_to_label', {}).get(0, 'N/A')}'). Need at least two classes (0 and 1 folders) for binary classification training.")
+        # If intended=1 and found=2, it's okay, we proceed with num_classes=1.
+        elif num_labels_from_dataset == 2:
+            print("DEBUG: Config intends num_classes=1 (binary loss), dataset found 2 classes (0/1 folders). Proceeding with num_classes=1.")
+            final_num_classes = 1
+        # Else (intended=1, found=0) - already handled above
+
+    elif intended_num_classes >= 2: # Intending multi-class style (CE/Focal etc.)
+         if num_labels_from_dataset == 1:
+              exit(f"Config Error: Intended num_classes={intended_num_classes} (e.g., for CE/Focal loss), but dataset only found 1 class. Cannot train.")
+         elif num_labels_from_dataset != intended_num_classes:
+              # If intending 2+, but found a different number (e.g., 3 folders 0/1/2)
+              # Use the number found by the dataset as the source of truth for multi-class.
+              print(f"Warning: Intended num_classes={intended_num_classes} based on loss type default, but dataset found {num_labels_from_dataset} classes. Using {num_labels_from_dataset} classes.")
+              final_num_classes = num_labels_from_dataset
+         # Else (intended >= 2 and found == intended) -> OK
+
+    # Store the final validated number back to args for other parts of the script
+    args.num_classes = final_num_classes
+    print(f"DEBUG: Final validated num_classes to be used: {args.num_classes}")
+
+    # --- 4. Instantiate Criterion (Using Validated Classes) ---
     criterion = None
     class_weights_tensor = None
-    if args.arch == "class" and hasattr(args, 'weights') and args.weights:
-         if len(args.weights) == num_classes:
-              try:
-                  class_weights_tensor = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32)
-                  print(f"DEBUG: Using class weights: {args.weights}")
-              except Exception as e:
-                   print(f"Warning: Failed to create tensor from class weights: {e}. Ignoring weights.")
-         else:
-              print(f"Warning: Length of weights in config ({len(args.weights)}) != num_classes ({num_classes}). Ignoring weights.")
+    # Get weights from args if they exist and match final_num_classes
+    config_weights = getattr(args, 'weights', None)
+    if config_weights and len(config_weights) == final_num_classes:
+         try:
+              class_weights_tensor = torch.tensor(config_weights, device=TARGET_DEV, dtype=torch.float32)
+              print(f"DEBUG: Using class weights: {config_weights}")
+         except Exception as e: print(f"Warning: Failed to make tensor from weights: {e}.")
+    elif config_weights: print(f"Warning: Config weights len ({len(config_weights)}) != final num_classes ({final_num_classes}). Ignoring weights.")
 
-    # --- Determine Criterion ---
-    # This logic remains mostly the same, but uses the final num_classes
-    # It also validates against the model's output_mode required by the loss
-    head_output_mode = getattr(args, 'head_output_mode', 'linear').lower() # Get head output mode
-
-    if loss_function_name == 'l1':
-        print("DEBUG: Setting criterion to L1Loss.")
+    # Re-check loss compatibility with final_num_classes
+    if config_loss_function == 'l1':
+        if final_num_classes != 1: exit(f"Config Error: loss_function='l1' requires final_num_classes=1, but got {final_num_classes}.")
         criterion = nn.L1Loss(reduction='mean')
-        if num_classes != 1: print(f"Warning: L1Loss typically used with num_classes=1, but found {num_classes}.")
-        if head_output_mode not in ['tanh_scaled', 'sigmoid', 'linear']: print(f"Warning: L1Loss typically paired with scaled/linear output, got '{head_output_mode}'.")
-
-    elif loss_function_name == 'mse':
-        print("DEBUG: Setting criterion to MSELoss.")
+    elif config_loss_function == 'mse':
+        if final_num_classes != 1: exit(f"Config Error: loss_function='mse' requires final_num_classes=1, but got {final_num_classes}.")
         criterion = nn.MSELoss(reduction='mean')
-        if num_classes != 1: print(f"Warning: MSELoss typically used with num_classes=1, but found {num_classes}.")
-        if head_output_mode not in ['tanh_scaled', 'linear', 'sigmoid']: print(f"Warning: MSELoss typically paired with linear/scaled output, got '{head_output_mode}'.")
-
-    elif loss_function_name == 'focal':
-        print("DEBUG: Setting criterion to FocalLoss.")
-        if num_classes <= 1: exit(f"Error: FocalLoss requires num_classes > 1, but found {num_classes}.")
+    elif config_loss_function == 'focal':
+        if final_num_classes <= 1: exit(f"Config Error: loss_function='focal' requires final_num_classes > 1, but got {final_num_classes}.")
         criterion = FocalLoss(gamma=getattr(args, 'focal_loss_gamma', 2.0))
-        if head_output_mode != 'linear':
-             print(f"Warning: FocalLoss usually expects output_mode='linear', but got '{head_output_mode}'. Training with non-logit input.")
-             # Allow non-linear input, but loss calculation might be suboptimal.
-
-    elif loss_function_name == 'crossentropy':
-        print("DEBUG: Setting criterion to CrossEntropyLoss.")
-        if num_classes <= 1: exit(f"Error: CrossEntropyLoss requires num_classes > 1, but found {num_classes}.")
+    elif config_loss_function == 'crossentropy':
+        if final_num_classes <= 1: exit(f"Config Error: loss_function='crossentropy' requires final_num_classes > 1, but got {final_num_classes}.")
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-        if head_output_mode != 'linear':
-             print(f"Warning: CrossEntropyLoss usually expects output_mode='linear', but got '{head_output_mode}'. Training with non-logit input.")
-
-    elif loss_function_name == 'bce':
-        print("DEBUG: Setting criterion to BCEWithLogitsLoss.")
-        # BCEWithLogitsLoss *can* handle multi-label if target is multi-label float,
-        # but for single-label classification, num_classes=1 is standard.
-        if num_classes != 1:
-            print(f"Warning: BCEWithLogitsLoss selected, but num_classes={num_classes}. Ensure targets are correctly formatted (e.g., multi-label floats) or consider using CrossEntropyLoss.")
-        criterion = nn.BCEWithLogitsLoss(weight=class_weights_tensor if num_classes > 1 else None) # Weight applied per element for multi-label
-        if head_output_mode != 'linear':
-             print(f"Warning: BCEWithLogitsLoss expects output_mode='linear', but got '{head_output_mode}'. Training with non-logit input.")
-
-    elif loss_function_name == 'nll':
-        print("DEBUG: Setting criterion to NLLLoss (expects LogSoftmax input).")
-        if num_classes <= 1: exit(f"Error: NLLLoss requires num_classes > 1, but found {num_classes}.")
+    elif config_loss_function == 'bce':
+        if final_num_classes != 1: exit(f"Config Error: loss_function='bce' requires final_num_classes=1, but got {final_num_classes}.")
+        # BCEWithLogitsLoss weights are applied per *sample* if needed, not per class usually. Pass None.
+        criterion = nn.BCEWithLogitsLoss(weight=None) # Use pos_weight for weighting positive class if needed
+    elif config_loss_function == 'nll':
+        if final_num_classes <= 1: exit(f"Config Error: loss_function='nll' requires final_num_classes > 1, but got {final_num_classes}.")
         criterion = nn.NLLLoss(weight=class_weights_tensor)
-        if head_output_mode != 'linear':
-             # NLL *requires* log-probabilities. If the model isn't outputting logits, this won't work correctly.
-             exit(f"Error: loss_function='nll' selected, but model output_mode is '{head_output_mode}'. Must be 'linear' for NLLLoss (LogSoftmax applied in train loop).")
+        # Check model output mode for NLL
+        head_output_mode_nll = getattr(args, 'head_output_mode', 'linear').lower()
+        if head_output_mode_nll != 'linear': exit(f"Config Error: loss_function='nll' requires head_output_mode='linear', but got '{head_output_mode_nll}'.")
+    elif config_loss_function == 'ghm':
+        if final_num_classes <= 1: exit(f"Config Error: loss_function='ghm' requires final_num_classes > 1, but got {final_num_classes}.")
+        # Check model output mode for GHM
+        head_output_mode_ghm = getattr(args, 'head_output_mode', 'linear').lower()
+        if head_output_mode_ghm != 'linear': exit(f"Config Error: loss_function='ghm' requires head_output_mode='linear', but got '{head_output_mode_ghm}'.")
+        criterion = GHMC_Loss(bins=getattr(args, 'ghm_bins', 10), momentum=getattr(args, 'ghm_momentum', 0.75))
+    else: # Should be caught earlier, but safety net
+        exit(f"Internal Error: Reached criterion setup with unknown loss function '{config_loss_function}'.")
 
-    elif loss_function_name == 'ghm':
-        print("DEBUG: Setting criterion to GHMC_Loss.")
-        if num_classes <= 1: exit(f"Error: GHMC_Loss currently requires num_classes > 1, but found {num_classes}.")
-        ghm_bins = getattr(args, 'ghm_bins', 10)
-        ghm_momentum = getattr(args, 'ghm_momentum', 0.75)
-        criterion = GHMC_Loss(bins=ghm_bins, momentum=ghm_momentum, reduction='mean')
-        if head_output_mode != 'linear':
-             exit(f"Error: GHMC_Loss requires output_mode='linear', but got '{head_output_mode}'.")
-        if class_weights_tensor is not None: print("Warning: Class weights specified but GHMC_Loss does not use them directly.")
+    print(f"DEBUG: Criterion set to: {type(criterion).__name__}")
 
-    else:
-        raise ValueError(f"Unknown loss_function '{loss_function_name}' specified in config.")
-
-    if criterion is None:
-        exit("Error: Criterion setup failed.")
-
-    # --- Instantiate the HeadModel (v1.5.0 Transformer Head) ---
-    print(f"DEBUG: Instantiating HeadModel v1.5.0 (Transformer Head)...")
+    # --- 5. Instantiate the HeadModel (Using Validated Classes) ---
+    print(f"DEBUG: Instantiating HeadModel...")
     try:
         head_features = getattr(args, 'head_features', None)
         if head_features is None: exit("Error: 'head_features' not specified.")
 
-        # Load standard MLP head params (use original keys from args)
+        # Load other params from args (these should be correctly populated by parse_and_load_args)
         hidden_dim = getattr(args, 'head_hidden_dim', 1024)
+        pooling_strategy = getattr(args, 'pooling_strategy', 'attn') # Needed for HeadModel internal logic
         num_res_blocks = getattr(args, 'head_num_res_blocks', 3)
         dropout_rate = getattr(args, 'head_dropout_rate', 0.2)
-        output_mode = getattr(args, 'head_output_mode', 'linear')
-
-        # Load attn pool params only if needed
+        output_mode = getattr(args, 'head_output_mode', 'linear') # Already checked compatibility with NLL/GHM
         attn_pool_heads = getattr(args, 'attn_pool_heads', 16)
         attn_pool_dropout = getattr(args, 'attn_pool_dropout', 0.2)
 
         model = HeadModel(
             features=head_features,
-            num_classes=args.num_classes, # Use num_classes determined earlier
-            # MLP params
+            num_classes=args.num_classes, # Use the FINAL validated number
+            pooling_strategy=pooling_strategy, # Pass strategy for info, though pooling done elsewhere now
             hidden_dim=hidden_dim,
             num_res_blocks=num_res_blocks,
             dropout_rate=dropout_rate,
             output_mode=output_mode,
-            # Attn Pool params (passed even if not used by pooling_after)
             attn_pool_heads=attn_pool_heads,
             attn_pool_dropout=attn_pool_dropout
         )
@@ -324,16 +349,14 @@ def setup_model_criterion(args, dataset):
         exit(f"Error instantiating HeadModel.")
 
     model.to(TARGET_DEV)
-    print("HeadModel and criterion setup complete.")
+    print(f"HeadModel (Output Classes: {args.num_classes}) and criterion setup complete.")
     return model, criterion
 
-# Version 2.5.0: Conditional parameter selection for optimizer
+# Version 2.5.1: Improved float conversion for optimizer/scheduler args
 def setup_optimizer_scheduler(args, model):
     """
     Sets up the optimizer and scheduler based on args.
-    Dynamically loads custom optimizers/schedulers from OPTIMIZERS/SCHEDULERS dicts.
-    Uses inspect to gather relevant arguments from args object.
-    Selects parameters to optimize based on end-to-end mode and freezing settings.
+    Handles float conversion for scientific notation strings.
     """
     optimizer = None
     scheduler = None
@@ -342,120 +365,89 @@ def setup_optimizer_scheduler(args, model):
 
     print(f"Attempting to setup optimizer: {optimizer_name}")
 
-    # --- Determine Parameters to Optimize ---
-    params_to_optimize = None
-    if getattr(args, 'is_end_to_end', False) and getattr(args, 'freeze_base_model', True):
-        print("DEBUG Optimizer: Base model is frozen, optimizing HEAD parameters only.")
-        # Access parameters of the head module (assuming it's named 'head')
-        if hasattr(model, 'head') and isinstance(model.head, nn.Module):
-             params_to_optimize = model.head.parameters()
-             # Double-check if any parameters were found in the head
-             if not list(model.head.parameters()):
-                 print("Warning: model.head found, but it has no parameters to optimize!")
-                 # Fallback to optimizing everything? Or error? Let's warn and optimize all for now.
-                 params_to_optimize = model.parameters()
-        else:
-             # Error if we expect a frozen base but can't find the head
-             exit("Error: Cannot find 'model.head' submodule to optimize when base model is frozen.")
-    else:
-        # Optimize all parameters if not E2E, or if E2E but base is not frozen
-        if getattr(args, 'is_end_to_end', False):
-             print("DEBUG Optimizer: End-to-end model, base is NOT frozen. Optimizing ALL trainable model parameters.")
-        else:
-             print("DEBUG Optimizer: Embedding-based model. Optimizing ALL trainable model parameters.")
-        params_to_optimize = model.parameters()
-
+    # --- Determine Parameters to Optimize (Logic Remains Same) ---
+    params_to_optimize = model.parameters() # Simplified for feature training (always optimize head)
     # Check if any parameters were selected
-    # Convert generator to list to check emptiness
     param_list_for_check = list(params_to_optimize)
-    if not param_list_for_check:
-         exit("Error: No parameters selected for optimization!")
-    # Need to use the original generator for the optimizer constructor if not checking length
-    # Re-assign if we consumed the generator by converting to list
-    params_to_optimize = iter(param_list_for_check) # Or get it again if model structure is simple
-    # Safer: Just get the generator again if needed
-    if getattr(args, 'is_end_to_end', False) and getattr(args, 'freeze_base_model', True):
-         params_to_optimize = model.head.parameters()
-    else:
-         params_to_optimize = model.parameters()
+    if not param_list_for_check: exit("Error: No parameters selected for optimization!")
+    params_to_optimize = model.parameters() # Get generator again
     # --- End Parameter Determination ---
 
     # --- Dynamic Optimizer Loading ---
     if optimizer_name in OPTIMIZERS:
         optimizer_class = OPTIMIZERS[optimizer_name]
         print(f"Found optimizer class: {optimizer_class.__name__}")
-
         try:
-            # Inspect the optimizer's __init__ signature
             sig = inspect.signature(optimizer_class.__init__)
             available_params = sig.parameters.keys()
-            # Gather potential kwargs from args (same logic as before)
             potential_kwargs = {}
             args_dict = vars(args)
             for param_name in available_params:
                 if param_name in ['self', 'params', 'model', 'args', 'kwargs']: continue
                 if param_name in args_dict and args_dict[param_name] is not None:
-                    # (Type conversion logic remains the same as before)
                     expected_type = sig.parameters[param_name].annotation
                     default_value = sig.parameters[param_name].default
                     value = args_dict[param_name]
                     try:
-                        if expected_type == inspect.Parameter.empty: potential_kwargs[param_name] = value
-                        elif expected_type == bool: potential_kwargs[param_name] = bool(value)
-                        elif expected_type == int: potential_kwargs[param_name] = int(value)
-                        elif expected_type == float: potential_kwargs[param_name] = float(value)
-                        elif expected_type == str: potential_kwargs[param_name] = str(value)
+                        # <<< START TYPE CONVERSION FIX >>>
+                        converted_value = None
+                        if expected_type == inspect.Parameter.empty:
+                            # No type hint, try common types (float first for LR etc.)
+                            try: converted_value = float(value)
+                            except (ValueError, TypeError):
+                                 try: converted_value = int(value)
+                                 except (ValueError, TypeError):
+                                      if isinstance(value, str) and value.lower() in ['true', 'false']:
+                                           converted_value = value.lower() == 'true'
+                                      else: converted_value = value # Use as is if no conversion works
+                        elif expected_type == bool:
+                            converted_value = str(value).lower() == 'true' if isinstance(value, str) else bool(value)
+                        elif expected_type == int: converted_value = int(value)
+                        elif expected_type == float: converted_value = float(value) # Handles '1e-4' correctly
+                        elif expected_type == str: converted_value = str(value)
                         elif expected_type == tuple or expected_type == list or \
                              (hasattr(expected_type, '__origin__') and expected_type.__origin__ in [tuple, list]):
                             if isinstance(value, (list, tuple)):
-                                inner_type = float
+                                inner_type = float # Default inner type
                                 if hasattr(expected_type, '__args__') and expected_type.__args__: inner_type = expected_type.__args__[0]
                                 converted_list = [inner_type(v) for v in value]
-                                potential_kwargs[param_name] = tuple(converted_list) if expected_type == tuple or expected_type.__origin__ == tuple else converted_list
+                                converted_value = tuple(converted_list) if expected_type == tuple or expected_type.__origin__ == tuple else converted_list
                             else: print(f"Warning: Arg {param_name} expects {expected_type} but got {type(value)}. Skipping.")
-                        else: potential_kwargs[param_name] = value
+                        else: # Fallback for other types or Any
+                            converted_value = value
+                        # <<< END TYPE CONVERSION FIX >>>
+
+                        if converted_value is not None:
+                            potential_kwargs[param_name] = converted_value
+
                     except (ValueError, TypeError) as e_type:
                          print(f"Warning: Could not convert arg '{param_name}' (value: {value}) to expected type {expected_type}. Error: {e_type}. Using default or skipping.")
                          if default_value != inspect.Parameter.empty: potential_kwargs[param_name] = default_value
 
             print(f"  Instantiating {optimizer_class.__name__} with args: {potential_kwargs}")
-            # <<< Pass the correctly selected parameters >>>
             optimizer = optimizer_class(params_to_optimize, **potential_kwargs)
-
-            # Check if it's a schedule-free optimizer
-            if "schedulefree" in optimizer_name:
-                is_schedule_free = True
-                print("  Detected schedule-free optimizer.")
+            if "schedulefree" in optimizer_name: is_schedule_free = True; print("  Detected schedule-free optimizer.")
 
         except Exception as e:
-            print(f"ERROR: Failed to instantiate optimizer '{optimizer_name}' dynamically: {e}")
-            import traceback; traceback.print_exc()
-            print("  Falling back to AdamW.")
-            optimizer_name = 'adamw'
-            optimizer = None
-            is_schedule_free = False
+            print(f"ERROR: Failed to instantiate optimizer '{optimizer_name}' dynamically: {e}"); traceback.print_exc()
+            print("  Falling back to AdamW."); optimizer_name = 'adamw'; optimizer = None; is_schedule_free = False
 
     # --- Fallback / Default Optimizer ---
     if optimizer is None:
-        if optimizer_name != 'adamw':
-             print(f"Warning: Optimizer '{optimizer_name}' not found or failed. Falling back to AdamW.")
+        if optimizer_name != 'adamw': print(f"Warning: Optimizer '{optimizer_name}' failed. Falling back to AdamW.")
         optimizer_name = 'adamw'
-        # Use defaults from args for AdamW
-        adamw_kwargs = {
+        adamw_kwargs = { # Ensure these are floats
              'lr': float(getattr(args, 'lr', 1e-4)),
-             'betas': tuple(getattr(args, 'betas', (0.9, 0.999))),
+             'betas': tuple(getattr(args, 'betas', (0.9, 0.999))), # Assumes betas are already tuple/list
              'weight_decay': float(getattr(args, 'weight_decay', 0.0)),
              'eps': float(getattr(args, 'eps', 1e-8)),
         }
         print(f"Instantiating torch.optim.AdamW with args: {adamw_kwargs}")
-        # <<< Pass the correctly selected parameters >>>
-        optimizer = torch.optim.AdamW(params_to_optimize, **adamw_kwargs)
-        is_schedule_free = False
+        optimizer = torch.optim.AdamW(params_to_optimize, **adamw_kwargs); is_schedule_free = False
     # --- End Fallback ---
 
-    # --- Scheduler Setup ---
+    # --- Scheduler Setup (Ensure float conversion here too if needed) ---
     if not is_schedule_free:
-        # (Scheduler loading logic remains unchanged - operates on the created `optimizer`)
         scheduler_name = getattr(args, 'scheduler_name', 'CosineAnnealingLR').lower()
         print(f"Attempting to setup scheduler: {scheduler_name}")
         scheduler_class = None
@@ -463,38 +455,31 @@ def setup_optimizer_scheduler(args, model):
             scheduler_class = SCHEDULERS[scheduler_name]
             print(f"Found custom scheduler class: {scheduler_class.__name__}")
             try:
-                # (Inspect and gather kwargs logic remains the same)
-                sig = inspect.signature(scheduler_class.__init__)
-                available_params = sig.parameters.keys()
-                scheduler_kwargs = {}
-                args_dict = vars(args)
+                sig = inspect.signature(scheduler_class.__init__); available_params = sig.parameters.keys()
+                scheduler_kwargs = {}; args_dict = vars(args)
                 for param_name in available_params:
                     if param_name in ['self', 'optimizer', 'last_epoch', 'args', 'kwargs']: continue
-                    arg_key = f"scheduler_{param_name}"
+                    arg_key = f"scheduler_{param_name}" # Look for prefixed args
+                    if arg_key not in args_dict and param_name in args_dict: arg_key = param_name # Fallback to non-prefixed
                     if arg_key in args_dict and args_dict[arg_key] is not None:
-                        expected_type = sig.parameters[param_name].annotation
-                        default_value = sig.parameters[param_name].default
                         value = args_dict[arg_key]
+                        # <<< Add simplified float conversion here too >>>
                         try:
-                            # (Type conversion logic remains the same)
-                            if expected_type == inspect.Parameter.empty: scheduler_kwargs[param_name] = value
-                            elif expected_type == bool: scheduler_kwargs[param_name] = bool(value)
-                            elif expected_type == int: scheduler_kwargs[param_name] = int(value)
-                            elif expected_type == float: scheduler_kwargs[param_name] = float(value)
-                            elif expected_type == str: scheduler_kwargs[param_name] = str(value)
-                            else: scheduler_kwargs[param_name] = value
-                        except (ValueError, TypeError) as e_type:
-                             print(f"Warning: Could not convert scheduler arg '{param_name}' (value: {value}) to {expected_type}. Error: {e_type}. Using default or skipping.")
-                             if default_value != inspect.Parameter.empty: scheduler_kwargs[param_name] = default_value
-
+                            # Try float conversion first for common scheduler args
+                            scheduler_kwargs[param_name] = float(value)
+                        except (ValueError, TypeError):
+                             try: # Try int
+                                  scheduler_kwargs[param_name] = int(value)
+                             except (ValueError, TypeError):
+                                  try: # Try bool
+                                       if isinstance(value, str): scheduler_kwargs[param_name] = value.lower() == 'true'
+                                       else: scheduler_kwargs[param_name] = bool(value)
+                                  except: scheduler_kwargs[param_name] = value # Fallback
                 print(f"  Instantiating {scheduler_class.__name__} with args: {scheduler_kwargs}")
                 scheduler = scheduler_class(optimizer, **scheduler_kwargs)
-            except Exception as e:
-                 print(f"ERROR: Failed to instantiate custom scheduler '{scheduler_name}': {e}")
-                 print("  Falling back to standard PyTorch schedulers.")
-                 scheduler = None # Reset to trigger fallback
-
+            except Exception as e: print(f"ERROR: Failed custom scheduler '{scheduler_name}': {e}"); scheduler = None
         # --- Fallback to Standard PyTorch Schedulers ---
+
         if scheduler is None:
             scheduler_type = None
             # Check args.cosine (legacy) or specific names

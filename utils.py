@@ -354,153 +354,87 @@ def run_validation_embeddings(model, val_loader, criterion, device, scaler):
 
 
 @torch.no_grad()
-# v2.4.0 -> v3.0.0: More robust validation logic adapted from old ModelWrapper
-def run_validation_sequences(model, val_loader, criterion, device, scaler, num_labels): # <<< Added num_labels >>>
+# v3.0.1: Refined target dtype handling for loss calculation
+def run_validation_sequences(model, val_loader, criterion, device, scaler, num_labels):
     """
     Runs validation loop for sequence models (padding/masking), with robust target/loss handling.
-    Args:
-        model: The model to evaluate (should be HeadModel).
-        val_loader: DataLoader providing validation batches {'sequence': [B, L, F], 'mask': [B, L], 'label': [B]}.
-        criterion: The loss function.
-        device: The device to run on ('cuda' or 'cpu').
-        scaler: GradScaler instance (used to check AMP status/dtype).
-        num_labels (int): Number of output classes/labels for the model.
-    Returns:
-        float: Average loss per sample over the validation set, or float('nan').
     """
-    if val_loader is None:
-        print("run_validation_sequences: Validation loader not provided, skipping.")
-        return float('nan')
-
-    model.eval() # Set model to evaluation mode
-
-    # --- Determine AMP settings from scaler ---
+    if val_loader is None: print("run_validation_sequences: Validation loader missing."); return float('nan')
+    model.eval()
     autocast_enabled = scaler is not None and scaler.is_enabled()
-    amp_dtype = torch.float32
-    if autocast_enabled:
-        if hasattr(scaler, 'get_amp_dtype'): amp_dtype = scaler.get_amp_dtype()
-        elif device == 'cuda' and torch.cuda.is_bf16_supported(): amp_dtype = torch.bfloat16
-        else: amp_dtype = torch.float16
-    # --- End AMP settings ---
-
-    total_loss = 0.0
-    total_samples = 0
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 # Simplified AMP dtype check
+    total_loss = 0.0; total_samples = 0
     val_iterator = tqdm(val_loader, desc="Validation", leave=False, dynamic_ncols=True)
 
     for batch_data in val_iterator:
         if batch_data is None or not batch_data: continue
         try:
-            # Get data and move basic tensors to device
-            sequence_batch = batch_data.get('sequence') # Expects [B, L, F], Float32 from dataset
-            mask_batch = batch_data.get('mask')         # Expects [B, L], Bool
-            label_batch = batch_data.get('label')       # Expects [B], Long
-            if sequence_batch is None or mask_batch is None or label_batch is None:
-                print("Warning: Validation batch missing sequence, mask, or label. Skipping.")
-                continue
+            sequence_batch = batch_data.get('sequence'); mask_batch = batch_data.get('mask'); label_batch = batch_data.get('label')
+            if sequence_batch is None or mask_batch is None or label_batch is None: continue
 
-            sequence_batch = sequence_batch.to(device)
-            mask_batch = mask_batch.to(device)
-            # Keep label_batch on CPU for now, move later based on dtype needed
+            sequence_batch = sequence_batch.to(device); mask_batch = mask_batch.to(device)
+            # Keep label_batch on CPU until we know the required dtype
 
-            # Check for non-finite input values
-            if not torch.isfinite(sequence_batch).all():
-                print("Warning: Non-finite values in validation sequence batch. Skipping.")
-                continue
-
+            if not torch.isfinite(sequence_batch).all(): print("Warning: Non-finite values in validation sequence. Skipping."); continue
             batch_size = sequence_batch.size(0)
 
-            # --- Prepare Target Tensor ('val') based on num_labels and criterion ---
-            val = None # Initialize
-            try:
-                if num_labels == 1: # Score or BCE with 1 output
-                    # Needs Float target, shape [B]
-                    val = label_batch.to(device=device, dtype=torch.float32) # Move to device as Float
-                    if val.ndim != 1: val = val.squeeze() # Ensure 1D
-                    if val.ndim != 1: raise ValueError(f"Target shape error (expected 1D): {val.shape}")
-                elif num_labels > 1: # Classification with CE, Focal, GHM, NLL
-                    # Needs Long target, shape [B]
-                    val = label_batch.squeeze().to(device=device, dtype=torch.long) # Move to device as Long, ensure 1D
-                    if val.ndim != 1: raise ValueError(f"Target shape error (expected 1D): {val.shape}")
-                else: raise ValueError(f"Invalid num_labels ({num_labels})")
-            except Exception as e_target:
-                print(f"Error preparing validation target tensor: {e_target}")
-                print(f"  Original label shape: {label_batch.shape}, dtype: {label_batch.dtype}, num_labels: {num_labels}")
-                continue # Skip batch if target prep fails
-            # --- End Target Prep ---
-
-            if sequence_batch.shape[0] != val.shape[0]:
-                 print(f"Error: Validation batch size mismatch sequence ({sequence_batch.shape[0]}) vs target ({val.shape[0]}). Skipping.")
-                 continue
-
-            # --- Prediction and Loss Calculation ---
-            loss = torch.tensor(float('nan'), device=device) # Use NaN default
+            # --- Prediction ---
+            y_pred_final = None; loss = torch.tensor(float('nan'), device=device)
             try:
                 with torch.amp.autocast(device_type=device, enabled=autocast_enabled, dtype=amp_dtype):
-                    # Pass sequence AND mask to model
                     y_pred = model(sequence_batch, attention_mask=mask_batch)
+                    y_pred_for_loss = y_pred # Default to raw output
+                    # Squeeze output if needed for specific losses AND num_labels is 1
+                    if num_labels == 1 and isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)):
+                        if y_pred.ndim == 2 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(1)
+                    y_pred_final = y_pred_for_loss.to(torch.float32) # Use float32 for loss calc
+            except Exception as e_pred: print(f"Error during validation prediction: {e_pred}"); continue
 
-                    # Prepare prediction shape for loss
-                    y_pred_for_loss = y_pred
-                    if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and num_labels == 1:
-                         if y_pred.ndim == 2 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(1)
-
-                # Ensure prediction is Float32 for loss stability/calculation
-                y_pred_final = y_pred_for_loss.to(torch.float32)
-                # Target 'val' is already on the correct device and has the right dtype from prep above
-
-                # --- Calculate loss based on criterion type ---
-                if isinstance(criterion, (torch.nn.CrossEntropyLoss, FocalLoss)):
-                    loss = criterion(y_pred_final, val) # val should be Long
-                elif isinstance(criterion, nn.NLLLoss):
-                    log_probs = F.log_softmax(y_pred_final, dim=-1)
-                    loss = criterion(log_probs, val) # val should be Long
-                elif isinstance(criterion, nn.BCEWithLogitsLoss):
-                    loss = criterion(y_pred_final, val) # val should be Float
-                elif isinstance(criterion, (nn.L1Loss, nn.MSELoss)):
-                    loss = criterion(y_pred_final, val) # val should be Float
-                elif isinstance(criterion, GHMC_Loss):
-                    loss = criterion(y_pred_final, val) # val should be Long
+            # --- Target Prep & Loss Calculation (Revised) ---
+            target_for_loss = None
+            try:
+                # Prepare target tensor WITH the correct dtype based on the loss criterion INSTANCE
+                if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)):
+                    # These expect Long targets, shape [B]
+                    target_for_loss = label_batch.squeeze().to(device=device, dtype=torch.long)
+                    if target_for_loss.shape[0] != batch_size: raise ValueError("Target shape mismatch (Long)")
+                    # Calculate loss
+                    if isinstance(criterion, nn.NLLLoss):
+                        loss = criterion(F.log_softmax(y_pred_final, dim=-1), target_for_loss)
+                    else:
+                        loss = criterion(y_pred_final, target_for_loss)
+                elif isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)):
+                    # These expect Float targets, shape [B] (for num_labels=1) or [B, C] (for multi-label BCE)
+                    # Since model output is [B] or [B,1] -> [B] here, target must be [B]
+                    target_for_loss = label_batch.squeeze().to(device=device, dtype=torch.float32)
+                    if target_for_loss.shape[0] != batch_size: raise ValueError("Target shape mismatch (Float)")
+                    # Calculate loss
+                    loss = criterion(y_pred_final, target_for_loss)
                 else:
                     print(f"Warning: Unknown criterion type {type(criterion)} in validation. Loss not calculated.")
                     loss = torch.tensor(float('nan'), device=device)
-                # --- End Loss Calculation ---
 
             except Exception as e_val_step:
                 print(f"Error during validation step calculation: {e_val_step}")
-                print(f"  Seq shape: {sequence_batch.shape}, Mask shape: {mask_batch.shape}, Target shape: {val.shape}, Target dtype: {val.dtype}")
+                print(f"  Pred shape: {y_pred_final.shape if y_pred_final is not None else 'N/A'}, Target shape: {target_for_loss.shape if target_for_loss is not None else 'N/A'}, Target dtype: {target_for_loss.dtype if target_for_loss is not None else 'N/A'}")
                 loss = torch.tensor(float('nan'), device=device) # Assign NaN on error
-            # --- End Prediction and Loss ---
 
-            # --- Accumulate Loss ---
-            if not math.isnan(loss.item()):
-                total_loss += loss.item() * batch_size
-                total_samples += batch_size
-            else:
-                print("Warning: NaN loss encountered during validation.")
-            # --- End Accumulate Loss ---
-
-            # Optional: Update postfix for validation iterator
+            # Accumulate Loss
+            if not math.isnan(loss.item()): total_loss += loss.item() * batch_size; total_samples += batch_size
+            else: print("Warning: NaN loss encountered during validation.")
             if total_samples > 0: val_iterator.set_postfix({"AvgLoss": f"{(total_loss / total_samples):.4e}"})
 
-        except Exception as e_batch: # Catch errors processing the whole batch
-             print(f"Error processing validation batch: {e_batch}")
-             import traceback; traceback.print_exc()
-        finally:
-             # Minimal cleanup needed due to no_grad and loop scope
-             try: del sequence_batch, mask_batch, label_batch, val, y_pred, y_pred_for_loss, loss
+        except Exception as e_batch: print(f"Error processing validation batch: {e_batch}"); traceback.print_exc()
+        finally: # Cleanup
+             try: del sequence_batch, mask_batch, label_batch, target_for_loss, y_pred, y_pred_for_loss, loss
              except NameError: pass
 
-    # End batch loop
-    val_iterator.close()
-    model.train() # Set model back to training mode
-
-    if total_samples == 0:
-        print("Warning: No valid samples processed during validation.")
-        return float('nan')
-
+    val_iterator.close(); model.train()
+    if total_samples == 0: print("Warning: No valid samples processed during validation."); return float('nan')
     avg_loss = total_loss / total_samples
     print(f"Validation finished. Avg Loss: {avg_loss:.4e} ({total_samples} samples)")
     return avg_loss
+
 
 # --- ModelWrapper Class (Simplified) ---
 # Version 3.0.0: Removed validation loop and CSV logging
