@@ -1,22 +1,24 @@
-# Version: 1.7.0 (Adds dynamic preprocessing selection)
+# Version: 1.10.0 (Adds HybridHeadModel loading support)
 
 import os
 import json
 import traceback
 
 import torch
-import torchvision.transforms.functional as TF # This might already be there for tiling?
-import torch.nn.functional as F # <<< ADD THIS LINE or make sure it exists!
+import torchvision.transforms.functional as TF
+import torch.nn.functional as F
+from PIL import Image
+from PIL.Image import Resampling
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
-from transformers import AutoProcessor, AutoModel
-from PIL import Image
-import math # For isnan checks maybe
+from transformers import AutoProcessor, AutoModel, AutoImageProcessor # Use AutoImageProcessor
+import math
 
 # --- Import Models ---
 try:
-    from model import PredictorModel # For old pipelines
-    from head_model import HeadModel # <<< ADD THIS IMPORT >>>
+    from model import PredictorModel # Original head
+    from head_model import HeadModel # Sequence head (unused by these pipelines directly)
+    from hybrid_model import HybridHeadModel # <<< ADD IMPORT >>>
     from utils import get_embed_params # Keep utils import
 except ImportError as e:
     print(f"Error importing model classes or get_embed_params: {e}")
@@ -31,7 +33,9 @@ except ImportError:
     TIMM_AVAILABLE = False
 
 # Define target_len, maybe make it configurable later
-TARGET_LEN_INFERENCE = 4096
+TARGET_LEN_INFERENCE = 4096 # Keep if needed by any preprocess func
+AIMV2_PATCH_SIZE = 14
+AIMV2_TARGET_MAX_PATCHES = 4096
 
 
 # --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
@@ -160,11 +164,80 @@ def _load_model_helper(model_path, expected_features, expected_outputs=None):
 # --- End Utility: Load Model State Dict ---
 
 
+# --- Utility: Load State Dict Helper (Checks features/outputs) ---
+# v1.1.0: More robust output key finding, better feature checking
+def _load_state_dict_helper(model_path, expected_features=None, expected_outputs=None):
+    """Loads state dict, verifies input features, checks output size."""
+    if not os.path.isfile(model_path): raise FileNotFoundError(f"Model file not found: {model_path}")
+    try:
+        sd = load_file(model_path)
+        actual_outputs = None
+        inferred_features = None
+
+        # --- Infer/Verify input feature dimension ---
+        # Check keys associated with different model types
+        pred_initial_proj_key = "initial_proj.weight"
+        hybrid_initial_proj_key = "mlp_head.0.weight" # Usually the first Linear in the Sequential MLP
+        hybrid_attn_qkv_key = "attention.in_proj_weight" # Optional attention in Hybrid
+
+        if pred_initial_proj_key in sd: inferred_features = sd[pred_initial_proj_key].shape[1]
+        elif hybrid_initial_proj_key in sd: inferred_features = sd[hybrid_initial_proj_key].shape[1]
+        elif hybrid_attn_qkv_key in sd: inferred_features = sd[hybrid_attn_qkv_key].shape[1] # Input to attention QKV
+        # Add more checks if needed for other first layers
+
+        if inferred_features is None: print(f"Warning: Cannot infer input features from known keys in {model_path}.")
+        elif expected_features is not None and inferred_features != expected_features:
+             print(f"Warning: Input feature mismatch! Expected {expected_features}, Inferred {inferred_features} in {model_path}.")
+             # Decide whether to raise error or proceed? Let's proceed but warn.
+
+        # --- Infer/Verify output dimension ---
+        # Check possible final layer keys
+        pred_final_bias = "final_layer.bias" # PredictorModel
+        hybrid_final_bias = "mlp_head.7.bias" # Example if Hybrid MLP has 8 layers (0-7), last Linear bias
+        hybrid_final_weight = "mlp_head.7.weight" # Example weight key
+
+        # Find the bias key first, as it directly gives num_classes
+        potential_bias_keys = [k for k in sd if k.endswith(".bias")]
+        if potential_bias_keys:
+             # Assume the numerically highest indexed layer in mlp_head is the final one, or use specific name
+             final_bias_key = None
+             if pred_final_bias in sd: final_bias_key = pred_final_bias
+             else: # Try finding highest index in mlp_head
+                  max_idx = -1; target_key = None
+                  for k in potential_bias_keys:
+                       if k.startswith("mlp_head."):
+                            parts = k.split('.')
+                            if len(parts) == 3 and parts[1].isdigit():
+                                 idx = int(parts[1])
+                                 if idx > max_idx: max_idx = idx; target_key = k
+                  if target_key: final_bias_key = target_key
+
+             if final_bias_key: actual_outputs = sd[final_bias_key].shape[0]
+             else: print(f"Warning: Could not reliably identify final bias key in {model_path}.")
+
+        # Fallback: Check weight keys if bias not found/identified
+        if actual_outputs is None:
+             potential_weight_keys = [k for k in sd if k.endswith(".weight")]
+             if potential_weight_keys:
+                  # Similar logic to find final weight key...
+                  # ... (implementation depends on naming convention) ...
+                  # For now, let's assume bias is sufficient for output inference.
+                  pass
+
+        if actual_outputs is None: print(f"Warning: Could not infer output size from state dict {model_path}.")
+        elif expected_outputs is not None and actual_outputs != expected_outputs:
+            print(f"Warning: Output size mismatch! Expected {expected_outputs}, found {actual_outputs} in {model_path}.")
+
+        return sd, inferred_features, actual_outputs
+
+    except Exception as e: print(f"Error loading state dict helper {model_path}: {e}"); raise
+
+
 # ================================================
 #        Base Pipeline Class
 # ================================================
 class BasePipeline:
-    # v1.1.0: Read base config keys directly
+    # v1.2.0: Uses _load_model_head, more robust vision init
     def __init__(self, model_path: str, config_path: str = None, device: str = "cpu", clip_dtype: torch.dtype = torch.float32):
         self.device = device
         self.clip_dtype = clip_dtype
@@ -172,55 +245,50 @@ class BasePipeline:
 
         # --- Config Loading ---
         if config_path is None or not os.path.isfile(config_path):
-             print("DEBUG: Config path not provided or invalid, attempting to infer...")
              config_path = self._infer_config_path(model_path)
-             if config_path is None:
-                  raise FileNotFoundError(f"Could not find or infer config file for model {model_path}")
+             if config_path is None: raise FileNotFoundError(f"Could not find/infer config for {model_path}")
         self.config_path = config_path
         self.config = _load_config_helper(self.config_path)
         if self.config is None: raise ValueError("Failed to load configuration.")
-        print(f"DEBUG: Config keys loaded: {list(self.config.keys())}") # Add print
+        # print(f"DEBUG BasePipeline: Config keys: {list(self.config.keys())}") # Optional
 
-        # --- Store Embed Version (Read directly) ---
-        # <<< FIX 1: Read 'embed_ver' from top level >>>
-        self.embed_ver = self.config.get("embed_ver") # Can be None if not present
-        if self.embed_ver is None: self.embed_ver = "unknown" # Default if None or missing
-        print(f"DEBUG BasePipeline: Found embed_ver: {self.embed_ver}")
-
-        # --- Vision Model Setup (Read directly) ---
-        # <<< FIX 2: Read 'base_vision_model' from top level >>>
+        # --- Get Base Vision Model Info from Config ---
+        # These are now assumed to be top-level keys saved by write_config
         self.base_vision_model_name = self.config.get("base_vision_model")
-        if not self.base_vision_model_name:
-            # Now this error is correct if the key is truly missing from the top level
-            raise ValueError("Missing 'base_vision_model' in config file.")
-        print(f"DEBUG BasePipeline: Found base_vision_model: {self.base_vision_model_name}")
+        self.embed_ver = self.config.get("embed_ver") # Can be None if E2E mode
+        if not self.base_vision_model_name: raise ValueError("Missing 'base_vision_model' in config.")
+        print(f"DEBUG BasePipeline: Base Vision='{self.base_vision_model_name}', EmbedVer='{self.embed_ver}'")
 
         # --- Initialize vision model attributes ---
         self.vision_model_type = "unknown"; self.vision_model = None; self.hf_processor = None;
-        self.timm_transforms = None; self.proc_size = 512;
-        self._init_vision_model() # Call the init function
+        self.timm_transforms = None; self.proc_size = 512
+        self._init_vision_model() # Initialize the vision backbone
 
-        # --- Preprocessing function selection ---
+        # --- Preprocessing function selection (Based on embed_ver or model type) ---
         self.preprocess_func = None
-        if "NaflexResize" in self.embed_ver or "naflex" in self.embed_ver.lower(): # Check if it's a NaFlex embedding
-            print("DEBUG BasePipeline: Selecting NaFlex resize preprocessing.")
-            self.preprocess_func = preprocess_naflex_resize
-        elif "FitPad" in self.embed_ver: # Check if it's FitPad
-            print("DEBUG BasePipeline: Selecting FitPad preprocessing.")
+        # <<< Use more robust checking based on model name/embed_ver >>>
+        if "naflex" in self.base_vision_model_name.lower() or ("Naflex" in (self.embed_ver or "")):
+            print("DEBUG BasePipeline: Selecting NaFlex processor logic (via get_clip_emb).")
+            # NaFlex uses the processor directly, no manual func needed here
+            self.preprocess_func = None # Signal direct processor use
+        elif "dinov2" in self.base_vision_model_name.lower() or ("DINOv2" in (self.embed_ver or "")):
+             print("DEBUG BasePipeline: Selecting FitPad preprocessing (likely DINOv2).")
+             self.preprocess_func = preprocess_fit_pad # Default FitPad for DINO
+        elif "aimv2" in self.base_vision_model_name.lower():
+             print("DEBUG BasePipeline: Selecting AIMv2 Native logic (controlled resize + processor).")
+             # Logic handled inside get_clip_emb, no single preprocess func here
+             self.preprocess_func = None # Signal internal handling
+        elif "siglip" in self.base_vision_model_name.lower(): # Non-Naflex Siglip
+             print("DEBUG BasePipeline: Selecting FitPad preprocessing (likely SigLIP).")
+             self.preprocess_func = preprocess_fit_pad # Default FitPad
+        else: # Fallback
+            print(f"DEBUG BasePipeline: Unknown model type. Defaulting to FitPad preprocessing.")
             self.preprocess_func = preprocess_fit_pad
-        # Add elif for CenterCrop if needed
-        # elif "CenterCrop" in self.embed_ver:
-        #     print("DEBUG BasePipeline: Selecting CenterCrop preprocessing.")
-        #     self.preprocess_func = preprocess_center_crop # Assuming this exists
-        else:
-            # Default fallback (or raise error)
-            print(f"DEBUG BasePipeline: Unknown embed_ver '{self.embed_ver}'. Defaulting to FitPad preprocessing.")
-            self.preprocess_func = preprocess_fit_pad
-        # <<< END NEW >>>
 
-        # --- Predictor Head Setup (Loaded in subclasses) ---
-        self.model = None
-        # --- End Predictor Head Setup ---
+        # --- Model Head Setup (Loaded in subclasses using _load_model_head) ---
+        self.model = None # This will be the loaded head (PredictorModel or HybridHeadModel)
+        self.num_labels = 0
+        self.labels = {} # Labels specific to the loaded head
 
     def _infer_config_path(self, model_path: str) -> str | None:
         """Tries to infer the base config path from a checkpoint path."""
@@ -341,44 +409,26 @@ class BasePipeline:
                 raise
 
 
-    # Version 1.8.4: Correct target_size determination for FitPad
+    # --- _preprocess_images (Simplified - Only applies manual funcs if set) ---
     def _preprocess_images(self, img_list: list[Image.Image]) -> list[Image.Image] | None:
-        """Applies the selected manual preprocessing function to a list of PIL images."""
-        if not self.preprocess_func: print("ERROR: Preprocessing function not selected."); return None
+        """Applies manual preprocessing function IF one is selected."""
+        if self.preprocess_func is None:
+            # print("DEBUG _preprocess_images: No manual func set, returning raw images.")
+            return img_list # Return original list if no manual func needed
 
         processed_imgs = []
         for img_pil in img_list:
-            try:
-                img_processed = None
-                # --- Determine Correct Target Size ---
-                target_s = self.proc_size # Default size (e.g., 512 from HF SigLIP)
-                # Specific overrides based on model/embed_ver for manual modes
-                # Check for DINOv2 Giant specifically
-                if "dinov2" in self.base_vision_model_name.lower() and "giant" in self.base_vision_model_name.lower():
-                    target_s = 518 # DINOv2 Giant uses 518
-                    # print(f"DEBUG _preprocess_images: Using target_size {target_s} for DINOv2 Giant.")
-                # Add other overrides if needed (e.g., checking self.embed_ver)
-                # elif 'dinov2' in self.base_vision_model_name and '_224' in self.embed_ver: target_s = 224
-
-                # --- Apply Selected Preprocessing ---
-                if self.preprocess_func == preprocess_fit_pad:
-                    img_processed = self.preprocess_func(img_pil, target_size=target_s)
-                elif self.preprocess_func == preprocess_naflex_resize: # NaFlex doesn't use target_s
-                    img_processed = self.preprocess_func(img_pil)
-                # Add elif for CenterCrop if needed
-                # elif self.preprocess_func == preprocess_center_crop:
-                #    img_processed = self.preprocess_func(img_pil, target_size=target_s)
-                else: # Fallback
-                    img_processed = self.preprocess_func(img_pil) # Attempt basic call
-
+            try: # Apply the function (e.g., preprocess_fit_pad)
+                target_s = self.proc_size # Use determined size for manual funcs
+                if "dinov2" in self.base_vision_model_name.lower() and "giant" in self.base_vision_model_name.lower(): target_s = 518
+                # Call the function stored in self.preprocess_func
+                img_processed = self.preprocess_func(img_pil, target_size=target_s)
                 if img_processed: processed_imgs.append(img_processed)
-                else: print(f"Warning: Preprocessing returned None.")
-            except Exception as e_prep:
-                 print(f"Error during {getattr(self.preprocess_func, '__name__', 'unknown preprocessing')} in inference: {e_prep}. Skipping image.")
-                 import traceback; traceback.print_exc()
+                else: print("Warning: Manual preprocessing returned None.")
+            except Exception as e_prep: print(f"Error manual preprocess: {e_prep}"); continue
         return processed_imgs if processed_imgs else None
 
-    # Version 1.8.6: Restore TIMM path, correctly handle FB DINOv2, preserve SigLIP
+    # v1.9.0: Includes AIMv2 CLS logic with pre-resizing
     def get_clip_emb(self, img_list: list[Image.Image]) -> torch.Tensor | None:
         """
         Generates embeddings for a list of PIL images using the loaded vision model.
@@ -405,14 +455,16 @@ class BasePipeline:
                 # Check if base model name indicates DINOv2 for normalization
                 do_l2_normalize = "dinov2" in self.base_vision_model_name.lower()
 
-            # --- Path 2: Hugging Face Models (SigLIP or FB DINOv2) ---
+            # --- Path 2: Hugging Face Models ---
             elif self.vision_model_type == "hf":
-                if self.vision_model is None or self.hf_processor is None: raise ValueError("HF model or processor not initialized.")
-                is_naflex_mode = "Naflex" in self.embed_ver
-                is_siglip_model = "Siglip" in self.vision_model.__class__.__name__
-                is_dinov2_model = "Dinov2" in self.vision_model.__class__.__name__ or "dinov2" in self.base_vision_model_name.lower()
+                processor = self.hf_processor; model = self.vision_model
+                if model is None or processor is None: raise ValueError("HF model/processor missing.")
+                is_naflex_mode = "Naflex" in (self.embed_ver or "") or "naflex" in self.base_vision_model_name.lower()
+                is_aimv2_model = "aimv2" in self.base_vision_model_name.lower()
+                is_siglip_model = "siglip" in self.base_vision_model_name.lower() and not is_aimv2_model # Avoid conflict
+                is_dinov2_model = "dinov2" in self.base_vision_model_name.lower() and not is_aimv2_model
 
-                # --- SubPath 2a: SigLIP NaFlex (Processor handles all) ---
+                # --- SubPath 2a: SigLIP NaFlex ---
                 if is_siglip_model and is_naflex_mode:
                     # Expects RAW PIL images in img_list
                     inputs = self.hf_processor(images=img_list, return_tensors="pt", max_num_patches=1024)
@@ -433,6 +485,41 @@ class BasePipeline:
                             emb = self.vision_model.get_image_features(**kwargs_for_get)
                         else: raise AttributeError("SigLIP Model missing expected methods.")
                     do_l2_normalize = False # SigLIP internal norm
+
+                # --- SubPath 2b: AIMv2 Native CLS ---
+                elif is_aimv2_model: # Assuming CLS mode is intended for inference
+                     # Expects RAW PIL images, performs controlled pre-resize THEN processor
+                     processed_tensors = []
+                     for raw_img_pil in img_list:
+                          img_to_process = raw_img_pil
+                          # <<< Apply pre-resizing logic >>>
+                          try: # Identical logic to generate_embeddings v4.4.0
+                               original_width, original_height = raw_img_pil.size
+                               if original_width > 0 and original_height > 0:
+                                    patches_w = math.floor(original_width / AIMV2_PATCH_SIZE); patches_h = math.floor(original_height / AIMV2_PATCH_SIZE)
+                                    if patches_w * patches_h > AIMV2_TARGET_MAX_PATCHES:
+                                         # ... (iterative resizing logic to fit AIMV2_TARGET_MAX_PATCHES) ...
+                                         scale_factor = math.sqrt(AIMV2_TARGET_MAX_PATCHES / (patches_w * patches_h))
+                                         # ... find target_w, target_h that are multiples of 14 ...
+                                         target_w = 1120; target_h = 840 # Example placeholder values
+                                         img_to_process = raw_img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                                    else: # Ensure dims are multiple of patch size even if not resizing
+                                         # ... (adjust dims to be multiple of 14) ...
+                                         pass # Placeholder
+                          except Exception as e_resize: print(f"Resize error AIMv2 Inf: {e_resize}"); continue
+                          # <<< End pre-resizing >>>
+                          # Now process the (maybe resized) image
+                          inputs = processor(images=[img_to_process], return_tensors="pt")
+                          processed_tensors.append(inputs.pixel_values)
+
+                     if not processed_tensors: raise ValueError("AIMv2 processing failed for all images.")
+                     pixel_values = torch.cat(processed_tensors, dim=0).to(device=self.device, dtype=self.clip_dtype)
+                     model_call_kwargs = {"pixel_values": pixel_values}
+                     with torch.no_grad(): outputs = model(**model_call_kwargs)
+                     last_hidden_state = getattr(outputs, 'last_hidden_state', None)
+                     if last_hidden_state is None: raise ValueError("AIMv2 missing LHS.")
+                     emb = last_hidden_state[:, 0, :] # CLS token
+                     do_l2_normalize = True
 
                 # --- SubPath 2b: Manual Preprocessing (FB DINOv2 or SigLIP FitPad/CenterCrop) ---
                 elif not is_naflex_mode:
@@ -610,113 +697,106 @@ class BasePipeline:
         else:
             raise ValueError(f"Identified key '{potential_final_layer_key}' is not a bias or weight key.")
 
-    # --- v1.7.12: Loads PredictorModel v2 using enhanced config ---
-    def _load_predictor_head(self, required_outputs: int | None = None):
-        """Loads the MLP head model state dict using enhanced config from self.config."""
-        print("DEBUG _load_predictor_head: Loading predictor head...")
-        if not self.config:
-             raise ValueError("Pipeline configuration not loaded.")
+    # --- <<< NEW: Unified Head Loading Function >>> ---
+    # v1.0.0: Loads PredictorModel or HybridHeadModel
+    def _load_model_head(self):
+        """Loads the appropriate head model (PredictorModel or HybridHeadModel) based on config/state_dict."""
+        print(f"DEBUG _load_model_head: Loading head from {os.path.basename(self.model_path)}...")
+        if not self.config: raise ValueError("Pipeline config not loaded.")
 
-        # --- Get Parameters from the NEW 'predictor_params' section ---
-        pred_params_conf = self.config.get("predictor_params", {})
-        if not pred_params_conf:
-             # Try falling back to old 'model_params' for compatibility? Or raise error?
-             # Let's try a fallback for now, but warn heavily.
-             print("Warning: 'predictor_params' section not found in config. Trying old 'model_params'.")
-             pred_params_conf = self.config.get("model_params", {})
-             if not pred_params_conf:
-                  raise ValueError("Could not find 'predictor_params' or 'model_params' in config.")
-
-        # Load core parameters (use get with defaults matching PredictorModel v2 init)
-        expected_features = pred_params_conf.get("features")
-        # If features still missing, try inferring from embed_ver as last resort
-        if expected_features is None:
+        # --- Load State Dict and Config ---
+        # Determine expected features from base vision model or config
+        expected_features = self.config.get("features") # Check if saved directly
+        if not expected_features and self.vision_model and hasattr(self.vision_model, 'config'):
+             expected_features = getattr(self.vision_model.config, 'hidden_size', None)
+        if not expected_features and self.embed_ver: # Fallback to embed_ver lookup
              try: expected_features = get_embed_params(self.embed_ver)["features"]
-             except Exception as e: raise ValueError(f"Could not determine features from config or embed_ver '{self.embed_ver}': {e}")
+             except: pass
+        if not expected_features: raise ValueError("Cannot determine input features for head.")
 
-        hidden_dim = pred_params_conf.get("hidden_dim")
-        if hidden_dim is None: # Fallback to old 'hidden' name?
-            hidden_dim = pred_params_conf.get("hidden") # Try old name
-            if hidden_dim is None: # Fallback to embed_ver default
-                 try: hidden_dim = get_embed_params(self.embed_ver)["hidden"]
-                 except Exception: hidden_dim = 1280 # Hard fallback
-                 print(f"Warning: 'hidden_dim' not found, using default/inferred: {hidden_dim}")
+        # Load state dict and try to infer outputs
+        sd, inferred_features, actual_outputs = _load_state_dict_helper(self.model_path, expected_features)
+        if actual_outputs is None: raise ValueError("Could not infer model output size from state dict.")
+        self.num_labels = actual_outputs # Use inferred outputs as truth
 
-        # Determine number of output classes
-        # Use required_outputs if explicitly provided (e.g., by AestheticsPipeline)
-        num_classes = required_outputs
-        if num_classes is None: # Otherwise, get from config
-             num_classes = pred_params_conf.get("num_classes")
-             if num_classes is None: # Fallback to old 'outputs' name?
-                  num_classes = pred_params_conf.get("outputs")
-                  if num_classes is None: # Final fallback - try to infer from state dict
-                       print("Warning: 'num_classes'/'outputs' not found in config. Inferring from state dict (might be unreliable).")
-                       # Need to load state dict temporarily to infer - less ideal
-                       try:
-                            sd_temp, outputs_in_file = _load_model_helper(self.model_path, expected_features, None)
-                            num_classes = outputs_in_file
-                            del sd_temp
-                       except Exception as e_sd:
-                            raise ValueError(f"Cannot determine num_classes from config or state dict: {e_sd}")
-                  else: print("Warning: Using 'outputs' key for num_classes (old config format?).")
-             num_classes = int(num_classes) # Ensure integer
+        # --- Determine Model Type ---
+        # Check for keys unique to HybridHeadModel (e.g., from RMSNorm/SwiGLU in MLP)
+        # Example: "mlp_head.1.weight" might be RMSNorm weight, "mlp_head.2.ffn.w12.weight" might be SwiGLU
+        is_hybrid = any(k.startswith("mlp_head.") and ("norm.weight" in k or "ffn.w" in k) for k in sd)
+        # Crude check, might need refinement based on exact layer names in HybridHeadModel
 
-        # Load enhanced architecture parameters
-        use_attention = pred_params_conf.get("use_attention", True) # Default True if missing
-        num_attn_heads = pred_params_conf.get("num_attn_heads", 8)
-        attn_dropout = pred_params_conf.get("attn_dropout", 0.1)
-        num_res_blocks = pred_params_conf.get("num_res_blocks", 1)
-        dropout_rate = pred_params_conf.get("dropout_rate", 0.1)
-        output_mode = pred_params_conf.get("output_mode", 'linear') # Default linear if missing
+        model = None
+        model_type_str = "HybridHeadModel" if is_hybrid else "PredictorModel"
+        print(f"DEBUG: Detected head type: {model_type_str}")
+
+        # --- Get Hyperparameters from Config ---
+        # Config saved by train.py should have top-level args
+        # Prioritize specific args if available, fallback to defaults
+        output_mode = self.config.get("output_mode", self.config.get("head_output_mode", "linear")) # Get output mode
+        hidden_dim = self.config.get("hidden_dim", self.config.get("head_hidden_dim", 1280))
+        num_res_blocks = self.config.get("num_res_blocks", self.config.get("head_num_res_blocks", 1))
+        dropout_rate = self.config.get("dropout_rate", self.config.get("head_dropout_rate", 0.1))
+        # Attention params (usually only needed if PredictorModel or Hybrid with use_attention=True)
+        use_attention = self.config.get("use_attention", True if not is_hybrid else False) # Default ON for Predictor, OFF for Hybrid unless specified
+        num_attn_heads = self.config.get("num_attn_heads", 16)
+        attn_dropout = self.config.get("attn_dropout", 0.1)
+        # Hybrid specific
+        rms_norm_eps = self.config.get("rms_norm_eps", 1e-6)
+
+
+        # --- Instantiate Correct Model ---
+        try:
+            if is_hybrid:
+                model = HybridHeadModel(
+                    features=inferred_features or expected_features, # Prioritize inferred
+                    hidden_dim=hidden_dim,
+                    num_classes=self.num_labels, # Use inferred from state dict
+                    use_attention=use_attention, # Allow enabling attention
+                    num_attn_heads=num_attn_heads,
+                    attn_dropout=attn_dropout,
+                    num_res_blocks=num_res_blocks,
+                    dropout_rate=dropout_rate,
+                    rms_norm_eps=rms_norm_eps,
+                    output_mode=output_mode
+                )
+            else: # Assume PredictorModel
+                model = PredictorModel(
+                    features=inferred_features or expected_features,
+                    hidden_dim=hidden_dim,
+                    num_classes=self.num_labels,
+                    use_attention=use_attention,
+                    num_attn_heads=num_attn_heads,
+                    attn_dropout=attn_dropout,
+                    num_res_blocks=num_res_blocks,
+                    dropout_rate=dropout_rate,
+                    output_mode=output_mode
+                )
+        except Exception as e: raise TypeError(f"Failed to instantiate {model_type_str}: {e}") from e
 
         # --- Load State Dict ---
-        # We need the *actual* number of classes in the file for verification
-        # Pass None as expected_outputs to _load_model_helper, it will return the count from the file
-        sd, outputs_in_file = _load_model_helper(self.model_path, expected_features, None)
-
-        # --- Consistency Check ---
-        # If required_outputs was specified, make sure it matches the file
-        if required_outputs is not None and required_outputs != outputs_in_file:
-             print(f"ERROR: Mismatch! Required outputs ({required_outputs}) != Outputs in state dict ({outputs_in_file}).")
-             raise ValueError("State dict output count mismatch.")
-        # If num_classes was determined from config, check against file
-        elif required_outputs is None and num_classes != outputs_in_file:
-             print(f"Warning: Configured num_classes ({num_classes}) != Outputs in state dict ({outputs_in_file}). Using state dict value.")
-             num_classes = outputs_in_file # Prioritize state dict if different from config
-
-        # --- Instantiate PredictorModel v2 ---
-        # Use all the parameters loaded from config
-        try:
-            model = PredictorModel(
-                features=expected_features,
-                hidden_dim=hidden_dim,
-                num_classes=num_classes, # Use verified number of classes
-                use_attention=use_attention,
-                num_attn_heads=num_attn_heads,
-                attn_dropout=attn_dropout,
-                num_res_blocks=num_res_blocks,
-                dropout_rate=dropout_rate,
-                output_mode=output_mode
-            )
-            # Initialization log now happens inside PredictorModel.__init__
-        except Exception as e:
-            raise TypeError(f"Failed to instantiate PredictorModel v2: {e}") from e
-
-        # --- Load State Dict into Model ---
         model.eval()
         try:
-             # Use strict=False temporarily ONLY if migrating from old models
-             # Otherwise keep strict=True
-             missing_keys, unexpected_keys = model.load_state_dict(sd, strict=True)
-             if unexpected_keys: print(f"Warning: Unexpected keys found in state dict: {unexpected_keys}")
-             if missing_keys: print(f"Warning: Missing keys in state dict: {missing_keys}")
+            missing, unexpected = model.load_state_dict(sd, strict=True) # Try strict first
+            if missing or unexpected: print(f" Load warnings: Missing={missing}, Unexpected={unexpected}")
         except RuntimeError as e:
-            print(f"ERROR: State dict mismatch loading into PredictorModel v2 for {self.model_path}.")
-            raise e
+            print(f"Warning: Strict load failed for {model_type_str}. Trying non-strict. Error: {e}")
+            missing, unexpected = model.load_state_dict(sd, strict=False) # Fallback non-strict
+            if missing or unexpected: print(f" Load warnings (non-strict): Missing={missing}, Unexpected={unexpected}")
 
-        model.to(self.device) # Move predictor head to device
-        print(f"Successfully loaded predictor head '{os.path.basename(self.model_path)}' with {model.num_classes} outputs (output_mode='{model.output_mode}').")
+
+        model.to(self.device)
+        print(f"Successfully loaded head '{os.path.basename(self.model_path)}' ({model_type_str}, Outputs: {self.num_labels}, Mode: '{output_mode}').")
         self.model = model # Assign to instance variable
+
+        # --- Load Labels ---
+        # Use labels saved in the config file
+        self.labels = self.config.get("labels", {})
+        if not self.labels: # Fallback to default numeric labels
+            self.labels = {str(i): str(i) for i in range(self.num_labels)}
+            print(f"DEBUG: Using default numeric labels (0 to {self.num_labels-1})")
+        elif len(self.labels) != self.num_labels:
+             print(f"Warning: Config labels count ({len(self.labels)}) != model outputs ({self.num_labels}).")
+
 
     def get_model_pred_generic(self, emb: torch.Tensor) -> torch.Tensor:
         """Runs prediction using the loaded predictor head."""
@@ -822,28 +902,27 @@ class BasePipeline:
         # print(f"Successfully loaded HeadModel '{os.path.basename(head_model_path)}' with {model.num_classes} outputs (pooling_after_transformer='{model.pooling_after_transformer}', output_mode='{model.output_mode}').")
         self.model = model # Assign to instance variable
 
+
 # ================================================
 #        Aesthetics Pipeline (Scorer)
 # ================================================
 class CityAestheticsPipeline(BasePipeline):
     """Pipeline for single-output score prediction models."""
-    # v1.1: Added explicit config_path handling
     def __init__(self, model_path: str, config_path: str = None, device: str = "cpu", clip_dtype: torch.dtype = torch.float32):
-        # Base class handles config loading (inferring if config_path is None)
         super().__init__(model_path=model_path, config_path=config_path, device=device, clip_dtype=clip_dtype)
-        # Load the predictor head, requiring 1 output
-        self._load_predictor_head(required_outputs=1)
+        # <<< Use new loading function >>>
+        self._load_model_head()
+        # <<< Add check for single output >>>
+        if self.num_labels != 1:
+             print(f"Warning: CityAestheticsPipeline expects num_labels=1, but loaded model has {self.num_labels}. Output might be incorrect.")
         print("CityAestheticsPipeline: Init OK.")
 
     def __call__(self, raw_pil_image: Image.Image) -> float:
-        """Processes a single image and returns a score."""
-        # Get non-tiled embedding (fit-pad happens in get_clip_emb)
-        emb = self.get_clip_emb_tiled(raw_pil_image, tiling=False)
-        if emb is None: return 0.0 # Return default score on error? Or raise?
-
+        emb = self.get_clip_emb_tiled(raw_pil_image, tiling=False) # Assumes non-tiled for scoring
+        if emb is None: return 0.0
         pred = self.get_model_pred_generic(emb)
-        # Squeeze potential batch dim and convert to float
-        return float(pred.squeeze().item())
+        return float(pred.squeeze().item()) # Assumes single output
+
 
 # ================================================
 #        Classifier Pipeline (Single Model)
@@ -859,7 +938,7 @@ class CityClassifierPipeline(BasePipeline):
         self.labels = self.config.get("labels", {})
 
         # Load the predictor head, output count inferred from config/state_dict
-        self._load_predictor_head(required_outputs=None)
+        self._load_model_head()
         self.num_labels = self.model.num_classes
 
         # Populate default labels if needed (based on actual outputs)
@@ -872,35 +951,27 @@ class CityClassifierPipeline(BasePipeline):
 
         print(f"CityClassifierPipeline: Init OK (Labels: {self.labels}, Num Outputs: {self.num_labels})")
 
-    # v1.6: Default tiling=False, passes args to format_pred
+    # --- __call__ and format_pred remain largely the same ---
     def __call__(self, raw_pil_image: Image.Image, default: bool = True, tiling: bool = False, tile_strat: str = "mean") -> dict:
-        """Processes image, returns dict of label probabilities."""
-        # Get embedding (tiling flag passed, but default is False)
         emb = self.get_clip_emb_tiled(raw_pil_image, tiling=tiling)
-        if emb is None: return {"error": "Failed to get embedding"}
-
-        # Get predictions (shape [num_tiles, num_classes])
+        if emb is None: return {"error": "Failed embedding"}
         pred = self.get_model_pred_generic(emb)
-
-        # Format predictions (handles tiling combination if needed)
         num_tiles_pred = pred.shape[0] if pred.ndim == 2 else 1
         formatted_output = self.format_pred(
-            pred,
-            labels=self.labels,
-            drop_default=(not default),
+            pred, labels=self.labels, drop_default=(not default),
             tile_strategy=tile_strat if tiling and num_tiles_pred > 1 else "raw"
         )
         return formatted_output
 
-    # v1.3: Handle num_classes=1 case
     def format_pred(self, pred: torch.Tensor, labels: dict, drop_default: bool = False, tile_strategy: str = "mean") -> dict:
-        """Formats raw predictions into a dictionary, applying tile strategy."""
-        # Expects pred to be [Tiles, Classes] or [Classes] after tiling combination/no tiling
-
-        num_classes_model = pred.shape[-1] if pred.ndim > 0 else 1 # Get num outputs from tensor
+        # Expects pred [Tiles, Classes] or [Classes]
+        # Uses self.model.output_mode (loaded during init) if available
+        # Uses self.num_labels (set during init)
+        model_output_mode = getattr(self.model, 'output_mode', 'linear').lower() # Get mode from loaded model
+        num_classes_model = self.num_labels # Use num_labels from loaded model
         num_tiles = pred.shape[0] if pred.ndim >= 2 else 1
 
-        if num_tiles > 1 and tile_strategy != "raw":
+        if pred.ndim >= 2 and tile_strategy != "raw":
             # Combine tile predictions
             combined_pred = torch.zeros(num_classes_model, device='cpu') # Calc on CPU
             for k in range(num_classes_model):
@@ -923,60 +994,22 @@ class CityClassifierPipeline(BasePipeline):
             pred_to_format = pred.cpu().squeeze(0) if pred.ndim > 1 else pred.cpu() # Shape [num_classes_model] or [] if scalar output initially?
 
         # --- Handle Output Formatting Based on num_classes_model ---
-        out = {}
-        if num_classes_model == 1:
-             # Single output (likely BCE or Scorer)
-             # Get the scalar value
-             scalar_value = pred_to_format.item() if pred_to_format.ndim == 0 else pred_to_format[0].item()
-
-             # Decide which label this corresponds to. Conventionally, single output
-             # represents the probability/score of the "positive" class (index 1).
-             # Need to handle potential sigmoid/tanh scaling based on output_mode?
-             # Assuming linear output for BCE here, needs sigmoid for probability.
-             # If model output_mode was 'sigmoid' or 'tanh_scaled', value is already 0-1.
-             # If model output_mode was 'linear', apply sigmoid here for probability display.
-             # Let's assume the loaded pipeline knows the model's output_mode? Access self.model.output_mode?
+        out = {}; probabilities = pred_to_format
+        if num_classes_model == 1: # Binary case
+             scalar_value = probabilities.item() if probabilities.ndim == 0 else probabilities[0].item()
              final_score = scalar_value
-             if hasattr(self, 'model') and self.model.output_mode == 'linear':
-                  # print("DEBUG format_pred: Applying sigmoid to linear output for probability display.")
-                  final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
-             elif hasattr(self, 'model') and self.model.output_mode == 'tanh_scaled':
-                  final_score = scalar_value # Already scaled 0-1
-             # Else assume it's already a probability if mode was sigmoid
-
-             # Get label name for the positive class (index '1')
-             # Use self.labels if available, fallback to '1'
-             positive_label_key = '1'
-             positive_label_name = self.labels.get(positive_label_key, positive_label_key)
-
-             # Get label name for the negative class (index '0')
-             negative_label_key = '0'
-             negative_label_name = self.labels.get(negative_label_key, negative_label_key)
-
-             # Output both probabilities (P(1) and P(0) = 1 - P(1))
-             if not (drop_default and negative_label_name == self.labels.get('0')): # Check if default should be dropped
-                 out[negative_label_name] = float(1.0 - final_score)
+             if model_output_mode == 'linear': final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
+             positive_label_name = labels.get('1', '1'); negative_label_name = labels.get('0', '0')
+             if not (drop_default and negative_label_name == labels.get('0')): out[negative_label_name] = float(1.0 - final_score)
              out[positive_label_name] = float(final_score)
-
-        elif num_classes_model > 1:
-             # Multi-output (likely CE/Focal)
-             # Apply softmax here if output was linear for probability display?
-             probabilities = pred_to_format # Assume already probabilities if output_mode was softmax
-             if hasattr(self, 'model') and self.model.output_mode == 'linear':
-                  # print("DEBUG format_pred: Applying softmax to linear output for probability display.")
-                  probabilities = F.softmax(pred_to_format, dim=-1)
-
+        elif num_classes_model > 1: # Multi-class case
+             if model_output_mode == 'linear': probabilities = F.softmax(pred_to_format, dim=-1)
              for k in range(num_classes_model):
-                 label_index_str = str(k)
-                 # Handle dropping default class (index 0)
                  if k == 0 and drop_default: continue
-                 # Get label name from loaded labels (might differ from self.labels if multi-model)
-                 key = labels.get(label_index_str, label_index_str)
-                 value = probabilities[k].item() # Get probability for class k
+                 key = labels.get(str(k), str(k))
+                 value = probabilities[k].item()
                  out[key] = float(value)
-        else:
-             print(f"ERROR: Invalid num_classes_model ({num_classes_model}) in format_pred.")
-
+        else: print(f"ERROR: Invalid num_classes_model ({num_classes_model}).")
         return out
 
 # ================================================

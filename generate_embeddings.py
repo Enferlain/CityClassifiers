@@ -2,7 +2,15 @@
 # Version: 4.2.0 (Added TIMM DINOv2 support)
 
 import os
+from concurrent.futures import ThreadPoolExecutor, Future
+import time
+from typing import List
+
+import torch.nn.functional as F
 import torch
+import torchvision.transforms.functional as TF # Renamed from F to avoid conflict
+import torch.nn.functional as torch_func
+
 # <<< ADD TIMM IMPORT >>>
 try:
     import timm
@@ -12,8 +20,7 @@ except ImportError:
     print("Warning: timm library not found. TIMM models cannot be used.")
     TIMM_AVAILABLE = False
 # <<< END ADD >>>
-import torchvision.transforms.functional as TF # Renamed from F to avoid conflict
-import torch.nn.functional as torch_func
+
 from PIL import Image, UnidentifiedImageError # <<< Added UnidentifiedImageError >>>
 from tqdm import tqdm
 import numpy as np
@@ -23,12 +30,20 @@ import math
 import shutil
 import traceback
 
-
 # --- Constants ---
 TARGET_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_PRECISION_MAP = {'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}
 # Defaulting to standard SigLIP here, will be overridden by args
 DEFAULT_MODEL_ID = "google/siglip-so400m-patch14-384" # Changed default for clarity
+# <<< Define NaFlex patch size >>>
+SIGLIP_NAFLEX_PATCH_SIZE = 16
+# <<< ADDED: AIMv2 Specific Constants >>>
+AIMV2_PATCH_SIZE = 14
+AIMV2_TARGET_MAX_PATCHES = 4096 # Target patch count for resizing, adjust if needed
+# <<< ADDED: Threading config >>>
+NUM_LOAD_WORKERS = 64 # Number of threads for loading images
+LOAD_QUEUE_SIZE = 32  # How many images to keep loaded ahead of time
+
 
 # --- Argument Parsing ---
 # v4.2.0: Added dinov2_large_timm_fitpad choice
@@ -44,6 +59,7 @@ def parse_gen_args():
                             'center_crop',          # Manual CenterCrop (SigLIP HF)
                             # 'avg_crop',             # Manual AvgCrop (NYI)
                             'naflex_resize',        # NaFlex HF (Proc Logic @ 1024)
+                            'naflex_resize2',  # NaFlex HF (Proc Logic @ 2048)
                             'dinov2_large_timm_fitpad',  # DINOv2 TIMM (TIMM Transforms)
                             'dinov2_giant_fb_fitpad',  # DINOv2 Facebook (Manual FitPad 518)
                             'aimv2_native_cls'  # <<< ADDED: AIMv2 Native CLS Token (HF Processor) >>>
@@ -51,6 +67,7 @@ def parse_gen_args():
                         help="Image preprocessing method before embedding.")
     # parser.add_argument('--resize_factor_avg_crop', type=float, default=2.0,
     #                     help="Factor to multiply model's native size by for resizing ONLY for avg_crop mode (default: 2.0).")
+    parser.add_argument('--naflex_max_patches', type=int, default=1024, help="Value for max_num_patches for SigLIP NaFlex processor (default: 1024).")
     parser.add_argument('--output_dir_suffix', type=str, default="", help="Optional suffix for the output directory name.")
 
     args = parser.parse_args()
@@ -161,8 +178,8 @@ def init_vision_model(model_name, device, dtype):
     try:
         # <<< Use AutoImageProcessor explicitly >>>
         # trust_remote_code might be needed for AIMv2's processor config
-        processor = AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True).to(device).eval()
+        processor = AutoImageProcessor.from_pretrained(model_name, attn_implementation="sdpa", trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_name, torch_dtype=dtype, attn_implementation="sdpa", trust_remote_code=True).to(device).eval()
 
         print(f"  Loaded model class: {model.__class__.__name__}")
         print(f"  Loaded processor class: {processor.__class__.__name__}")
@@ -210,7 +227,7 @@ def init_vision_model(model_name, device, dtype):
 
 
 # --- Unified Embedding Function ---
-# Version 4.3.0: Added AIMv2 Native CLS mode
+# Version 4.5.1: Corrects SigLIP NaFlex mask creation based on spatial_shapes
 @torch.no_grad()
 def get_embedding(
     raw_img_pil: Image.Image,
@@ -218,19 +235,22 @@ def get_embedding(
     model_info: dict,
     device,
     dtype,
-    model_image_size: int, # Size needed for manual preprocess modes
+    model_image_size: int, # Needed for manual modes like FitPad
+    filename: str = None,
+    naflex_max_patches: int = 1024 # Default for SigLIP NaFlex
 ) -> np.ndarray | None:
     """
     Generates embedding for a single raw PIL image using the specified mode
     and the provided model_info bundle.
     Returns normalized float32 numpy embedding or None on error.
     """
-    img_name = getattr(raw_img_pil, 'filename', 'UNKNOWN')
+    img_name = filename if filename else getattr(raw_img_pil, 'filename', 'UNKNOWN') # <<< UPDATED line
     model_type = model_info.get("type", "hf")
 
     try:
         emb = None
         do_l2_normalize = False
+        img_to_process = raw_img_pil # Start with the raw image
 
         # --- TIMM Model Handling (Unchanged) ---
         if model_type == "timm" and preprocess_mode == 'dinov2_large_timm_fitpad':
@@ -251,9 +271,101 @@ def get_embedding(
             # <<< ADDED: Check for AIMv2Model name >>>
             is_aimv2_model = "AIMv2Model" in model.__class__.__name__
 
-            # --- HF NaFlex Mode (SigLIP Processor Logic @ 1024) ---
+            # --- HF NaFlex Mode (WITH MANUAL PRE-RESIZING) ---
             if is_siglip_model and preprocess_mode == 'naflex_resize':
-                inputs = processor(images=[raw_img_pil], return_tensors="pt", max_num_patches=1024)
+                print(f"DEBUG get_embedding [HF/NaFlex]: Using max_num_patches={naflex_max_patches} with MANUAL PRE-RESIZE.")
+                # <<< START MANUAL PRE-RESIZING (Similar to AIMv2 logic but patch_size=16) >>>
+                try:
+                    original_width, original_height = raw_img_pil.size
+                    if original_width <= 0 or original_height <= 0: raise ValueError("Invalid image dimensions")
+
+                    patch_size = SIGLIP_NAFLEX_PATCH_SIZE # Use 16 for SigLIP
+                    target_patches = naflex_max_patches
+
+                    patches_w_initial = math.floor(original_width / patch_size)
+                    patches_h_initial = math.floor(original_height / patch_size)
+                    total_patches_initial = patches_w_initial * patches_h_initial
+
+                    if total_patches_initial > target_patches:
+                        scale_factor = math.sqrt(target_patches / total_patches_initial)
+                        resize_needed = True; max_iterations = 10; iterations = 0
+                        target_w = original_width; target_h = original_height # Keep track of target dims
+                        while iterations < max_iterations:
+                             target_w_f = original_width * scale_factor; target_h_f = original_height * scale_factor
+                             # Floor dimensions to be MULTIPLES of patch_size
+                             target_w = math.floor(target_w_f / patch_size) * patch_size
+                             target_h = math.floor(target_h_f / patch_size) * patch_size
+                             if target_w == 0: target_w = patch_size
+                             if target_h == 0: target_h = patch_size
+                             new_patches = (target_w // patch_size) * (target_h // patch_size)
+
+                             if new_patches <= target_patches:
+                                 print(f"  - INFO: Pre-Resizing {img_name} ({original_width}x{original_height}) -> ({target_w}x{target_h}) for SigLIP NaFlex.")
+                                 img_to_process = raw_img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                                 resize_needed = False; break
+                             scale_factor *= 0.995; iterations += 1
+                        if resize_needed:
+                            print(f"  Warning: Could not find suitable resize for {img_name}. Using original (might error).")
+                            img_to_process = raw_img_pil # Fallback, likely will error later if too big
+                    else: # Image already fits patch limit, just ensure dims are multiples of patch_size
+                        current_w, current_h = img_to_process.size
+                        target_w = math.floor(current_w / patch_size) * patch_size
+                        target_h = math.floor(current_h / patch_size) * patch_size
+                        if target_w == 0: target_w = patch_size
+                        if target_h == 0: target_h = patch_size
+                        if target_w != current_w or target_h != current_h:
+                             print(f"  - INFO: Adjusting {img_name} dims ({current_w}x{current_h}) -> ({target_w}x{target_h}) for patch divisibility.")
+                             img_to_process = img_to_process.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                except Exception as e_resize: print(f"\nError during SigLIP pre-resizing: {e_resize}"); return None
+                # <<< END MANUAL PRE-RESIZING >>>
+
+                # Now call the processor with the pre-resized image
+                try:
+                    # Pass max_num_patches still, processor might use it for padding limit?
+                    inputs = processor(images=[img_to_process], return_tensors="pt", max_num_patches=naflex_max_patches)
+                except Exception as e_proc: print(f"\nError processor call: {e_proc}"); return None
+
+                # --- Get outputs, noting pixel_values is PADDED ---
+                pixel_values_padded = inputs.get("pixel_values").to(device=device, dtype=dtype) # Shape [B, max_num_patches, F_flat]
+                # processor_mask = inputs.get("pixel_attention_mask") # Ignore this
+                spatial_shapes = inputs.get("spatial_shapes").to(device=device) # Actual shapes
+
+                # --- Calculate actual patches and create correct mask ---
+                batch_size = spatial_shapes.shape[0]
+                actual_num_patches = spatial_shapes[0, 0] * spatial_shapes[0, 1]
+                correct_attention_mask = torch.ones((batch_size, actual_num_patches), dtype=torch.long, device=device)
+
+                # --- FIX: Un-pad pixel_values ---
+                # Take only the first 'actual_num_patches' from the padded tensor
+                pixel_values_unpadded = pixel_values_padded[:, :actual_num_patches, :] # Shape [B, actual_num_patches, F_flat]
+                print(f"DEBUG: Unpadded pixel_values shape: {pixel_values_unpadded.shape}")
+                # --- END FIX ---
+
+                # Pass UNPADDED pixel_values, CORRECT mask, and spatial_shapes
+                model_call_kwargs = {
+                    "pixel_values": pixel_values_unpadded,   # <<< Use UNPADDED values
+                    "attention_mask": correct_attention_mask, # <<< Use correct mask
+                    "spatial_shapes": spatial_shapes.long()
+                 }
+
+                # Call SigLIP model's vision component
+                with torch.no_grad():
+                    try:
+                        vision_model_component = getattr(model, 'vision_model', model)
+                        # <<< ADD THIS DEBUG PRINT >>>
+                        model_device = next(vision_model_component.parameters()).device
+                        print(
+                            f"DEBUG: Calling vision model ({type(vision_model_component).__name__}) on device: {model_device}")
+                        # <<< END DEBUG PRINT >>>
+                        outputs = vision_model_component(**model_call_kwargs)
+                        emb = getattr(outputs, 'pooler_output', None) # Get pooled output
+                    except Exception as e_model:
+                        print(f"\nError Siglip forward (max_patches={naflex_max_patches}): {e_model}"); traceback.print_exc(); return None
+                do_l2_normalize = True # Apply L2 norm (matches previous successful runs)
+
+            # --- HF NaFlex Mode (SigLIP Processor Logic @ 2048) ---
+            elif is_siglip_model and preprocess_mode == 'naflex_resize2':
+                inputs = processor(images=[raw_img_pil], return_tensors="pt", max_num_patches=2048)
                 pixel_values = inputs.get("pixel_values"); attention_mask = inputs.get("pixel_attention_mask"); spatial_shapes = inputs.get("spatial_shapes")
                 if pixel_values is None or attention_mask is None or spatial_shapes is None: raise ValueError("Missing tensors from HF NaFlex processor.")
                 model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype), "attention_mask": attention_mask.to(device=device), "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)}
@@ -280,40 +392,71 @@ def get_embedding(
                 emb = last_hidden_state[:, 0, :] # Extract CLS token
                 do_l2_normalize = True
 
-            # --- <<< ADDED: HF AIMv2 Native CLS Mode >>> ---
+            # --- HF AIMv2 Native CLS Mode (WITH PRE-RESIZING) ---
             elif is_aimv2_model and preprocess_mode == 'aimv2_native_cls':
-                # print(f"DEBUG get_embedding [HF/AIMv2 CLS]: Using HF Processor.")
-                # Use processor directly - it handles the native AIMv2 transforms
+                # print(f"DEBUG get_embedding [HF/AIMv2 CLS]: Applying pre-resize if needed.")
+                # <<< START PRE-RESIZING LOGIC (Adapated from generate_feature_sequences) >>>
                 try:
-                     inputs = processor(images=[raw_img_pil], return_tensors="pt")
-                except Exception as e_proc:
-                     print(f"\nError during AIMv2 processor call for {img_name}: {e_proc}")
-                     traceback.print_exc()
-                     return None
+                    original_width, original_height = raw_img_pil.size
+                    if original_width <= 0 or original_height <= 0: raise ValueError("Invalid image dimensions")
 
+                    # Check initial patch count
+                    patches_w_initial = math.floor(original_width / AIMV2_PATCH_SIZE)
+                    patches_h_initial = math.floor(original_height / AIMV2_PATCH_SIZE)
+                    total_patches_initial = patches_w_initial * patches_h_initial
+
+                    if total_patches_initial > AIMV2_TARGET_MAX_PATCHES:
+                        # Calculate scale factor and resize iteratively
+                        scale_factor = math.sqrt(AIMV2_TARGET_MAX_PATCHES / total_patches_initial)
+                        resize_needed = True; max_iterations = 10; iterations = 0
+                        while iterations < max_iterations:
+                             target_w = int(original_width * scale_factor + 0.5); target_h = int(original_height * scale_factor + 0.5)
+                             if target_w < 1: target_w = 1;
+                             if target_h < 1: target_h = 1
+                             # Ensure new dims are multiples of patch size
+                             target_w = math.floor(target_w / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                             target_h = math.floor(target_h / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                             if target_w == 0: target_w = AIMV2_PATCH_SIZE
+                             if target_h == 0: target_h = AIMV2_PATCH_SIZE
+
+                             new_patches_w = target_w // AIMV2_PATCH_SIZE
+                             new_patches_h = target_h // AIMV2_PATCH_SIZE
+
+                             if new_patches_w * new_patches_h <= AIMV2_TARGET_MAX_PATCHES:
+                                 print(f"  - INFO: Resizing {img_name} ({original_width}x{original_height}, {total_patches_initial}p) -> ({target_w}x{target_h}, {new_patches_w * new_patches_h}p) for AIMv2 CLS.")
+                                 img_to_process = raw_img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                                 resize_needed = False; break
+                             scale_factor *= 0.995; iterations += 1
+                        if resize_needed: # If loop finished without success
+                            print(f"  Warning: Could not find suitable resize dimensions for {img_name}. Using original (might OOM or error).")
+                            img_to_process = raw_img_pil # Use original as fallback
+                    else:
+                        # Ensure original dimensions are multiples of patch size if not resizing
+                        current_w, current_h = img_to_process.size
+                        new_w = math.floor(current_w / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                        new_h = math.floor(current_h / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                        if new_w == 0: new_w = AIMV2_PATCH_SIZE
+                        if new_h == 0: new_h = AIMV2_PATCH_SIZE
+                        if new_w != current_w or new_h != current_h:
+                             print(f"  - INFO: Adjusting {img_name} dims ({current_w}x{current_h}) -> ({new_w}x{new_h}) to be multiples of {AIMV2_PATCH_SIZE}.")
+                             img_to_process = img_to_process.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                except Exception as e_resize:
+                     print(f"\nError during AIMv2 pre-resizing for {img_name}: {e_resize}")
+                     traceback.print_exc(); return None
+                # <<< END PRE-RESIZING LOGIC >>>
+
+                # Now, use the processor on the (potentially resized) image
+                try: inputs = processor(images=[img_to_process], return_tensors="pt")
+                except Exception as e_proc: print(f"\nError processor call: {e_proc}"); return None
                 pixel_values = inputs.get("pixel_values")
                 if pixel_values is None: raise ValueError("HF AIMv2 Processor didn't return 'pixel_values'.")
-
-                # AIMv2 model only needs pixel_values typically
                 model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
 
-                # Call model
-                outputs = model(**model_call_kwargs) # AIMv2Model forward returns BaseModelOutputWithPooling
-
-                # Extract last_hidden_state (AIMv2 might output this directly or within outputs)
+                # Call model, extract CLS token
+                outputs = model(**model_call_kwargs)
                 last_hidden_state = getattr(outputs, 'last_hidden_state', None)
-                if last_hidden_state is None:
-                    raise ValueError("AIMv2 model did not return last_hidden_state.")
-
-                # Expect shape [1, SeqLen, Features]
-                if last_hidden_state.ndim != 3 or last_hidden_state.shape[0] != 1:
-                    raise ValueError(f"Unexpected last_hidden_state shape from AIMv2: {last_hidden_state.shape}")
-
-                # Extract CLS token (first token of the sequence)
-                emb = last_hidden_state[:, 0, :] # Shape [1, Features]
-
-                # Set flag to normalize the CLS token embedding
-                do_l2_normalize = True
+                if last_hidden_state is None: raise ValueError("AIMv2 model did not return last_hidden_state.")
+                emb = last_hidden_state[:, 0, :]; do_l2_normalize = True
 
             # --- HF Manual Modes (FitPad / CenterCrop for SigLIP/non-FB DINOv2) ---
             elif preprocess_mode in ['fit_pad', 'center_crop']:
@@ -376,6 +519,26 @@ def get_embedding(
 # --- End Unified Embedding Function ---
 
 
+# <<< ADDED: Helper function to load image in thread >>>
+def load_image_job(img_path):
+    """Loads a single image in a separate thread."""
+    try:
+        img_pil = Image.open(img_path).convert("RGB")
+        # Basic check for valid image dimensions
+        w, h = img_pil.size
+        if w <= 0 or h <= 0: raise ValueError(f"Invalid image dimensions ({w}x{h})")
+        return img_pil, img_path # Return PIL image and its original path
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as img_e:
+        # Print error but return None for image, keep path for tracking
+        print(f"\nError opening image {os.path.basename(img_path)} in thread: {img_e}. Returning None.")
+        return None, img_path
+    except Exception as e: # Catch any other unexpected errors
+        print(f"\nUnexpected error loading image {os.path.basename(img_path)} in thread: {e}")
+        traceback.print_exc()
+        return None, img_path
+
+
+# v4.4.0: Added ThreadPoolExecutor for image loading
 # --- Main Execution Logic ---
 if __name__ == "__main__":
     args = parse_gen_args()
@@ -440,6 +603,7 @@ if __name__ == "__main__":
         'center_crop': "CenterCrop",      # HF SigLIP Manual CenterCrop
         # 'avg_crop': "AvgCrop",            # NYI
         'naflex_resize': "Naflex_Proc1024",
+        'naflex_resize2': "Naflex_Proc2048",
         'dinov2_large_timm_fitpad': "FitPad",
         'dinov2_giant_fb_fitpad': "FitPad518", # Make FB DINOv2 distinct
         'aimv2_native_cls': "AIMv2CLS",       # <<< New Suffix >>>
@@ -459,69 +623,137 @@ if __name__ == "__main__":
     print(f"Selected Preprocessing Mode: {args.preprocess_mode}")
     # <<< Updated Print Statements >>>
     if args.preprocess_mode == 'naflex_resize': print("  (Using HF Processor logic with target max_num_patches=1024)")
+    if args.preprocess_mode == 'naflex_resize2': print("  (Using HF Processor logic with target max_num_patches=2048)")
     if args.preprocess_mode == 'dinov2_large_timm_fitpad': print(f"  (Using TIMM transforms with input size {model_image_size})")
     if args.preprocess_mode == 'dinov2_giant_fb_fitpad': print(f"  (Using Manual FitPad to size {model_image_size})")
     if args.preprocess_mode == 'aimv2_native_cls': print(f"  (Using HF Processor for native transforms, extracting CLS token)")
     print(f"Embeddings will be saved in: {final_output_dir}")
 
-    # --- Process Source Folders (Main Loop - Unchanged Structure) ---
-    source_subfolders = sorted([d for d in os.listdir(args.image_dir) if os.path.isdir(os.path.join(args.image_dir, d))])
-    if not source_subfolders: exit(f"Error: No subfolders found in image directory: {args.image_dir}")
+    # --- Process Source Folders (Main Loop with Threading) ---
+    source_subfolders = sorted([d for d in os.listdir(args.image_dir) if os.path.isdir(os.path.join(args.image_dir, d)) and not d.startswith('.')])
+    if not source_subfolders: exit(f"Error: No valid subfolders found in {args.image_dir}")
     print(f"Found source subfolders: {source_subfolders}")
 
-    for src_folder in source_subfolders:
-        current_image_dir = os.path.join(args.image_dir, src_folder)
-        target_label = src_folder
-        current_output_subdir = os.path.join(final_output_dir, target_label)
-        os.makedirs(current_output_subdir, exist_ok=True)
-        print(f"\nProcessing: {current_image_dir} -> {current_output_subdir}")
+    total_processed_count = 0
+    total_skipped_count = 0
+    total_error_count = 0
 
-        image_files = [f for f in os.listdir(current_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-        if not image_files: print("  No image files found."); continue
+    # <<< START THREADING LOGIC >>>
+    with ThreadPoolExecutor(max_workers=NUM_LOAD_WORKERS) as executor:
+        for src_folder in source_subfolders:
+            current_image_dir = os.path.join(args.image_dir, src_folder)
+            target_label = src_folder # Assuming folder name is the label/subfolder name
+            current_output_subdir = os.path.join(final_output_dir, target_label)
+            os.makedirs(current_output_subdir, exist_ok=True)
+            print(f"\nProcessing Folder: {current_image_dir} -> {current_output_subdir}")
 
-        for fname in tqdm(image_files, desc=f"Folder '{src_folder}'"):
-            embedding_result = None
+            # --- Collect all tasks for this folder ---
+            tasks = [] # List of tuples: (output_path, input_path)
+            skipped_in_folder = 0
             try:
-                img_path = os.path.join(current_image_dir, fname)
-                try:
-                    raw_img_pil = Image.open(img_path).convert("RGB")
-                # <<< Catch UnidentifiedImageError specifically >>>
-                except UnidentifiedImageError as img_e:
-                    print(f"\nError opening image {fname} (unidentified): {img_e}. Skipping.")
-                    continue
-                except Exception as img_e:
-                    print(f"\nError opening image {fname}: {img_e}. Skipping.")
-                    continue
-
-                # --- Call unified embedding function (Unchanged call) ---
-                embedding_result = get_embedding(
-                    raw_img_pil=raw_img_pil,
-                    preprocess_mode=args.preprocess_mode,
-                    model_info=model_info,
-                    device=TARGET_DEV,
-                    dtype=COMPUTE_DTYPE,
-                    model_image_size=model_image_size,
-                )
-
-                # --- Save result (Unchanged) ---
-                if embedding_result is not None:
-                    # <<< Add shape check before saving >>>
-                    if embedding_result.ndim == 1:
-                        base_fname = os.path.splitext(fname)[0]
-                        output_path = os.path.join(current_output_subdir, f"{base_fname}.npy")
-                        np.save(output_path, embedding_result)
-                    else:
-                        print(f"Error: Final embedding for {fname} is not 1D (shape: {embedding_result.shape}). Skipping save.")
-                else:
-                    print(f"Info: Skipping save for {fname} as embedding generation returned None.")
-
-            except Exception as e:
-                print(f"\nCAUGHT UNEXPECTED EXCEPTION while processing image {fname}. Details below. Skipping.")
-                print(f"  EXCEPTION TYPE: {type(e)}")
-                print(f"  EXCEPTION VALUE: {e}")
-                traceback.print_exc()
+                image_files = [f for f in os.listdir(current_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and not f.startswith('.')]
+                for fname in image_files:
+                    base_fname = os.path.splitext(fname)[0]
+                    output_path = os.path.join(current_output_subdir, f"{base_fname}.npy")
+                    img_path = os.path.join(current_image_dir, fname)
+                    # Skip if output already exists
+                    if os.path.exists(output_path):
+                        skipped_in_folder += 1
+                        continue
+                    tasks.append((output_path, img_path))
+            except OSError as e:
+                print(f"  Error listing files in {current_image_dir}: {e}. Skipping folder.")
                 continue
-        # --- End Image Loop ---
-    # --- End Folder Loop ---
 
+            total_skipped_count += skipped_in_folder
+            if not tasks:
+                 print(f"  All {len(image_files)} images already processed/skipped in this folder."); continue
+            # --- End Task Collection ---
+
+            processed_in_folder = 0
+            error_in_folder = 0
+            futures: List[Future] = []
+            task_map = {} # Map future to output path for saving
+
+            # Wrap folder processing in tqdm
+            with tqdm(total=len(tasks), desc=f"Folder '{src_folder}'", unit="image", dynamic_ncols=True) as pbar:
+                 # Submit initial batch of load jobs
+                 for i in range(min(LOAD_QUEUE_SIZE, len(tasks))):
+                     out_p, img_p = tasks[i]
+                     future = executor.submit(load_image_job, img_p)
+                     futures.append(future)
+                     task_map[future] = out_p # Store output path with future
+
+                 current_task_index = 0
+                 # Process futures as they complete
+                 while current_task_index < len(tasks):
+                     # Wait for the oldest future to complete
+                     # Using futures.pop(0) makes this FIFO
+                     completed_future = futures.pop(0)
+                     output_path_for_task = task_map.pop(completed_future) # Get corresponding output path
+
+                     # Submit a new load job if there are more tasks
+                     next_job_index = current_task_index + LOAD_QUEUE_SIZE
+                     if next_job_index < len(tasks):
+                         next_out_p, next_img_p = tasks[next_job_index]
+                         new_future = executor.submit(load_image_job, next_img_p)
+                         futures.append(new_future)
+                         task_map[new_future] = next_out_p
+
+                     # --- Process the completed image load job ---
+                     try:
+                         loaded_image, loaded_path = completed_future.result() # Get result (PIL image, path)
+
+                         if loaded_image is None: # Loading failed in thread
+                             error_in_folder += 1
+                         else: # Image loaded successfully, generate embedding
+                             # Pass relevant args from command line and initialized models
+                             embedding_result = get_embedding(
+                                 raw_img_pil=loaded_image,
+                                 preprocess_mode=args.preprocess_mode,
+                                 model_info=model_info,
+                                 device=TARGET_DEV,
+                                 dtype=COMPUTE_DTYPE,
+                                 model_image_size=model_image_size,
+                                 filename=os.path.basename(loaded_path), # Pass basename for logging
+                                 naflex_max_patches=args.naflex_max_patches # Pass limit
+                             )
+
+                             # --- Save result ---
+                             if embedding_result is not None and embedding_result.ndim == 1:
+                                 try:
+                                      np.save(output_path_for_task, embedding_result)
+                                      processed_in_folder += 1
+                                 except Exception as e_save:
+                                      print(f"\nError saving {output_path_for_task}: {e_save}")
+                                      error_in_folder += 1
+                             elif embedding_result is not None: # Wrong shape
+                                  print(f"Error: Embedding for {os.path.basename(loaded_path)} not 1D. Shape: {embedding_result.shape}. Skipping save.")
+                                  error_in_folder += 1
+                             else: # Generation failed (error printed in get_embedding)
+                                  error_in_folder += 1
+                             # Explicitly delete to free memory sooner?
+                             del loaded_image, embedding_result
+
+                     except Exception as e_proc: # Catch errors during result processing/embedding gen
+                         print(f"\nError processing result for task {current_task_index} (path: {loaded_path if 'loaded_path' in locals() else 'unknown'}): {e_proc}")
+                         traceback.print_exc()
+                         error_in_folder += 1
+                     finally:
+                          pbar.update(1) # Update progress bar for the completed task index
+                          current_task_index += 1
+                          # Give GPU tiny breather? Unlikely needed.
+                          # time.sleep(0.001)
+
+            # --- End Folder Task Loop (tqdm) ---
+            total_processed_count += processed_in_folder
+            total_error_count += error_in_folder
+            print(f"  Folder '{src_folder}' Summary: Processed: {processed_in_folder}, Skipped: {skipped_in_folder}, Errors: {error_in_folder}")
+    # <<< END THREADING LOGIC WRAPPER >>>
+
+    print("\n--- Overall Summary ---")
+    print(f"Total Images Processed: {total_processed_count}")
+    print(f"Total Images Skipped:   {total_skipped_count}")
+    print(f"Total Errors:           {total_error_count}")
+    print(f"Embeddings saved to:    {final_output_dir}")
     print("\nEmbedding generation complete!")

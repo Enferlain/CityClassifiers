@@ -30,6 +30,7 @@ from optimizer.shampoo import ScalableShampoo
 from optimizer.adam import AdamW8bitAO, AdamW4bitAO, AdamWfp8AO
 from .distributed_shampoo.distributed_shampoo import DistributedShampoo
 # from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree # missing?
+from optimizer.glyph import Glyph
 
 # --- Imports for Schedulers ---
 from torch.optim.lr_scheduler import LRScheduler # Base type
@@ -74,6 +75,7 @@ OPTIMIZER_LIST: List[OPTIMIZER] = [
     FishMonger,
     FishMonger8BitBNB,
     GaLore,
+    Glyph,
     GrokFastAdamW,
     LPFAdamW,
     LaProp,

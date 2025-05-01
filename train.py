@@ -1,4 +1,5 @@
 # Version: 2.3.0 (Handles E2E Dataset Loading)
+import argparse
 import collections
 import inspect
 import os
@@ -28,7 +29,8 @@ except Exception as e:
 # Assuming utils.py is in the same directory or accessible
 from utils import (
     ModelWrapper, get_embed_params, parse_and_load_args, write_config,
-    FocalLoss, load_optimizer_state, load_scheduler_state, load_scaler_state # Add load helpers if needed here
+    load_optimizer_state, load_scheduler_state, load_scaler_state,
+    run_validation_embeddings  # Add load helpers if needed here
 )
 # Import datasets conditionally or both if needed
 from dataset import EmbeddingDataset
@@ -41,7 +43,10 @@ except ImportError:
 
 from model_early_extract import EarlyExtractAnatomyModel
 from model import PredictorModel
-from losses import GHMC_Loss # Keep loss imports here
+from head_model import HeadModel
+from hybrid_model import HybridHeadModel
+
+from losses import FocalLoss, GHMC_Loss # Keep loss imports here
 
 # --- Attempt to import our custom optimizers ---
 try:
@@ -241,102 +246,142 @@ def setup_dataloaders(args, image_processor=None):
     return dataset, train_loader, val_loader
 # --- End setup_dataloaders ---
 
-# Version 2.3.0: Handles E2E and Embedding model/criterion setup
+# Version 2.4.0: Handles E2E, PredictorModel, or HeadModel based on config
 def setup_model_criterion(args, dataset):
     """
     Sets up the model and criterion based on args.
-    Instantiates either PredictorModel or EarlyExtractAnatomyModel.
+    Instantiates EarlyExtractAnatomyModel (E2E), HeadModel (features/embeddings),
+    or PredictorModel (embeddings) based on config structure.
     Determines criterion based on args.loss_function.
     """
-    print("DEBUG setup_model_criterion: Setting up model and criterion...")
+    print("DEBUG setup_model_criterion v2.4.0: Setting up model and criterion...")
 
-    # --- Common Setup ---
-    loss_function_name = getattr(args, 'loss_function')
-    # num_labels should have been updated by setup_dataloaders based on the dataset
-    num_classes = getattr(args, 'num_labels', None)
-    if num_classes is None:
-        exit("Error: num_labels not set by dataset loader. Cannot determine model output size.")
-    if args.arch == 'score' and num_classes != 1:
-        print(f"Warning: arch is 'score' but dataset seems to have {num_classes} labels? Forcing num_classes=1.")
-        num_classes = 1
-    if args.arch == 'class' and num_classes == 0:
-         exit("Error: arch is 'class' but dataset found 0 labels.")
-    if args.arch == 'class' and num_classes == 1:
-         print("Warning: arch is 'class' but dataset only has 1 label (e.g., only '0' folder). Consider adding more classes or using 'score' arch.")
-         # Defaulting to 2 classes for binary classification if only one label found might be confusing.
-         # Let's proceed with num_classes=1 for BCE loss, but CE/Focal/NLL/GHM will fail.
-         # num_classes = 2 # Force to 2? Or let it fail later? Let's keep 1 for now.
+    # --- Determine Intended num_classes & Validate (Using the v1.1.0 logic from train_features) ---
+    # This ensures we correctly determine num_classes based on loss/arch first,
+    # then validate against the dataset.
+    config_loss_function = getattr(args, 'loss_function', None)
+    config_arch = getattr(args, 'arch', 'class')
+    intended_num_classes = None
+    loss_requires_num_classes_1 = config_loss_function in ['bce', 'l1', 'mse']
+    loss_requires_num_classes_multi = config_loss_function in ['crossentropy', 'focal', 'nll', 'ghm']
 
-    args.num_classes = num_classes # Store the final determined number of classes back to args
+    # Determine intended based on config
+    if config_arch == 'score':
+        intended_num_classes = 1
+        if config_loss_function is None: config_loss_function = 'l1'
+        elif loss_requires_num_classes_multi: intended_num_classes = 2 # Ambiguous, default to 2
+    elif config_arch == 'class':
+        if loss_requires_num_classes_1: intended_num_classes = 1
+        elif loss_requires_num_classes_multi: intended_num_classes = 2 # Default to 2
+        elif config_loss_function is None: config_loss_function = 'focal'; intended_num_classes = 2
+        else: exit(f"Error: Unknown loss '{config_loss_function}' for arch='class'.")
+    else: exit(f"Error: Unknown model architecture '{config_arch}'.")
+
+    if intended_num_classes is None: exit("Error: Could not determine intended num_classes.")
+    print(f"DEBUG: Intended num_classes based on config: {intended_num_classes}")
+
+    # Get dataset labels
+    num_labels_from_dataset = getattr(dataset, 'num_labels', 0)
+    print(f"DEBUG: Labels found by dataset: {num_labels_from_dataset}")
+
+    # Validate intended vs dataset
+    final_num_classes = intended_num_classes
+    if intended_num_classes == 1:
+        if num_labels_from_dataset <= 1: exit(f"Config Error: Intended binary loss but dataset found {num_labels_from_dataset} classes.")
+        elif num_labels_from_dataset > 2: exit(f"Config Error: Intended binary loss but dataset found {num_labels_from_dataset} classes (>2).")
+        # If intended=1, found=2 -> OK, use 1
+        final_num_classes = 1
+    elif intended_num_classes >= 2:
+        if num_labels_from_dataset <= 1: exit(f"Config Error: Intended multi-class loss but dataset found {num_labels_from_dataset} classes.")
+        elif num_labels_from_dataset != intended_num_classes:
+            print(f"Warning: Intended num_classes={intended_num_classes} but dataset found {num_labels_from_dataset}. Using {num_labels_from_dataset}.")
+            final_num_classes = num_labels_from_dataset
+
+    args.num_classes = final_num_classes # Store final validated number
+    print(f"DEBUG: Final validated num_classes to be used: {args.num_classes}")
+    # --- End num_classes validation ---
 
     criterion = None
     class_weights_tensor = None
     if args.arch == "class" and hasattr(args, 'weights') and args.weights:
-         if len(args.weights) == num_classes:
+         if len(args.weights) == final_num_classes:
               try:
                   class_weights_tensor = torch.tensor(args.weights, device=TARGET_DEV, dtype=torch.float32)
                   print(f"DEBUG: Using class weights: {args.weights}")
               except Exception as e:
                    print(f"Warning: Failed to create tensor from class weights: {e}. Ignoring weights.")
          else:
-              print(f"Warning: Length of weights in config ({len(args.weights)}) != num_classes ({num_classes}). Ignoring weights.")
-
+              print(f"Warning: Length of weights in config ({len(args.weights)}) != num_classes ({final_num_classes}). Ignoring weights.")
 
     # --- Determine Criterion ---
-    # This logic remains mostly the same, but uses the final num_classes
-    # It also validates against the model's output_mode required by the loss
-    model_output_mode = getattr(args, 'head_output_mode') if getattr(args, 'is_end_to_end', False) else getattr(args, 'output_mode')
-    if model_output_mode is None: exit("Error: Model output mode is not defined in args.")
-    model_output_mode = model_output_mode.lower()
+    # <<< FIX: Get correct output mode based on anticipated model type >>>
+    model_output_mode = None
+    if getattr(args, 'is_end_to_end', False):
+        # E2E mode uses head_output_mode
+        model_output_mode = getattr(args, 'head_output_mode', None)
+        if model_output_mode is None: exit("Error: 'head_output_mode' missing in config for E2E mode.")
+    else: # Embedding mode - check if HeadModel or PredictorModel params are present
+        use_head_model_params = hasattr(args, 'head_hidden_dim') or hasattr(args, 'pooling_strategy') # Check for head-specific args
+        if use_head_model_params:
+            model_output_mode = getattr(args, 'head_output_mode', None)
+            if model_output_mode is None: exit("Error: 'head_output_mode' missing in head_params section.")
+        else: # Assume PredictorModel
+            model_output_mode = getattr(args, 'output_mode', None)
+            if model_output_mode is None: exit("Error: 'output_mode' missing in predictor_params section.")
 
-    if loss_function_name == 'l1':
+    # Now model_output_mode holds the correct value ('sigmoid' in your case)
+    model_output_mode = model_output_mode.lower()
+    print(f"DEBUG: Determined model_output_mode for loss validation: '{model_output_mode}'")
+    # <<< END FIX >>>
+
+    if config_loss_function  == 'l1':
         print("DEBUG: Setting criterion to L1Loss.")
         criterion = nn.L1Loss(reduction='mean')
-        if num_classes != 1: print(f"Warning: L1Loss typically used with num_classes=1, but found {num_classes}.")
+        if final_num_classes != 1: print(f"Warning: L1Loss typically used with num_classes=1, but found {final_num_classes}.")
         if model_output_mode not in ['tanh_scaled', 'sigmoid', 'linear']: print(f"Warning: L1Loss typically paired with scaled/linear output, got '{model_output_mode}'.")
 
-    elif loss_function_name == 'mse':
+    elif config_loss_function  == 'mse':
         print("DEBUG: Setting criterion to MSELoss.")
         criterion = nn.MSELoss(reduction='mean')
-        if num_classes != 1: print(f"Warning: MSELoss typically used with num_classes=1, but found {num_classes}.")
+        if final_num_classes != 1: print(f"Warning: MSELoss typically used with num_classes=1, but found {final_num_classes}.")
         if model_output_mode not in ['tanh_scaled', 'linear', 'sigmoid']: print(f"Warning: MSELoss typically paired with linear/scaled output, got '{model_output_mode}'.")
 
-    elif loss_function_name == 'focal':
+    elif config_loss_function  == 'focal':
         print("DEBUG: Setting criterion to FocalLoss.")
-        if num_classes <= 1: exit(f"Error: FocalLoss requires num_classes > 1, but found {num_classes}.")
+        if final_num_classes <= 1: exit(f"Error: FocalLoss requires num_classes > 1, but found {final_num_classes}.")
         criterion = FocalLoss(gamma=getattr(args, 'focal_loss_gamma', 2.0))
         if model_output_mode != 'linear':
              print(f"Warning: FocalLoss usually expects output_mode='linear', but got '{model_output_mode}'. Training with non-logit input.")
              # Allow non-linear input, but loss calculation might be suboptimal.
 
-    elif loss_function_name == 'crossentropy':
+    elif config_loss_function  == 'crossentropy':
         print("DEBUG: Setting criterion to CrossEntropyLoss.")
-        if num_classes <= 1: exit(f"Error: CrossEntropyLoss requires num_classes > 1, but found {num_classes}.")
+        if final_num_classes <= 1: exit(f"Error: CrossEntropyLoss requires num_classes > 1, but found {final_num_classes}.")
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
         if model_output_mode != 'linear':
              print(f"Warning: CrossEntropyLoss usually expects output_mode='linear', but got '{model_output_mode}'. Training with non-logit input.")
 
-    elif loss_function_name == 'bce':
+    elif config_loss_function  == 'bce':
         print("DEBUG: Setting criterion to BCEWithLogitsLoss.")
         # BCEWithLogitsLoss *can* handle multi-label if target is multi-label float,
         # but for single-label classification, num_classes=1 is standard.
-        if num_classes != 1:
-            print(f"Warning: BCEWithLogitsLoss selected, but num_classes={num_classes}. Ensure targets are correctly formatted (e.g., multi-label floats) or consider using CrossEntropyLoss.")
-        criterion = nn.BCEWithLogitsLoss(weight=class_weights_tensor if num_classes > 1 else None) # Weight applied per element for multi-label
+        if final_num_classes != 1:
+            print(f"Warning: BCEWithLogitsLoss selected, but num_classes={final_num_classes}. Ensure targets are correctly formatted (e.g., multi-label floats) or consider using CrossEntropyLoss.")
+        criterion = nn.BCEWithLogitsLoss(weight=class_weights_tensor if final_num_classes > 1 else None) # Weight applied per element for multi-label
         if model_output_mode != 'linear':
              print(f"Warning: BCEWithLogitsLoss expects output_mode='linear', but got '{model_output_mode}'. Training with non-logit input.")
 
-    elif loss_function_name == 'nll':
+    elif config_loss_function  == 'nll':
         print("DEBUG: Setting criterion to NLLLoss (expects LogSoftmax input).")
-        if num_classes <= 1: exit(f"Error: NLLLoss requires num_classes > 1, but found {num_classes}.")
+        if final_num_classes <= 1: exit(f"Error: NLLLoss requires num_classes > 1, but found {final_num_classes}.")
         criterion = nn.NLLLoss(weight=class_weights_tensor)
         if model_output_mode != 'linear':
              # NLL *requires* log-probabilities. If the model isn't outputting logits, this won't work correctly.
              exit(f"Error: loss_function='nll' selected, but model output_mode is '{model_output_mode}'. Must be 'linear' for NLLLoss (LogSoftmax applied in train loop).")
 
-    elif loss_function_name == 'ghm':
+    elif config_loss_function  == 'ghm':
         print("DEBUG: Setting criterion to GHMC_Loss.")
-        if num_classes <= 1: exit(f"Error: GHMC_Loss currently requires num_classes > 1, but found {num_classes}.")
+        if final_num_classes <= 1: exit(f"Error: GHMC_Loss currently requires num_classes > 1, but found {final_num_classes}.")
         ghm_bins = getattr(args, 'ghm_bins', 10)
         ghm_momentum = getattr(args, 'ghm_momentum', 0.75)
         criterion = GHMC_Loss(bins=ghm_bins, momentum=ghm_momentum, reduction='mean')
@@ -345,7 +390,7 @@ def setup_model_criterion(args, dataset):
         if class_weights_tensor is not None: print("Warning: Class weights specified but GHMC_Loss does not use them directly.")
 
     else:
-        raise ValueError(f"Unknown loss_function '{loss_function_name}' specified in config.")
+        raise ValueError(f"Unknown loss_function '{config_loss_function }' specified in config.")
 
     if criterion is None:
         exit("Error: Criterion setup failed.")
@@ -365,7 +410,7 @@ def setup_model_criterion(args, dataset):
                 pooling_strategy=args.pooling_strategy,
                 head_features=None,
                 head_hidden_dim=args.head_hidden_dim,
-                head_num_classes=num_classes,
+                head_num_classes=final_num_classes,
                 head_num_res_blocks=args.head_num_res_blocks,
                 head_dropout_rate=args.head_dropout_rate,
                 head_output_mode=args.head_output_mode,
@@ -380,42 +425,54 @@ def setup_model_criterion(args, dataset):
             traceback.print_exc()
             exit(f"Error instantiating EarlyExtractAnatomyModel.")
 
-    else: # Embedding Path
-        print(f"DEBUG: Instantiating PredictorModel v2 (Output Classes: {num_classes}, Output Mode: {args.output_mode})")
+    else:  # Embedding Mode
+        if not hasattr(args, 'features') or args.features is None: exit("Error: Features missing.")
+
+        # <<< Decision Logic: Always use HybridHeadModel for embeddings now? >>>
+        # OR: Add a specific flag in YAML like `model.type: HybridHeadModel`?
+        # Let's assume for now we *always* want HybridHeadModel for embeddings.
+        # If you want PredictorModel back, you'll need to adjust this logic or use flags.
+
+        print(f"DEBUG: Embedding mode. Instantiating HybridHeadModel...")
+        # Get output mode (Assume it's loaded into args.output_mode from predictor_params)
+        output_mode = getattr(args, 'output_mode', None)
+        if output_mode is None:
+            # Maybe it was loaded into head_output_mode by mistake? Check there too.
+            output_mode = getattr(args, 'head_output_mode', None)
+            if output_mode is None: exit("Error: 'output_mode' missing in predictor_params (or head_params).")
+
         try:
-            if args.features is None: exit("Error: Features not determined for embedding model.")
-            model = PredictorModel(
+            model = HybridHeadModel(
                 features=args.features,
-                hidden_dim=args.hidden_dim, # Should be loaded by parse_args
-                num_classes=num_classes, # Use final num_classes
-                use_attention=args.use_attention,
-                num_attn_heads=args.num_attn_heads,
-                attn_dropout=args.attn_dropout,
-                num_res_blocks=args.num_res_blocks,
-                dropout_rate=args.dropout_rate,
-                output_mode=args.output_mode # Use predictor output mode
+                hidden_dim=getattr(args, 'hidden_dim', 1280),  # Get from PredictorModel args
+                num_classes=args.num_classes,
+                use_attention=getattr(args, 'use_attention', True),  # Get from PredictorModel args
+                num_attn_heads=getattr(args, 'num_attn_heads', 16),  # Get from PredictorModel args
+                attn_dropout=getattr(args, 'attn_dropout', 0.1),  # Get from PredictorModel args
+                # Get parameters that might exist under different names (e.g., head_num_res_blocks vs num_res_blocks)
+                # Prioritize args that HybridHeadModel specifically uses if available
+                num_res_blocks=getattr(args, 'head_num_res_blocks', getattr(args, 'num_res_blocks', 3)),
+                dropout_rate=getattr(args, 'head_dropout_rate', getattr(args, 'dropout_rate', 0.1)),
+                rms_norm_eps=getattr(args, 'rms_norm_eps', 1e-6),  # Add rms_norm_eps to YAML if needed
+                output_mode=output_mode
             )
         except Exception as e:
-            print(f"Error details during PredictorModel instantiation: {e}")
-            import traceback
-            traceback.print_exc()
-            exit(f"Error instantiating PredictorModel.")
+            print(f"Error details during HybridHeadModel instantiation: {e}")
+            exit(f"Error instantiating HybridHeadModel: {e}")
 
-    if model is None:
-        exit("Model instantiation failed.")
-
+        # --- Final Checks ---
+    if model is None: exit("Model instantiation failed.")
     model.to(TARGET_DEV)
-    print("Model and criterion setup complete.")
+    print(f"Model ({type(model).__name__}) and criterion setup complete.")
 
     return model, criterion
 
-# Version 2.5.0: Conditional parameter selection for optimizer
+# Version 2.6.0: fixes
+# Version 2.5.1: Improved float conversion for optimizer/scheduler args
 def setup_optimizer_scheduler(args, model):
     """
     Sets up the optimizer and scheduler based on args.
-    Dynamically loads custom optimizers/schedulers from OPTIMIZERS/SCHEDULERS dicts.
-    Uses inspect to gather relevant arguments from args object.
-    Selects parameters to optimize based on end-to-end mode and freezing settings.
+    Handles float conversion for scientific notation strings.
     """
     optimizer = None
     scheduler = None
@@ -424,121 +481,89 @@ def setup_optimizer_scheduler(args, model):
 
     print(f"Attempting to setup optimizer: {optimizer_name}")
 
-    # --- Determine Parameters to Optimize ---
-    params_to_optimize = None
-    if getattr(args, 'is_end_to_end', False) and getattr(args, 'freeze_base_model', True):
-        print("DEBUG Optimizer: Base model is frozen, optimizing HEAD parameters only.")
-        # Access parameters of the head module (assuming it's named 'head')
-        if hasattr(model, 'head') and isinstance(model.head, nn.Module):
-             params_to_optimize = model.head.parameters()
-             # Double-check if any parameters were found in the head
-             if not list(model.head.parameters()):
-                 print("Warning: model.head found, but it has no parameters to optimize!")
-                 # Fallback to optimizing everything? Or error? Let's warn and optimize all for now.
-                 params_to_optimize = model.parameters()
-        else:
-             # Error if we expect a frozen base but can't find the head
-             exit("Error: Cannot find 'model.head' submodule to optimize when base model is frozen.")
-    else:
-        # Optimize all parameters if not E2E, or if E2E but base is not frozen
-        if getattr(args, 'is_end_to_end', False):
-             print("DEBUG Optimizer: End-to-end model, base is NOT frozen. Optimizing ALL trainable model parameters.")
-        else:
-             print("DEBUG Optimizer: Embedding-based model. Optimizing ALL trainable model parameters.")
-        params_to_optimize = model.parameters()
-
+    # --- Determine Parameters to Optimize (Logic Remains Same) ---
+    params_to_optimize = model.parameters() # Simplified for feature training (always optimize head)
     # Check if any parameters were selected
-    # Convert generator to list to check emptiness
     param_list_for_check = list(params_to_optimize)
-    if not param_list_for_check:
-         exit("Error: No parameters selected for optimization!")
-    # Need to use the original generator for the optimizer constructor if not checking length
-    # Re-assign if we consumed the generator by converting to list
-    params_to_optimize = iter(param_list_for_check) # Or get it again if model structure is simple
-    # Safer: Just get the generator again if needed
-    if getattr(args, 'is_end_to_end', False) and getattr(args, 'freeze_base_model', True):
-         params_to_optimize = model.head.parameters()
-    else:
-         params_to_optimize = model.parameters()
+    if not param_list_for_check: exit("Error: No parameters selected for optimization!")
+    params_to_optimize = model.parameters() # Get generator again
     # --- End Parameter Determination ---
-
 
     # --- Dynamic Optimizer Loading ---
     if optimizer_name in OPTIMIZERS:
         optimizer_class = OPTIMIZERS[optimizer_name]
         print(f"Found optimizer class: {optimizer_class.__name__}")
-
         try:
-            # Inspect the optimizer's __init__ signature
             sig = inspect.signature(optimizer_class.__init__)
             available_params = sig.parameters.keys()
-            # Gather potential kwargs from args (same logic as before)
             potential_kwargs = {}
             args_dict = vars(args)
             for param_name in available_params:
                 if param_name in ['self', 'params', 'model', 'args', 'kwargs']: continue
                 if param_name in args_dict and args_dict[param_name] is not None:
-                    # (Type conversion logic remains the same as before)
                     expected_type = sig.parameters[param_name].annotation
                     default_value = sig.parameters[param_name].default
                     value = args_dict[param_name]
                     try:
-                        if expected_type == inspect.Parameter.empty: potential_kwargs[param_name] = value
-                        elif expected_type == bool: potential_kwargs[param_name] = bool(value)
-                        elif expected_type == int: potential_kwargs[param_name] = int(value)
-                        elif expected_type == float: potential_kwargs[param_name] = float(value)
-                        elif expected_type == str: potential_kwargs[param_name] = str(value)
+                        # <<< START TYPE CONVERSION FIX >>>
+                        converted_value = None
+                        if expected_type == inspect.Parameter.empty:
+                            # No type hint, try common types (float first for LR etc.)
+                            try: converted_value = float(value)
+                            except (ValueError, TypeError):
+                                 try: converted_value = int(value)
+                                 except (ValueError, TypeError):
+                                      if isinstance(value, str) and value.lower() in ['true', 'false']:
+                                           converted_value = value.lower() == 'true'
+                                      else: converted_value = value # Use as is if no conversion works
+                        elif expected_type == bool:
+                            converted_value = str(value).lower() == 'true' if isinstance(value, str) else bool(value)
+                        elif expected_type == int: converted_value = int(value)
+                        elif expected_type == float: converted_value = float(value) # Handles '1e-4' correctly
+                        elif expected_type == str: converted_value = str(value)
                         elif expected_type == tuple or expected_type == list or \
                              (hasattr(expected_type, '__origin__') and expected_type.__origin__ in [tuple, list]):
                             if isinstance(value, (list, tuple)):
-                                inner_type = float
+                                inner_type = float # Default inner type
                                 if hasattr(expected_type, '__args__') and expected_type.__args__: inner_type = expected_type.__args__[0]
                                 converted_list = [inner_type(v) for v in value]
-                                potential_kwargs[param_name] = tuple(converted_list) if expected_type == tuple or expected_type.__origin__ == tuple else converted_list
+                                converted_value = tuple(converted_list) if expected_type == tuple or expected_type.__origin__ == tuple else converted_list
                             else: print(f"Warning: Arg {param_name} expects {expected_type} but got {type(value)}. Skipping.")
-                        else: potential_kwargs[param_name] = value
+                        else: # Fallback for other types or Any
+                            converted_value = value
+                        # <<< END TYPE CONVERSION FIX >>>
+
+                        if converted_value is not None:
+                            potential_kwargs[param_name] = converted_value
+
                     except (ValueError, TypeError) as e_type:
                          print(f"Warning: Could not convert arg '{param_name}' (value: {value}) to expected type {expected_type}. Error: {e_type}. Using default or skipping.")
                          if default_value != inspect.Parameter.empty: potential_kwargs[param_name] = default_value
 
             print(f"  Instantiating {optimizer_class.__name__} with args: {potential_kwargs}")
-            # <<< Pass the correctly selected parameters >>>
             optimizer = optimizer_class(params_to_optimize, **potential_kwargs)
-
-            # Check if it's a schedule-free optimizer
-            if "schedulefree" in optimizer_name:
-                is_schedule_free = True
-                print("  Detected schedule-free optimizer.")
+            if "schedulefree" in optimizer_name: is_schedule_free = True; print("  Detected schedule-free optimizer.")
 
         except Exception as e:
-            print(f"ERROR: Failed to instantiate optimizer '{optimizer_name}' dynamically: {e}")
-            import traceback; traceback.print_exc()
-            print("  Falling back to AdamW.")
-            optimizer_name = 'adamw'
-            optimizer = None
-            is_schedule_free = False
+            print(f"ERROR: Failed to instantiate optimizer '{optimizer_name}' dynamically: {e}"); traceback.print_exc()
+            print("  Falling back to AdamW."); optimizer_name = 'adamw'; optimizer = None; is_schedule_free = False
 
     # --- Fallback / Default Optimizer ---
     if optimizer is None:
-        if optimizer_name != 'adamw':
-             print(f"Warning: Optimizer '{optimizer_name}' not found or failed. Falling back to AdamW.")
+        if optimizer_name != 'adamw': print(f"Warning: Optimizer '{optimizer_name}' failed. Falling back to AdamW.")
         optimizer_name = 'adamw'
-        # Use defaults from args for AdamW
-        adamw_kwargs = {
+        adamw_kwargs = { # Ensure these are floats
              'lr': float(getattr(args, 'lr', 1e-4)),
-             'betas': tuple(getattr(args, 'betas', (0.9, 0.999))),
+             'betas': tuple(getattr(args, 'betas', (0.9, 0.999))), # Assumes betas are already tuple/list
              'weight_decay': float(getattr(args, 'weight_decay', 0.0)),
              'eps': float(getattr(args, 'eps', 1e-8)),
         }
         print(f"Instantiating torch.optim.AdamW with args: {adamw_kwargs}")
-        # <<< Pass the correctly selected parameters >>>
-        optimizer = torch.optim.AdamW(params_to_optimize, **adamw_kwargs)
-        is_schedule_free = False
+        optimizer = torch.optim.AdamW(params_to_optimize, **adamw_kwargs); is_schedule_free = False
     # --- End Fallback ---
 
-    # --- Scheduler Setup ---
+    # --- Scheduler Setup (Ensure float conversion here too if needed) ---
     if not is_schedule_free:
-        # (Scheduler loading logic remains unchanged - operates on the created `optimizer`)
         scheduler_name = getattr(args, 'scheduler_name', 'CosineAnnealingLR').lower()
         print(f"Attempting to setup scheduler: {scheduler_name}")
         scheduler_class = None
@@ -546,37 +571,29 @@ def setup_optimizer_scheduler(args, model):
             scheduler_class = SCHEDULERS[scheduler_name]
             print(f"Found custom scheduler class: {scheduler_class.__name__}")
             try:
-                # (Inspect and gather kwargs logic remains the same)
-                sig = inspect.signature(scheduler_class.__init__)
-                available_params = sig.parameters.keys()
-                scheduler_kwargs = {}
-                args_dict = vars(args)
+                sig = inspect.signature(scheduler_class.__init__); available_params = sig.parameters.keys()
+                scheduler_kwargs = {}; args_dict = vars(args)
                 for param_name in available_params:
                     if param_name in ['self', 'optimizer', 'last_epoch', 'args', 'kwargs']: continue
-                    arg_key = f"scheduler_{param_name}"
+                    arg_key = f"scheduler_{param_name}" # Look for prefixed args
+                    if arg_key not in args_dict and param_name in args_dict: arg_key = param_name # Fallback to non-prefixed
                     if arg_key in args_dict and args_dict[arg_key] is not None:
-                        expected_type = sig.parameters[param_name].annotation
-                        default_value = sig.parameters[param_name].default
                         value = args_dict[arg_key]
+                        # <<< Add simplified float conversion here too >>>
                         try:
-                            # (Type conversion logic remains the same)
-                            if expected_type == inspect.Parameter.empty: scheduler_kwargs[param_name] = value
-                            elif expected_type == bool: scheduler_kwargs[param_name] = bool(value)
-                            elif expected_type == int: scheduler_kwargs[param_name] = int(value)
-                            elif expected_type == float: scheduler_kwargs[param_name] = float(value)
-                            elif expected_type == str: scheduler_kwargs[param_name] = str(value)
-                            else: scheduler_kwargs[param_name] = value
-                        except (ValueError, TypeError) as e_type:
-                             print(f"Warning: Could not convert scheduler arg '{param_name}' (value: {value}) to {expected_type}. Error: {e_type}. Using default or skipping.")
-                             if default_value != inspect.Parameter.empty: scheduler_kwargs[param_name] = default_value
-
+                            # Try float conversion first for common scheduler args
+                            scheduler_kwargs[param_name] = float(value)
+                        except (ValueError, TypeError):
+                             try: # Try int
+                                  scheduler_kwargs[param_name] = int(value)
+                             except (ValueError, TypeError):
+                                  try: # Try bool
+                                       if isinstance(value, str): scheduler_kwargs[param_name] = value.lower() == 'true'
+                                       else: scheduler_kwargs[param_name] = bool(value)
+                                  except: scheduler_kwargs[param_name] = value # Fallback
                 print(f"  Instantiating {scheduler_class.__name__} with args: {scheduler_kwargs}")
                 scheduler = scheduler_class(optimizer, **scheduler_kwargs)
-            except Exception as e:
-                 print(f"ERROR: Failed to instantiate custom scheduler '{scheduler_name}': {e}")
-                 print("  Falling back to standard PyTorch schedulers.")
-                 scheduler = None # Reset to trigger fallback
-
+            except Exception as e: print(f"ERROR: Failed custom scheduler '{scheduler_name}': {e}"); scheduler = None
         # --- Fallback to Standard PyTorch Schedulers ---
         if scheduler is None:
             scheduler_type = None
@@ -681,7 +698,7 @@ def load_checkpoint(args, model, optimizer, scheduler, scaler):
 # ================================================
 #        Main Training Loop (Epoch-Based)
 # ================================================
-# Version 3.5.2: Uses (loss / num_sub_batches).backward() for grad accum
+# Version 3.5.3: Corrected optimizer step logic and target shape for FocalLoss
 def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                train_loader, val_loader, wrapper, start_epoch, initial_global_step,
                enabled_amp, amp_dtype, is_schedule_free):
@@ -702,10 +719,9 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
     total_steps_to_run = args.max_train_steps
     total_epochs_to_run = args.num_train_epochs
     steps_per_epoch = args.steps_per_epoch
-    is_e2e = getattr(args, 'is_end_to_end', False)
-    # Use LOG_EVERY_N constant from utils.py if available, else default
-    log_every_n = getattr(args, 'log_every_n', 1) # Use 10 as default?
-    validate_every_n = getattr(args, 'validate_every_n', 50) # Use 150 as default?
+    is_e2e = False
+    log_every_n = getattr(args, 'log_every_n', 10) # Default changed to 10
+    validate_every_n = getattr(args, 'validate_every_n', 50) # Default changed to 50
 
     print(f"Starting training loop. Target Epochs: {total_epochs_to_run}, Target Steps: {total_steps_to_run}")
     print(f"Steps per epoch: {steps_per_epoch}. End-to-End Mode: {is_e2e}. Logging every {log_every_n} steps.")
@@ -716,7 +732,6 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
          best_eval_loss = wrapper.best_val_loss
          print(f"Retrieved best validation loss from wrapper: {best_eval_loss:.4e}")
 
-    # <<< INITIALIZE last_eval_loss_val HERE >>>
     last_eval_loss_val = float('nan')
 
     progress_bar = tqdm(initial=initial_global_step, total=total_steps_to_run, desc="Overall Training", unit="step", dynamic_ncols=True)
@@ -744,6 +759,7 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
             while step_in_epoch < steps_per_epoch:
                 if global_step >= total_steps_to_run: break
 
+                # --- Get Batch Data (Handles iterator restart) ---
                 try: batch_data = next(train_iterator)
                 except StopIteration:
                     train_iterator = iter(train_loader)
@@ -751,124 +767,119 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                     except StopIteration: print("ERROR: DataLoader empty after restart."); global_step = total_steps_to_run; break
                 except Exception as e_iter: print(f"\nError getting batch data: {e_iter}"); global_step = total_steps_to_run; break
 
+                # --- Skip initial steps if resuming ---
                 if global_step < initial_global_step:
-                    global_step += 1; progress_bar.update(1); continue
+                    # Need to increment conceptual step counter too if skipping
+                    step_in_epoch += 1
+                    global_step += 1
+                    progress_bar.update(1); continue
 
+                # --- Validate Batch Data ---
                 if batch_data is None or not batch_data:
                     print(f"Warning: Skipping step {global_step} due to invalid batch_data.")
-                    global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                    # Increment conceptual step even if skipping
+                    step_in_epoch += 1; global_step += 1; progress_bar.update(1); continue
 
+                # --- Handle List vs Dict Batch ---
                 if isinstance(batch_data, dict): batch_data_list = [batch_data]
                 elif isinstance(batch_data, list): batch_data_list = batch_data
                 else:
                      print(f"Warning: Unexpected batch_data type {type(batch_data)} at step {global_step}. Skipping.")
-                     global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                     step_in_epoch += 1; global_step += 1; progress_bar.update(1); continue
 
-                optimizer_stepped = False # Initialize for this conceptual batch
-                try:
-                    # <<< --- ADD GRADIENT CLIPPING --- >>>
-                    # Unscale the gradients before clipping
-                    scaler.unscale_(optimizer)
-
-                    # Clip the norm of the gradients
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                                               max_norm=1.0)  # Example: max_norm=1.0
-
-                    # Log grad_norm if desired (helps monitor clipping)
-                    if wrapper.wandb_run and global_step % log_every_n == 0:  # Log at the same frequency as loss
-                        try:
-                            wrapper.wandb_run.log({"train/grad_norm": grad_norm.item()}, step=global_step)
-                        except Exception as e_gn:
-                            print(f"Wandb grad_norm log error: {e_gn}")
-                    # <<< --- END GRADIENT CLIPPING --- >>>
-
-                    # Scaler step will skip update if gradients are invalid (NaN/Inf)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer_stepped = True
-                except Exception as e_step:
-                    print(f"\nError during optimizer step {global_step}: {e_step}")
-                    traceback.print_exc()
-                    optimizer_stepped = False
-                # <<< Zero gradients AFTER stepping >>>
-                optimizer.zero_grad(set_to_none=True)
-
+                # --- Process Sub-batches for one Optimizer Step ---
                 processed_samples_in_step = 0
                 minibatch_losses = []
                 num_sub_batches = len(batch_data_list)
-                if num_sub_batches == 0: # Should be caught earlier, but safety check
+                if num_sub_batches == 0: # Safety check
                     print(f"Warning: Empty batch_data_list at step {global_step}. Skipping.")
-                    global_step += 1; step_in_epoch += 1; progress_bar.update(1); continue
+                    step_in_epoch += 1; global_step += 1; progress_bar.update(1); continue
 
                 # --- Innermost Loop: Iterate through Mini-Batches ---
                 for sub_batch in batch_data_list:
                     loss = torch.tensor(float('nan'), device=TARGET_DEV)
                     try:
+                        # Ensure model is in train mode (might be redundant, but safe)
                         if not model.training: model.train()
                         if hasattr(optimizer, 'train') and callable(optimizer.train): optimizer.train()
 
+                        # --- Get Data ---
                         target_val_from_sub_batch = sub_batch.get("label" if is_e2e else "val")
+                        if target_val_from_sub_batch is None:
+                            print(f"Warning: Missing target ('label' or 'val') in sub-batch at step {global_step}. Skipping sub-batch.")
+                            continue
+
+                        # --- Get Data (Embedding Mode Only) ---
+                        target_val_from_sub_batch = sub_batch.get("val") # <<< Use "val" directly
                         if target_val_from_sub_batch is None: continue
 
-                        model_input_dict = {}; emb_input = None; current_sub_batch_size = 0
-                        if is_e2e:
-                            pixel_values = sub_batch.get("pixel_values")
-                            if pixel_values is None: continue
-                            model_input_dict["pixel_values"] = pixel_values.to(TARGET_DEV)
-                            current_sub_batch_size = pixel_values.size(0)
-                        else:
-                            emb_input = sub_batch.get("emb")
-                            if emb_input is None: continue
-                            emb_input = emb_input.to(TARGET_DEV); current_sub_batch_size = emb_input.size(0)
+                        emb_input = sub_batch.get("emb") # <<< Use "emb" directly
+                        if emb_input is None: continue
+                        model_input = emb_input.to(TARGET_DEV)
+                        current_sub_batch_size = emb_input.size(0)
+                        # --- End Get Data ---
 
-                        try: # Prepare target tensor
-                            if args.num_classes == 1: target = target_val_from_sub_batch.to(TARGET_DEV, dtype=torch.float32)
-                            else: target = target_val_from_sub_batch.to(TARGET_DEV, dtype=torch.long)
-                            if target.shape[0] != current_sub_batch_size: target = target.view(current_sub_batch_size, -1).squeeze()
+                        # --- Prepare Target Tensor (Corrected) ---
+                        target = None
+                        try:
+                            if args.num_classes == 1:
+                                target = target_val_from_sub_batch.to(TARGET_DEV, dtype=torch.float32).view(-1) # Float & 1D
+                            else: # num_classes > 1
+                                target = target_val_from_sub_batch.to(TARGET_DEV, dtype=torch.long).view(-1) # Long & 1D
                             if target.shape[0] != current_sub_batch_size: raise ValueError("Target shape mismatch")
                         except Exception as e_target: print(f"Error processing target: {e_target}"); continue
+                        # --- End Prepare Target ---
 
                         # --- Sub-Batch Forward/Backward ---
                         with torch.amp.autocast(device_type=TARGET_DEV, enabled=enabled_amp, dtype=amp_dtype):
-                            if is_e2e: y_pred = model(**model_input_dict)
-                            else: y_pred = model(emb_input)
+                            y_pred = model(model_input) # <<< Direct model call for embeddings
 
+                            # Prepare prediction for loss function
                             y_pred_for_loss = y_pred
                             if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and args.num_classes == 1:
                                 if y_pred.ndim > 1 and y_pred.shape[1] == 1: y_pred_for_loss = y_pred.squeeze(-1)
 
                             loss_input = y_pred_for_loss.to(torch.float32)
-                            target_for_loss = target.to(loss_input.device)
+                            target_for_loss = target.to(loss_input.device) # Target already has correct dtype/shape
 
-                            if isinstance(criterion, nn.NLLLoss): loss_input = F.log_softmax(loss_input.unsqueeze(0), dim=-1).squeeze(0) # Check NLLLoss input shape requirements
+                            # Apply LogSoftmax manually if NLLLoss is used with linear output
+                            if isinstance(criterion, nn.NLLLoss) and getattr(args, 'output_mode', 'linear') == 'linear':
+                                loss_input = F.log_softmax(loss_input, dim=-1)
 
-                            loss = criterion(loss_input, target_for_loss.long() if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)) else target_for_loss.float())
+                            # Calculate Loss (using correct target dtype based on criterion instance)
+                            loss = criterion(loss_input, target_for_loss)
 
-                        if torch.isnan(loss) or torch.isinf(loss): loss = None
+                        # --- Accumulate Gradient ---
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"Warning: NaN/Inf loss detected in sub-batch at step {global_step}. Skipping backward.")
+                            loss = None
                         else:
                             minibatch_losses.append(loss.detach()) # Log detached loss
                             processed_samples_in_step += current_sub_batch_size
-                            # <<< Gradient Accumulation by averaging loss before backward >>>
+                            # Scale loss for accumulation and perform backward pass
                             scaler.scale(loss / num_sub_batches).backward()
-                            # <<< End Change >>>
 
                     except Exception as e:
                         print(f"\nError processing sub-batch step {global_step}: {e}")
-                        traceback.print_exc(); continue
-                # --- End Innermost Loop ---
+                        traceback.print_exc(); continue # Continue to next sub-batch
+                # --- End Innermost Loop (Sub-batches) ---
 
-                # --- Optimizer Step ---
+                # --- Optimizer Step (Corrected - manual unscale/clip removed) ---
+                optimizer_stepped = False
                 if processed_samples_in_step > 0:
                     try:
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer_stepped = True
-                    except Exception as e_optim: print(f"\nError optimizer step {global_step}: {e_optim}")
-                else:
-                    print(f"Warning: No samples processed for step {global_step}. Skipping optimizer step.")
-                    optimizer.zero_grad(set_to_none=True) # Still zero grads
+                    except Exception as e_optim: print(f"\nError optimizer step {global_step}: {e_optim}"); traceback.print_exc()
+                else: print(f"Warning: No samples processed step {global_step}. Skipping optimizer step.")
+
+                # Zero gradients AFTER the step
+                optimizer.zero_grad(set_to_none=True)
+                # --- End Optimizer Step ---
 
                 # --- Scheduler Step ---
+                # Step scheduler only if optimizer took a step
                 if scheduler is not None and not is_schedule_free and optimizer_stepped:
                      try: scheduler.step()
                      except Exception as e_sched: print(f"Warning: Error scheduler step: {e_sched}")
@@ -877,21 +888,25 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                 if minibatch_losses:
                      avg_step_loss = torch.mean(torch.stack(minibatch_losses)).item()
                      if not math.isnan(avg_step_loss):
-                         accumulated_loss_for_log += avg_step_loss; accumulation_steps_for_log += 1
+                         accumulated_loss_for_log += avg_step_loss
+                         accumulation_steps_for_log += 1
 
                 # --- Update Counters & Logging/Saving ---
-                global_step += 1; step_in_epoch += 1; progress_bar.update(1); wrapper.update_step(global_step)
+                # Increment conceptual step counter REGARDLESS of processing success
+                # This ensures the loop eventually finishes steps_per_epoch
+                step_in_epoch += 1
+                # Increment global step only if we intended to process this step (i.e., not skipping resume steps)
+                # The optimizer step logic handles skipping if no samples were processed.
+                global_step += 1
+                progress_bar.update(1)
+                wrapper.update_step(global_step)
 
                 # --- Frequent Logging & Postfix Update ---
-                if global_step % log_every_n == 0 and global_step > 0:
-                    avg_loss_value_log = float('nan')
-                    if accumulation_steps_for_log > 0:
-                        avg_loss_value_log = (accumulated_loss_for_log / accumulation_steps_for_log).item()
+                if global_step % log_every_n == 0 and global_step > initial_global_step:
+                    avg_loss_value_log = (accumulated_loss_for_log / accumulation_steps_for_log).item() if accumulation_steps_for_log > 0 else float('nan')
                     accumulated_loss_for_log.zero_(); accumulation_steps_for_log = 0
 
-                    # Call log_main to log to WandB/CSV and update internal state
-                    # Pass the last known eval loss
-                    wrapper.log_main(step=global_step, train_loss_batch=avg_loss_value_log, eval_loss=last_eval_loss_val)
+                    wrapper.log_main(step=global_step, current_train_loss=avg_loss_value_log, current_val_loss=last_eval_loss_val)
 
                     # Update Progress Bar Postfix
                     lr = optimizer.param_groups[0]['lr']
@@ -905,18 +920,26 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                     progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False) # Use ordered_dict arg
 
                 # --- Less Frequent Validation & Best Model Saving ---
-                if global_step % validate_every_n == 0 and global_step > 0:
-                    print(f"\n--- Running Validation @ Step {global_step} ---") # Indicate validation start
+                # <<< Use run_validation_embeddings for embedding mode >>>
+                if global_step % validate_every_n == 0 and global_step > initial_global_step:
+                    print(f"\n--- Running Validation @ Step {global_step} ---")
                     eval_loss_val = float('nan')
                     if val_loader:
-                        eval_loss_val = wrapper.evaluate_on_validation_set(val_loader, args)
-                        last_eval_loss_val = eval_loss_val # Update last known eval loss
-                        if not model.training: model.train()
+                        # <<< CHOOSE VALIDATION FUNCTION BASED ON MODE >>>
+                        if is_e2e:
+                             # Assuming run_validation_e2e exists and takes similar args
+                             # eval_loss_val = run_validation_e2e(model, val_loader, criterion, TARGET_DEV, scaler, args.num_classes)
+                             print("Placeholder: E2E Validation needed here.") # Replace with actual call
+                        else: # Embedding mode
+                             eval_loss_val = run_validation_embeddings(model, val_loader, criterion, TARGET_DEV, scaler) # <<< USE THIS ONE >>>
 
-                    # Log validation loss specifically (if using WandB etc)
+                        last_eval_loss_val = eval_loss_val # Update last known eval loss
+                        if not model.training: model.train() # Ensure back in train mode
+
+                    # Log validation loss specifically
                     if wrapper.wandb_run and not math.isnan(eval_loss_val):
-                         try: wrapper.wandb_run.log({"eval/loss": eval_loss_val}, step=global_step)
-                         except Exception as e: print(f"Wandb eval log error: {e}")
+                        try: wrapper.wandb_run.log({"eval/loss": eval_loss_val}, step=global_step)
+                        except Exception as e: print(f"Wandb eval log error: {e}")
 
                     if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Step {global_step}.")
                     else: print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_val:.4e} ---")
@@ -943,11 +966,35 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
 # ================================================
 #        Main Execution Block (Updated)
 # ================================================
-# Version 2.3.0: Updated main execution flow
+# Version 2.4.0: Updated main execution flow
 def main():
     """Main function to run the training process."""
-    # 1. Load base config from YAML + CMD overrides
-    args = parse_and_load_args() # Should now contain is_end_to_end and relevant params
+
+    # <<< NEW: Parse command-line arguments FIRST >>>
+    parser = argparse.ArgumentParser(description="Train PredictorModel on embeddings.")
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to the YAML configuration file.')
+    # Add any other command-line overrides if needed (e.g., --resume, --data_root)
+    # parser.add_argument('--resume', type=str, default=None, help='Override resume path.')
+    cmd_args = parser.parse_args()
+    # <<< END NEW >>>
+
+    # 1. Load config using the path from command line
+    # <<< Pass the config path to the function >>>
+    try:
+        args = parse_and_load_args(config_path=cmd_args.config)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error loading config: {e}")
+        exit(1)
+    # <<< END Pass >>>
+
+    # --- Optional: Merge command-line overrides if you added any ---
+    # Example:
+    # if cmd_args.resume is not None:
+    #     print(f"Overriding resume path with command-line arg: {cmd_args.resume}")
+    #     args.resume = cmd_args.resume
+    # --- End Overrides ---
+
     print(f"Target device: {TARGET_DEV}")
 
     # Set seed AFTER parsing args

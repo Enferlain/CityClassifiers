@@ -19,11 +19,11 @@ LOSS_MEMORY = 500 # How many recent steps' training loss to average for display
 SAVE_FOLDER = "models" # Folder to save models and configs
 
 
-# Version 3.1.0: Always load base_vision_model and embed_ver for inference needs.
+# Version 3.1.1: More flexible parsing for embeddings mode
 def parse_and_load_args(config_path: str):
     """
     Loads configuration SOLELY from a YAML file.
-    Ensures base_vision_model is always loaded for inference compatibility.
+    Handles different data modes flexibly.
     """
     if not os.path.isfile(config_path):
          raise FileNotFoundError(f"Config file '{config_path}' not found.")
@@ -36,72 +36,76 @@ def parse_and_load_args(config_path: str):
     args = argparse.Namespace()
     args.config_path = config_path # Store config path for reference
 
-    # --- Helper to get required value from nested dict ---
+    # --- Helper to get optional value ---
+    # (Assuming get_optional_config and get_required_config are defined above this function in utils.py)
+    # Make sure these helpers exist in your utils.py!
     def get_required_config(key_path, config_dict):
         keys = key_path.split('.')
         value = config_dict
         try:
-            for key in keys:
-                value = value[key]
-            if value is None: raise KeyError # Treat None as missing for required keys
+            for key in keys: value = value[key]
+            if value is None: raise KeyError
             return value
         except (KeyError, TypeError):
-             raise ValueError(f"Missing required configuration key: '{key_path}' in {config_path}")
+             raise ValueError(f"Missing required config key: '{key_path}' in {config_path}")
 
-    # --- Helper to get optional value ---
     def get_optional_config(key_path, config_dict, default=None):
-         keys = key_path.split('.')
-         value = config_dict
+         keys = key_path.split('.'); value = config_dict
          try:
              for key in keys: value = value[key]
-             # Return default if YAML value is explicitly None, otherwise return YAML value
              return default if value is None else value
-         except (KeyError, TypeError):
-             return default # Return default if key path doesn't exist
+         except (KeyError, TypeError): return default
+    # --- End Helpers ---
 
-    # --- Load Common / Top-Level Settings (no changes here) ---
+    # --- Load Common / Top-Level Settings ---
     args.data_root = get_optional_config("data_root", conf, default="data")
     args.wandb_project = get_optional_config("wandb_project", conf, default="city-classifiers")
     args.resume = get_optional_config("resume", conf, default=None)
-
-    # --- Load Model Info (ALWAYS Load These Keys) ---
     args.base = get_required_config("model.base", conf)
     args.rev = get_required_config("model.rev", conf)
     args.arch = get_optional_config("model.arch", conf, default="class")
     args.name = f"{args.base}-{args.rev}"
-    # <<< --- ALWAYS LOAD these for inference compatibility --- >>>
     args.base_vision_model = get_required_config("model.base_vision_model", conf)
-    args.embed_ver = get_optional_config("model.embed_ver", conf) # Optional, but useful context
-    # <<< --- END ALWAYS LOAD --- >>>
+    args.embed_ver = get_optional_config("model.embed_ver", conf)
 
     # --- Load Data Mode ---
-    args.data_mode = get_required_config("data.mode", conf) # e.g., 'embeddings', 'features', 'images'
+    args.data_mode = get_required_config("data.mode", conf)
 
     # --- Mode-Specific Loading ---
-    # (These sections now only load params SPECIFIC to that mode's training)
     if args.data_mode == 'embeddings':
         print("DEBUG: Loading config for EMBEDDINGS mode...")
         args.is_end_to_end = False
-        if not args.embed_ver:  # embed_ver is essential for this mode
-            raise ValueError("Config Error: 'model.embed_ver' must be specified for embeddings mode.")
-        try:
+        if not args.embed_ver: raise ValueError("Config Error: 'model.embed_ver' must be specified.")
+        try: # Get input features for the head
             embed_params = get_embed_params(args.embed_ver)
-        except ValueError as e:
-            raise ValueError(f"Config Error: {e}") from e
-        args.features = embed_params['features']  # Input features for PredictorModel
-        default_hidden = embed_params.get('hidden', 1280)
+            args.features = embed_params['features']
+        except ValueError as e: raise ValueError(f"Config Error: {e}") from e
         args.preload_data = get_optional_config("train.preload_data", conf, default=True)
 
-        # Load PredictorModel params (these define the trainable head for this mode)
+        # <<< MODIFICATION START: Load BOTH param sets if they exist, but don't REQUIRE either >>>
         predictor_conf = get_optional_config("predictor_params", conf, default={})
-        args.hidden_dim = predictor_conf.get("hidden_dim", default_hidden)
-        args.use_attention = predictor_conf.get("use_attention", True)
-        args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
-        args.attn_dropout = predictor_conf.get("attn_dropout", 0.1)
-        args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
-        args.dropout_rate = predictor_conf.get("dropout_rate", 0.1)
-        # Output mode is REQUIRED for the predictor model
-        args.output_mode = get_required_config("predictor_params.output_mode", conf)
+        if predictor_conf:
+             print("DEBUG: Found predictor_params section.")
+             default_hidden_pred = embed_params.get('hidden', 1280); args.hidden_dim = predictor_conf.get("hidden_dim", default_hidden_pred)
+             args.use_attention = predictor_conf.get("use_attention", True); args.num_attn_heads = predictor_conf.get("num_attn_heads", 8)
+             args.attn_dropout = predictor_conf.get("attn_dropout", 0.1); args.num_res_blocks = predictor_conf.get("num_res_blocks", 1)
+             args.dropout_rate = predictor_conf.get("dropout_rate", 0.1); args.output_mode = predictor_conf.get("output_mode")
+
+        head_conf = get_optional_config("head_params", conf, default={})
+        if head_conf:
+             print("DEBUG: Found head_params section.")
+             args.head_features = head_conf.get("features")
+             if args.head_features and args.head_features != args.features: args.features = args.head_features
+             elif not hasattr(args, 'features'): exit("Error: Cannot determine input features for HeadModel.")
+             args.head_hidden_dim = head_conf.get("hidden_dim", 1024); args.pooling_strategy = head_conf.get("pooling_strategy", 'none')
+             args.head_num_res_blocks = head_conf.get("num_res_blocks", 3); args.head_dropout_rate = head_conf.get("dropout_rate", 0.1)
+             args.head_output_mode = head_conf.get("output_mode")
+             attn_conf = get_optional_config("attn_pool_params", conf, default={})
+             args.attn_pool_heads = attn_conf.get("attn_pool_heads", 16); args.attn_pool_dropout = attn_conf.get("attn_pool_dropout", 0.1)
+
+        if not getattr(args, 'output_mode', None) and not getattr(args, 'head_output_mode', None):
+             exit("Config Error: Missing 'output_mode' in 'predictor_params' OR 'head_params' section for embeddings mode.")
+        # <<< MODIFICATION END >>>
 
     elif args.data_mode == 'features':
         print("DEBUG: Loading config for FEATURES mode...")
@@ -173,11 +177,12 @@ def parse_and_load_args(config_path: str):
     args.save_full_model = get_optional_config("save_full_model", train_conf, default=False)
     args.log_every_n = get_optional_config("log_every_n", train_conf, default=50)
     args.validate_every_n = get_optional_config("validate_every_n", train_conf, default=0)
-    # Copy ALL OTHER keys from train_conf
+    # Load ALL OTHER keys from train_conf into args
     known_train_keys = {'lr', 'batch', 'loss_function', 'optimizer', 'betas', 'eps',
                         'weight_decay', 'max_train_epochs', 'max_train_steps', 'precision',
                         'nsave', 'seed', 'num_workers', 'preload_data', 'save_full_model',
-                        'log_every_n', 'validate_every_n'}
+                        'log_every_n', 'validate_every_n', 'gradient_accumulation_steps',
+                        'train_drop_last', 'prefetch_factor'} # Add any other known keys used by loader/trainer
     for key, value in train_conf.items():
          if isinstance(value, list): value = tuple(value)
          if key not in known_train_keys and not hasattr(args, key) and value is not None:
@@ -212,11 +217,13 @@ def parse_and_load_args(config_path: str):
     if args.arch == "class" and args.loss_function is None: args.loss_function = 'focal'
     if args.max_train_epochs is None and args.max_train_steps is None: args.max_train_steps = 10000 # Default steps
 
-
-    # Validate output modes were set for relevant modes
-    if args.data_mode == 'embeddings' and not hasattr(args, 'output_mode'): raise ValueError("Missing predictor_params.output_mode for embeddings mode.")
-    if args.data_mode == 'features' and not hasattr(args, 'head_output_mode'): raise ValueError("Missing head_params.output_mode for features mode.")
-    if args.data_mode == 'images' and not hasattr(args, 'head_output_mode'): raise ValueError("Missing head_params.output_mode for images (E2E) mode.")
+    # Final check that *some* output mode was defined based on loaded params
+    if args.data_mode == 'embeddings' and not getattr(args, 'output_mode', None) and not getattr(args, 'head_output_mode', None):
+         exit("Config Error: Missing 'output_mode' in EITHER 'predictor_params' OR 'head_params' section for embeddings mode.")
+    if args.data_mode == 'features' and not getattr(args, 'head_output_mode', None):
+         exit("Config Error: Missing 'head_output_mode' in 'head_params' for features mode.")
+    if args.data_mode == 'images' and not getattr(args, 'head_output_mode', None):
+         exit("Config Error: Missing 'head_output_mode' in 'head_params' for images mode.")
 
     return args
 # --- End Argument Parsing ---
@@ -256,13 +263,14 @@ def get_embed_params(ver):
         "siglip2_so400m_patch16_512_CenterCrop": {"features": 1152, "hidden": 1280},
         # Final NaFlex version using Processor Logic @ 1024
         "siglip2_so400m_patch16_naflex_Naflex_Proc1024": {"features": 1152, "hidden": 1280},
+        "siglip2_so400m_patch16_naflex_Naflex_Proc2048": {"features": 1152, "hidden": 1280},
         # (Can comment out or remove older/unused NaFlex keys if desired)
         # "siglip2_so400m_patch16_naflex_NaflexResize": {"features": 1152, "hidden": 1280},
         # "siglip2_so400m_patch16_naflex_NaflexResize_Pad1024": {"features": 1152, "hidden": 1280},
         # "siglip2_so400m_patch16_naflex_AvgCrop": {"features": 1152, "hidden": 1280},
         # "siglip2_so400m_patch16_naflex_FitPad": {"features": 1152, "hidden": 1280},
         # "siglip2_so400m_patch16_naflex_CenterCrop": {"features": 1152, "hidden": 1280},
-
+        "apple_aimv2_large_patch14_native_AIMv2CLS": {"features": 1024, "hidden": 1280},
         # --- DINOv2 ---
         # Assumes FitPad preprocessing was used for generation
         "fb_dinov2_giant_FitPad": {"features": 1536, "hidden": 1280}, # ViT-Giant

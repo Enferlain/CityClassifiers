@@ -760,15 +760,15 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                     try:
                         # <<< --- ADD GRADIENT CLIPPING --- >>>
                         # Unscale the gradients before clipping
-                        scaler.unscale_(optimizer)
+                        # scaler.unscale_(optimizer)
 
                         # Clip the norm of the gradients
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Example: max_norm=1.0
+                        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Example: max_norm=1.0
 
                         # Log grad_norm if desired (helps monitor clipping)
-                        if wrapper.wandb_run and global_step % log_every_n == 0: # Log at the same frequency as loss
-                             try: wrapper.wandb_run.log({"train/grad_norm": grad_norm.item()}, step=global_step)
-                             except Exception as e_gn: print(f"Wandb grad_norm log error: {e_gn}")
+                        # if wrapper.wandb_run and global_step % log_every_n == 0: # Log at the same frequency as loss
+                        #      try: wrapper.wandb_run.log({"train/grad_norm": grad_norm.item()}, step=global_step)
+                        #      except Exception as e_gn: print(f"Wandb grad_norm log error: {e_gn}")
 
                         # Scaler step will skip update if gradients are invalid (NaN/Inf)
                         scaler.step(optimizer)

@@ -4,55 +4,52 @@
 # (Used for naming output files/runs)
 model:
   base: "AnatomyFlaws"
-  rev: "v10.5_adoptaosf_bce_AIMv2Native_3000" # New revision indicating feature mode
+  rev: "v11.3_adabelief_focal_AIMv2Native_3000" # New revision indicating feature mode
   arch: class                      # Still a classification task
-  num_classes: 1
+  num_classes: 2
   base_vision_model: "apple/aimv2-large-patch14-native"
+  embed_ver: "apple_aimv2_large_patch14_native_AIMv2CLS"
 # --- Data Configuration ---
 data:
-  mode: features                   # <<< Crucial: Set mode to 'features' >>>
+  mode: embeddings                   # <<< Crucial: Set mode to 'features' >>>
   data_root: ./data                # Root location for data folders
   # <<< Name of the subfolder containing the generated .npz features >>>
-  feature_dir_name: "aimv2_large_patch14_native_SeqFeatures_fp16"
-
+  feature_dir_name: "apple_aimv2_large_patch14_native_AIMv2CLS"
   # <<< Validation split count (applied to feature file list) >>>
   val_split_count: 300
 
 # --- Head Model Parameters ---
 # (Defines the HeadModel structure in head_model.py)
-head_params:
+predictor_params:
   features: 1024                   # <<< Input features from AIMv2 base (MUST MATCH features) >>>
   pooling_strategy: 'attn'         # Pooling strategy ('attn', 'avg', 'none') for HeadModel input sequences
-  hidden_dim: 1024                 # Hidden dimension for the MLP head
+  hidden_dim: 1280                 # Hidden dimension for the MLP head
   num_res_blocks: 3                # Number of ResBlocks in the head
-  dropout_rate: 0.3              # Dropout rate within the head
-  output_mode: linear             # <<< Output mode for the head
-
-# --- Attention Pooling Parameters (Only if head_params.pooling_strategy='attn') ---
-attn_pool_params:
+  dropout_rate: 0.3                # Dropout rate within the head
   attn_pool_heads: 16              # Heads for the Attention Pooling layer in HeadModel
   attn_pool_dropout: 0.3         # Dropout for the Attention Pooling layer
+  output_mode: sigmoid             # <<< Output mode for the head
 
 # --- Training Parameters ---
 train:
   # --- Training Duration ---
   # (Adjust based on faster training speed - maybe more steps/epochs feasible now?)
-  # max_train_steps: 2000            # Example: 5k steps (adjust as needed)
-  max_train_epochs: 80           # Can alternatively specify epochs
+  max_train_steps: 50000            # Example: 5k steps (adjust as needed)
+  # max_train_epochs: 80           # Can alternatively specify epochs
 
   # --- Core Settings ---
   # (Can likely use a higher LR now since only training head)
   lr: 1e-4                         # <<< Increased LR from E2E example >>>
   batch: 128                        # <<< Increase batch size significantly - head is small! >>>
   gradient_accumulation_steps: 1   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
-  precision: "bf16"                # Mixed precision for training head
+  precision: "fp32"                # Mixed precision for training head
 
   # --- Loss Function ---
-  loss_function: "bce"
+  loss_function: "focal"
   focal_loss_gamma: 2.0
 
   # --- Optimizer ---
-  optimizer: "ADOPTAOScheduleFree"
+  optimizer: "adabelief" # "ADOPTAOScheduleFree"
   # -- Optimizer Hyperparameters --
   betas: [0.9, 0.999]
   eps: 1e-8
@@ -68,24 +65,24 @@ train:
   adaptive_clip_eps: 1e-3    # Epsilon for adaptive clipping
 
   # --- Scheduler ---
-  scheduler_name: "none" # "RexAnnealingWarmRestarts"
+  scheduler_name: "RexAnnealingWarmRestarts"
   # -- Scheduler Arguments --
-  # scheduler_gamma: 0.95
-  # scheduler_cycle_multiplier: 1.0
+  scheduler_gamma: 0.95
+  scheduler_cycle_multiplier: 1.0
   # <<< Adjust first cycle steps to match max_train_steps >>>
-  # scheduler_first_cycle_max_steps: 500
-  # scheduler_min_lr: 1e-7
+  scheduler_first_cycle_max_steps: 5000
+  scheduler_min_lr: 1e-7
   # <<< Adjust warmup steps relative to new steps/epoch (batch 64) >>>
   # If Steps/Epoch ≈ (2400 samples / 64 batch) ≈ 38 steps... maybe 50-100 warmup steps?
-  # scheduler_warmup_steps: 100
+  scheduler_warmup_steps: 200
 
   # --- Data & Other ---
   seed: -1
-  num_workers: 4                   # <<< Can use more workers now for loading NPZ >>>
+  num_workers: 0                   # <<< Can use more workers now for loading NPZ >>>
   # preload_data: false            # Not applicable/needed for features mode
   nsave: 1000                      # Periodic save frequency
   log_every_n: 10                  # Log training metrics frequency
-  validate_every_n: 19            # Validation frequency (adjust based on steps/epoch)
+  validate_every_n: 100            # Validation frequency (adjust based on steps/epoch)
   save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
 
 # --- Labels ---
