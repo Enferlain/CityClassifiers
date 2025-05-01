@@ -189,9 +189,10 @@ def init_vision_model(model_name, device, dtype):
         # Keep it for SigLIP/DINOv2 FitPad/CenterCrop modes
         print(f"  DEBUG: Original processor config: {processor}")
         # Check if these attributes exist before trying to set them
-        if hasattr(processor, 'do_resize'): processor.do_resize = False
+        if hasattr(processor, 'do_resize'): processor.do_resize = True
         if hasattr(processor, 'do_center_crop'): processor.do_center_crop = False
         if hasattr(processor, 'do_normalize'): processor.do_normalize = True # Keep normalize ON for processor use
+
         print(f"  DEBUG: Modified processor config (for manual modes): {processor}")
 
         # --- Determine Model Input Size ---
@@ -271,97 +272,18 @@ def get_embedding(
             # <<< ADDED: Check for AIMv2Model name >>>
             is_aimv2_model = "AIMv2Model" in model.__class__.__name__
 
-            # --- HF NaFlex Mode (WITH MANUAL PRE-RESIZING) ---
+            # --- HF NaFlex Mode (SigLIP Processor Logic @ 1024) ---
             if is_siglip_model and preprocess_mode == 'naflex_resize':
-                print(f"DEBUG get_embedding [HF/NaFlex]: Using max_num_patches={naflex_max_patches} with MANUAL PRE-RESIZE.")
-                # <<< START MANUAL PRE-RESIZING (Similar to AIMv2 logic but patch_size=16) >>>
-                try:
-                    original_width, original_height = raw_img_pil.size
-                    if original_width <= 0 or original_height <= 0: raise ValueError("Invalid image dimensions")
-
-                    patch_size = SIGLIP_NAFLEX_PATCH_SIZE # Use 16 for SigLIP
-                    target_patches = naflex_max_patches
-
-                    patches_w_initial = math.floor(original_width / patch_size)
-                    patches_h_initial = math.floor(original_height / patch_size)
-                    total_patches_initial = patches_w_initial * patches_h_initial
-
-                    if total_patches_initial > target_patches:
-                        scale_factor = math.sqrt(target_patches / total_patches_initial)
-                        resize_needed = True; max_iterations = 10; iterations = 0
-                        target_w = original_width; target_h = original_height # Keep track of target dims
-                        while iterations < max_iterations:
-                             target_w_f = original_width * scale_factor; target_h_f = original_height * scale_factor
-                             # Floor dimensions to be MULTIPLES of patch_size
-                             target_w = math.floor(target_w_f / patch_size) * patch_size
-                             target_h = math.floor(target_h_f / patch_size) * patch_size
-                             if target_w == 0: target_w = patch_size
-                             if target_h == 0: target_h = patch_size
-                             new_patches = (target_w // patch_size) * (target_h // patch_size)
-
-                             if new_patches <= target_patches:
-                                 print(f"  - INFO: Pre-Resizing {img_name} ({original_width}x{original_height}) -> ({target_w}x{target_h}) for SigLIP NaFlex.")
-                                 img_to_process = raw_img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                                 resize_needed = False; break
-                             scale_factor *= 0.995; iterations += 1
-                        if resize_needed:
-                            print(f"  Warning: Could not find suitable resize for {img_name}. Using original (might error).")
-                            img_to_process = raw_img_pil # Fallback, likely will error later if too big
-                    else: # Image already fits patch limit, just ensure dims are multiples of patch_size
-                        current_w, current_h = img_to_process.size
-                        target_w = math.floor(current_w / patch_size) * patch_size
-                        target_h = math.floor(current_h / patch_size) * patch_size
-                        if target_w == 0: target_w = patch_size
-                        if target_h == 0: target_h = patch_size
-                        if target_w != current_w or target_h != current_h:
-                             print(f"  - INFO: Adjusting {img_name} dims ({current_w}x{current_h}) -> ({target_w}x{target_h}) for patch divisibility.")
-                             img_to_process = img_to_process.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                except Exception as e_resize: print(f"\nError during SigLIP pre-resizing: {e_resize}"); return None
-                # <<< END MANUAL PRE-RESIZING >>>
-
-                # Now call the processor with the pre-resized image
-                try:
-                    # Pass max_num_patches still, processor might use it for padding limit?
-                    inputs = processor(images=[img_to_process], return_tensors="pt", max_num_patches=naflex_max_patches)
-                except Exception as e_proc: print(f"\nError processor call: {e_proc}"); return None
-
-                # --- Get outputs, noting pixel_values is PADDED ---
-                pixel_values_padded = inputs.get("pixel_values").to(device=device, dtype=dtype) # Shape [B, max_num_patches, F_flat]
-                # processor_mask = inputs.get("pixel_attention_mask") # Ignore this
-                spatial_shapes = inputs.get("spatial_shapes").to(device=device) # Actual shapes
-
-                # --- Calculate actual patches and create correct mask ---
-                batch_size = spatial_shapes.shape[0]
-                actual_num_patches = spatial_shapes[0, 0] * spatial_shapes[0, 1]
-                correct_attention_mask = torch.ones((batch_size, actual_num_patches), dtype=torch.long, device=device)
-
-                # --- FIX: Un-pad pixel_values ---
-                # Take only the first 'actual_num_patches' from the padded tensor
-                pixel_values_unpadded = pixel_values_padded[:, :actual_num_patches, :] # Shape [B, actual_num_patches, F_flat]
-                print(f"DEBUG: Unpadded pixel_values shape: {pixel_values_unpadded.shape}")
-                # --- END FIX ---
-
-                # Pass UNPADDED pixel_values, CORRECT mask, and spatial_shapes
-                model_call_kwargs = {
-                    "pixel_values": pixel_values_unpadded,   # <<< Use UNPADDED values
-                    "attention_mask": correct_attention_mask, # <<< Use correct mask
-                    "spatial_shapes": spatial_shapes.long()
-                 }
-
-                # Call SigLIP model's vision component
-                with torch.no_grad():
-                    try:
-                        vision_model_component = getattr(model, 'vision_model', model)
-                        # <<< ADD THIS DEBUG PRINT >>>
-                        model_device = next(vision_model_component.parameters()).device
-                        print(
-                            f"DEBUG: Calling vision model ({type(vision_model_component).__name__}) on device: {model_device}")
-                        # <<< END DEBUG PRINT >>>
-                        outputs = vision_model_component(**model_call_kwargs)
-                        emb = getattr(outputs, 'pooler_output', None) # Get pooled output
-                    except Exception as e_model:
-                        print(f"\nError Siglip forward (max_patches={naflex_max_patches}): {e_model}"); traceback.print_exc(); return None
-                do_l2_normalize = True # Apply L2 norm (matches previous successful runs)
+                inputs = processor(images=[raw_img_pil], return_tensors="pt", max_num_patches=1024)
+                pixel_values = inputs.get("pixel_values"); attention_mask = inputs.get("pixel_attention_mask"); spatial_shapes = inputs.get("spatial_shapes")
+                if pixel_values is None or attention_mask is None or spatial_shapes is None: raise ValueError("Missing tensors from HF NaFlex processor.")
+                model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype), "attention_mask": attention_mask.to(device=device), "spatial_shapes": torch.tensor(spatial_shapes, dtype=torch.long).to(device=device)}
+                # Call SigLIP model (logic unchanged)
+                vision_model_component = getattr(model, 'vision_model', None)
+                if vision_model_component: emb = vision_model_component(**model_call_kwargs).pooler_output
+                elif hasattr(model, 'get_image_features'): emb = model.get_image_features(**model_call_kwargs)
+                else: raise AttributeError("SigLIP Model missing expected methods.")
+                do_l2_normalize = False # SigLIP internal norm
 
             # --- HF NaFlex Mode (SigLIP Processor Logic @ 2048) ---
             elif is_siglip_model and preprocess_mode == 'naflex_resize2':
