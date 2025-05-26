@@ -467,7 +467,7 @@ class BasePipeline:
                 # --- SubPath 2a: SigLIP NaFlex ---
                 if is_siglip_model and is_naflex_mode:
                     # Expects RAW PIL images in img_list
-                    inputs = self.hf_processor(images=img_list, return_tensors="pt", max_num_patches=1024)
+                    inputs = self.hf_processor(images=img_list, return_tensors="pt", max_num_patches=2048)
                     pixel_values = inputs.get("pixel_values"); attention_mask = inputs.get("pixel_attention_mask"); spatial_shapes = inputs.get("spatial_shapes")
                     if pixel_values is None or attention_mask is None or spatial_shapes is None: raise ValueError("Missing tensors from HF NaFlex processor.")
 
@@ -484,7 +484,7 @@ class BasePipeline:
                             kwargs_for_get = {k: v for k, v in model_call_kwargs.items() if k in ['pixel_values', 'attention_mask', 'spatial_shapes']}
                             emb = self.vision_model.get_image_features(**kwargs_for_get)
                         else: raise AttributeError("SigLIP Model missing expected methods.")
-                    do_l2_normalize = True # SigLIP internal norm
+                    do_l2_normalize = False # SigLIP internal norm
 
                 # --- SubPath 2b: AIMv2 Native CLS ---
                 elif is_aimv2_model: # Assuming CLS mode is intended for inference

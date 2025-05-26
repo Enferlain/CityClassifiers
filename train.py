@@ -104,6 +104,11 @@ def setup_precision(args):
         else:
             if TARGET_DEV != 'cuda': print("Warning: bf16 requested but CUDA is not available. Falling back to fp32.")
             else: print("Warning: bf16 requested but not supported by hardware. Falling back to fp32.")
+    elif precision_arg == 'fp64':
+        # No AMP needed for fp64, it's full precision
+        amp_dtype = torch.float64
+        enabled_amp = False # AMP is for mixed precision (fp16/bf16 with fp32)
+        print("Using fp64 (double precision). AMP disabled.")
     else:
         print("Using fp32 precision.")
         if precision_arg not in ['fp32']:
@@ -921,34 +926,34 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
 
                 # --- Less Frequent Validation & Best Model Saving ---
                 # <<< Use run_validation_embeddings for embedding mode >>>
-                if global_step % validate_every_n == 0 and global_step > initial_global_step:
-                    print(f"\n--- Running Validation @ Step {global_step} ---")
-                    eval_loss_val = float('nan')
-                    if val_loader:
-                        # <<< CHOOSE VALIDATION FUNCTION BASED ON MODE >>>
-                        if is_e2e:
-                             # Assuming run_validation_e2e exists and takes similar args
-                             # eval_loss_val = run_validation_e2e(model, val_loader, criterion, TARGET_DEV, scaler, args.num_classes)
-                             print("Placeholder: E2E Validation needed here.") # Replace with actual call
-                        else: # Embedding mode
-                             eval_loss_val = run_validation_embeddings(model, val_loader, criterion, TARGET_DEV, scaler) # <<< USE THIS ONE >>>
-
-                        last_eval_loss_val = eval_loss_val # Update last known eval loss
-                        if not model.training: model.train() # Ensure back in train mode
-
-                    # Log validation loss specifically
-                    if wrapper.wandb_run and not math.isnan(eval_loss_val):
-                        try: wrapper.wandb_run.log({"eval/loss": eval_loss_val}, step=global_step)
-                        except Exception as e: print(f"Wandb eval log error: {e}")
-
-                    if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Step {global_step}.")
-                    else: print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_val:.4e} ---")
-
-                    # Check for best model only after validation
-                    if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
-                        best_eval_loss = eval_loss_val
-                        print(f"New best val loss: {best_eval_loss:.4e}. Saving best model...")
-                        wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args)
+                # if global_step % validate_every_n == 0 and global_step > initial_global_step:
+                #     print(f"\n--- Running Validation @ Step {global_step} ---")
+                #     eval_loss_val = float('nan')
+                #     if val_loader:
+                #         # <<< CHOOSE VALIDATION FUNCTION BASED ON MODE >>>
+                #         if is_e2e:
+                #              # Assuming run_validation_e2e exists and takes similar args
+                #              # eval_loss_val = run_validation_e2e(model, val_loader, criterion, TARGET_DEV, scaler, args.num_classes)
+                #              print("Placeholder: E2E Validation needed here.") # Replace with actual call
+                #         else: # Embedding mode
+                #              eval_loss_val = run_validation_embeddings(model, val_loader, criterion, TARGET_DEV, scaler) # <<< USE THIS ONE >>>
+                #
+                #         last_eval_loss_val = eval_loss_val # Update last known eval loss
+                #         if not model.training: model.train() # Ensure back in train mode
+                #
+                #     # Log validation loss specifically
+                #     if wrapper.wandb_run and not math.isnan(eval_loss_val):
+                #         try: wrapper.wandb_run.log({"eval/loss": eval_loss_val}, step=global_step)
+                #         except Exception as e: print(f"Wandb eval log error: {e}")
+                #
+                #     if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Step {global_step}.")
+                #     else: print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_val:.4e} ---")
+                #
+                #     # Check for best model only after validation
+                #     if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
+                #         best_eval_loss = eval_loss_val
+                #         print(f"New best val loss: {best_eval_loss:.4e}. Saving best model...")
+                #         wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args)
 
                 # --- Periodic saving (independent of validation) ---
                 if args.nsave > 0 and global_step % args.nsave == 0:

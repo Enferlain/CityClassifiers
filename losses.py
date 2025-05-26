@@ -1,6 +1,9 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class GHMC_Loss(nn.Module):
     """ Gradient Harmonizing Mechanism for Classification (GHM-C)
@@ -141,18 +144,49 @@ class GHMC_Loss(nn.Module):
             return weighted_loss
 
 
-# --- Focal Loss Definition ---
-# (Keep the FocalLoss class definition here as before)
+# class FocalLoss(nn.Module):
+#     def __init__(self, gamma=2.0, reduction='mean'):
+#         super(FocalLoss, self).__init__()
+#         self.gamma = gamma
+#         self.reduction = reduction
+#     def forward(self, inputs, targets):
+#         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+#         pt = torch.exp(-ce_loss)
+#         focal_loss = (1 - pt)**self.gamma * ce_loss
+#         if self.reduction == 'mean': return torch.mean(focal_loss)
+#         elif self.reduction == 'sum': return torch.sum(focal_loss)
+#         else: return focal_loss
+
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, reduction='mean'):
+    def __init__(self, gamma: float = 2.0, reduction: str = 'mean', weight: Optional[torch.Tensor] = None):
         super(FocalLoss, self).__init__()
+        if not 0 <= gamma:
+            raise ValueError(f"Invalid gamma: {gamma}") # Added gamma validation
         self.gamma = gamma
         self.reduction = reduction
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        self.weight = weight # Store the weight tensor
+
+        if self.weight is not None:
+            print(f"DEBUG FocalLoss Init: Using class weights: {self.weight.tolist()}") # Optional debug
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Calculate Cross Entropy loss with per-class weights (if provided)
+        # Ensure inputs are float32 for stability with log_softmax (used by CE)
+        # Ensure targets are long
+        ce_loss = F.cross_entropy(inputs.float(), targets.long(), reduction='none', weight=self.weight)
+
+        # Calculate pt (probability of true class)
         pt = torch.exp(-ce_loss)
-        focal_loss = (1 - pt)**self.gamma * ce_loss
-        if self.reduction == 'mean': return torch.mean(focal_loss)
-        elif self.reduction == 'sum': return torch.sum(focal_loss)
-        else: return focal_loss
-# --- End Focal Loss ---
+
+        # Calculate Focal Loss: (1 - pt)^gamma * ce_loss
+        focal_loss_unreduced = (1 - pt).pow(self.gamma) * ce_loss
+
+        # Apply reduction
+        if self.reduction == 'mean':
+            return torch.mean(focal_loss_unreduced)
+        elif self.reduction == 'sum':
+            return torch.sum(focal_loss_unreduced)
+        elif self.reduction == 'none':
+            return focal_loss_unreduced
+        else:
+            raise ValueError(f"Invalid reduction: {self.reduction}")

@@ -1,0 +1,94 @@
+# Configuration for training on pre-computed AIMv2 Native feature sequences
+
+# --- Model Identification ---
+# (Used for naming output files/runs)
+model:
+  base: "AnatomyFlaws"
+  rev: "v13.8_adabelief_fl_naflex_4670" # New revision indicating feature mode
+  arch: class                      # Still a classification task
+  base_vision_model: "google/siglip2-so400m-patch16-naflex"
+  embed_ver: "siglip2_so400m_patch16_naflex_Naflex_Proc2048"
+# --- Data Configuration ---
+data:
+  mode: embeddings                   # <<< Crucial: Set mode to 'features' >>>
+  data_root: ./data                # Root location for data folders
+  # <<< Name of the subfolder containing the generated .npz features >>>
+  feature_dir_name: # "apple_aimv2_large_patch14_native_AIMv2CLS"
+  # <<< Validation split count (applied to feature file list) >>>
+  val_split_count: 453 # 480
+
+# --- PredictorModel v2 Architecture Parameters ---
+predictor_params:
+  # features: (int) - Input embedding size. Typically determined automatically via 'embed_ver'.
+  hidden_dim: 1280
+  num_classes: 2           # Output neurons. Set by training script based on 'arch' and 'labels'. Do not set here unless needed for specific BCE cases.
+  use_attention: true      # Use the initial MultiheadAttention layer? (true/false)
+  num_attn_heads: 16       # Number of attention heads (if use_attention=true). Must be divisor of features dim.
+  attn_dropout: 0.0218      # Dropout rate for attention layer (if use_attention=true). [0.0 - 1.0]
+  num_res_blocks: 3        # Number of ResBlocks in the MLP head. [0, 1, 2, ...]
+  dropout_rate: 0.0218      # Dropout rate in the MLP 'down' block. [0.0 - 1.0]
+  output_mode: sigmoid     # Options: 'linear', 'sigmoid', 'softmax', 'tanh_scaled'
+
+# --- Training Parameters ---
+train:
+  # --- Training Duration ---
+  # (Adjust based on faster training speed - maybe more steps/epochs feasible now?)
+  max_train_steps: 10000            # Example: 5k steps (adjust as needed)
+  # max_train_epochs: 80           # Can alternatively specify epochs
+
+  # --- Core Settings ---
+  # (Can likely use a higher LR now since only training head)
+  lr: 1e-4                         # <<< Increased LR from E2E example >>>
+  batch: 3630                        # <<< Increase batch size significantly - head is small! >>>
+  gradient_accumulation_steps: 1   # Example: Accumulate over 4 micro-batches (Effective Batch Size = 32 * 4 = 128)
+  precision: "fp64"                # Mixed precision for training head
+
+  # --- Loss Function ---
+  loss_function: "focal"
+  focal_loss_gamma: 2.0
+
+  # --- Optimizer ---
+  optimizer: "adabelief" # "ADOPTAOScheduleFree"
+  # -- Optimizer Hyperparameters --
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  weight_decay: 1e-3               # Regularization might still be useful for head
+  rectify: true
+  weight_decouple: true
+
+  gamma: 0.005               # Gamma for FMARSCrop (float)
+  r_sf: 0.0                  # R value for ScheduleFree (float)
+  wlpow_sf: 2.0              # Weight LR Power for ScheduleFree (float)
+  state_precision: parameter # Precision for optimizer state in ScheduleFree (parameter or float32)
+  adaptive_clip: 1.0         # Adaptive clipping threshold for ADOPT/FMARS/ScheduleFree variants
+  adaptive_clip_eps: 1e-3    # Epsilon for adaptive clipping
+
+  # --- Scheduler ---
+  scheduler_name: "RexAnnealingWarmRestarts"
+  # -- Scheduler Arguments --
+  scheduler_gamma: 0.95
+  scheduler_cycle_multiplier: 1.0
+  # <<< Adjust first cycle steps to match max_train_steps >>>
+  scheduler_first_cycle_max_steps: 2500
+  scheduler_min_lr: 1e-7
+  # <<< Adjust warmup steps relative to new steps/epoch (batch 64) >>>
+  # If Steps/Epoch ≈ (2400 samples / 64 batch) ≈ 38 steps... maybe 50-100 warmup steps?
+  scheduler_warmup_steps: 750
+
+  # --- Data & Other ---
+  seed: -1
+  num_workers: 0                   # <<< Can use more workers now for loading NPZ >>>
+  # preload_data: false            # Not applicable/needed for features mode
+  nsave: 100                      # Periodic save frequency
+  log_every_n: 1                  # Log training metrics frequency
+  validate_every_n: 1            # Validation frequency (adjust based on steps/epoch)
+  save_full_model: false           # <<< Save ONLY HeadModel (head+pooler) >>>
+
+# --- Labels ---
+# (Same as before)
+labels:
+ '0': { name: "Bad Anatomy", loss: 1.0 }
+ '1': { name: "Good Anatomy", loss: 1.0 }
+
+# --- Logging ---
+wandb_project: "lumi-classifiers" # Or maybe "city-classifiers-features"
