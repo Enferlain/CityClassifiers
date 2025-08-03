@@ -924,42 +924,60 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                     postfix_dict["LR"] = f"{lr:.1e}"
                     progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False) # Use ordered_dict arg
 
-                # --- Less Frequent Validation & Best Model Saving ---
-                # <<< Use run_validation_embeddings for embedding mode >>>
-                # if global_step % validate_every_n == 0 and global_step > initial_global_step:
-                #     print(f"\n--- Running Validation @ Step {global_step} ---")
-                #     eval_loss_val = float('nan')
-                #     if val_loader:
-                #         # <<< CHOOSE VALIDATION FUNCTION BASED ON MODE >>>
-                #         if is_e2e:
-                #              # Assuming run_validation_e2e exists and takes similar args
-                #              # eval_loss_val = run_validation_e2e(model, val_loader, criterion, TARGET_DEV, scaler, args.num_classes)
-                #              print("Placeholder: E2E Validation needed here.") # Replace with actual call
-                #         else: # Embedding mode
-                #              eval_loss_val = run_validation_embeddings(model, val_loader, criterion, TARGET_DEV, scaler) # <<< USE THIS ONE >>>
-                #
-                #         last_eval_loss_val = eval_loss_val # Update last known eval loss
-                #         if not model.training: model.train() # Ensure back in train mode
-                #
-                #     # Log validation loss specifically
-                #     if wrapper.wandb_run and not math.isnan(eval_loss_val):
-                #         try: wrapper.wandb_run.log({"eval/loss": eval_loss_val}, step=global_step)
-                #         except Exception as e: print(f"Wandb eval log error: {e}")
-                #
-                #     if math.isnan(eval_loss_val): print(f"Warning: Eval loss is NaN at Step {global_step}.")
-                #     else: print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_val:.4e} ---")
-                #
-                #     # Check for best model only after validation
-                #     if not math.isnan(eval_loss_val) and eval_loss_val < best_eval_loss:
-                #         best_eval_loss = eval_loss_val
-                #         print(f"New best val loss: {best_eval_loss:.4e}. Saving best model...")
-                #         wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args)
+                # --- Validation & Best Model Saving ---
+                if global_step % validate_every_n == 0 and global_step > initial_global_step:
+                    print(f"\n--- Running Validation @ Step {global_step} (Current best_eval_loss: {best_eval_loss:.4e}) ---")
+                    eval_loss_this_run = float('nan')
+                    should_save_new_best = False
+
+                    if val_loader:
+                        if is_e2e:
+                            # (E2E placeholder remains the same)
+                            print("Placeholder: E2E Validation called. Ensure it's updated.")
+                            eval_loss_this_run = last_eval_loss_val if not math.isnan(last_eval_loss_val) else float('inf')
+                            should_save_new_best = False
+                        else: # Embedding mode
+                            eval_loss_this_run, should_save_new_best = run_validation_embeddings(
+                                model, val_loader, criterion, TARGET_DEV, scaler, best_eval_loss
+                            )
+
+                        if not math.isnan(eval_loss_this_run):
+                            last_eval_loss_val = eval_loss_this_run
+
+                        if not model.training:
+                            model.train()
+
+                    # Log validation loss to WandB
+                    if wrapper.wandb_run and not math.isnan(eval_loss_this_run):
+                        try:
+                            # <<< WANDB LOG NAME CHANGED TO "eval/loss" >>>
+                            wrapper.wandb_run.log({"eval/loss": eval_loss_this_run}, step=global_step)
+                            # <<< END CHANGE >>>
+                        except Exception as e:
+                            print(f"Wandb eval log error: {e}")
+
+                    if math.isnan(eval_loss_this_run):
+                        print(f"Warning: Eval loss is NaN at Step {global_step}.")
+                    else:
+                        print(f"--- Validation Complete @ Step {global_step}: Eval Loss = {eval_loss_this_run:.4e} ---")
+
+                    # Decision to save best model
+                    if should_save_new_best:
+                        print(f"  Validation loss {eval_loss_this_run:.4e} IS a new best (old best: {best_eval_loss:.4e}). Saving best model...")
+                        best_eval_loss = eval_loss_this_run
+                        wrapper.best_val_loss = best_eval_loss
+                        wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val", save_aux=False, args=args)
+                    elif not math.isnan(eval_loss_this_run):
+                        print(f"  Validation loss {eval_loss_this_run:.4e} did not improve on best {best_eval_loss:.4e}. Not saving as best.")
+                    else:
+                        print(f"  Eval loss was NaN. Not saving as best.")
 
                 # --- Periodic saving (independent of validation) ---
-                if args.nsave > 0 and global_step % args.nsave == 0:
+                # (This part remains the same)
+                if args.nsave > 0 and global_step > 0 and global_step % args.nsave == 0:
                      if global_step > initial_global_step:
                           print(f"\nSaving periodic checkpoint @ step {global_step}...")
-                          wrapper.save_model(step=global_step, epoch=epoch, args=args)
+                          wrapper.save_model(step=global_step, epoch=epoch, args=args, save_aux=False)
 
             # --- End Inner Step Loop ---
             if global_step >= total_steps_to_run: break

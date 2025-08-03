@@ -583,14 +583,14 @@ def load_checkpoint(args, model, optimizer, scheduler, scaler):
 # ================================================
 #        Main Training Loop (for Feature Sequences)
 # ================================================
-# Version 1.2.0 logging changes
+# Version 1.2.1: Uses modified validation return, updates best_val_loss in ModelWrapper
 def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                train_loader, val_loader, wrapper, start_epoch, initial_global_step,
                enabled_amp, amp_dtype, is_schedule_free):
     """
     Runs the main training loop for sequence models with gradient accumulation
     and detailed logging metrics.
-    Logs: loss/current, loss/epoch, loss/current_val_loss, loss/average_val_loss
+    Validation now returns a flag to save the best model.
     """
     # --- Initial Setup ---
     if not all(hasattr(args, attr) for attr in ['num_train_epochs', 'steps_per_epoch', 'max_train_steps', 'num_labels']):
@@ -816,29 +816,38 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
                              postfix_dict["LR"] = f"{lr:.1e}"; progress_bar.set_postfix(ordered_dict=postfix_dict, refresh=False)
                          # --- End Logging ---
 
-                         # --- Validation (Every VALIDATE_EVERY_N global steps) ---
                          if validate_every_n > 0 and global_step % validate_every_n == 0 and global_step > 0:
                              print(f"\n--- Running Validation @ Step {global_step} ---")
-                             eval_loss_val = run_validation_sequences(model, val_loader, criterion, TARGET_DEV, scaler, args.num_labels)
-                             model.train() # Ensure back in train mode
+                             # Pass current best_eval_loss to validation function
+                             eval_loss_val, should_save_new_best = run_validation_sequences(
+                                 model, val_loader, criterion, TARGET_DEV, scaler, args.num_labels, best_eval_loss
+                                 # Pass current best
+                             )
+                             model.train()  # Ensure back in train mode
 
                              if not math.isnan(eval_loss_val):
-                                 last_eval_loss_val = eval_loss_val # Update last known
-                                 all_validation_losses.append(eval_loss_val) # Store for average
+                                 last_eval_loss_val = eval_loss_val
+                                 all_validation_losses.append(eval_loss_val)
                                  print(f"--- Validation Complete: Eval Loss = {eval_loss_val:.4e} ---")
-
-                                 # Calculate and Log Average Validation Loss
                                  avg_val_loss = sum(all_validation_losses) / len(all_validation_losses)
                                  print(f"--- Average Validation Loss So Far: {avg_val_loss:.4e} ---")
                                  if wrapper.wandb_run:
-                                      try:
-                                           wrapper.wandb_run.log({
-                                                # Log the specific result for this run
-                                                "loss/eval_run_result": eval_loss_val,
-                                                # Log the running average
-                                                "loss/average_val_loss": avg_val_loss
-                                                }, step=global_step)
-                                      except Exception as e: print(f"Wandb val log error: {e}")
+                                     try:
+                                         wrapper.wandb_run.log({
+                                             "loss/eval_run_result": eval_loss_val,
+                                             "loss/average_val_loss": avg_val_loss
+                                         }, step=global_step)
+                                     except Exception as e:
+                                         print(f"Wandb val log error: {e}")
+
+                                 # <<< MODIFIED Best Model Saving Logic >>>
+                                 if should_save_new_best:
+                                     best_eval_loss = eval_loss_val  # Update the best loss tracker
+                                     wrapper.best_val_loss = best_eval_loss  # Update wrapper's best loss
+                                     print(f"New best val loss: {best_eval_loss:.4e}. Saving best model...")
+                                     wrapper.save_model(step=global_step, epoch=epoch, suffix="_best_val",
+                                                        save_aux=False, args=args)
+                                 # <<< END MODIFIED Logic >>>
 
                                  # Update progress bar postfix
                                  lr = optimizer.param_groups[0]['lr']

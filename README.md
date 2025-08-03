@@ -1,211 +1,172 @@
 # CityClassifiers
 
-Code for my collection of predictors/classifiers/etc
+A flexible and powerful framework for training and deploying high-performance image classifiers and aesthetic predictors. This project utilizes modern vision transformers and advanced training techniques to achieve state-of-the-art results.
 
-## Architecture
+## Core Concepts
 
-The base model itself is fairly simple. It takes embeddings from a CLIP model (in this case, `openai/clip-vit-large-patch14-336`) and expands them to 1024 dimensions. From there, a single block with residuals is followed by a few linear layers which converge down to the final output.
+This framework is built around a modular architecture that separates feature extraction from the final prediction task. This allows for rapid experimentation and efficient training. The primary approaches supported are:
 
-For the predictor model, the final output goes through `nn.Tanh` as the training labels are normalized to `[0,1]`. For the classifier, this is `nn.Softmax` instead.
+1.  **Training on Pre-computed Embeddings:** A large, pre-trained vision model (e.g., SigLIP, DINOv2) is used to generate single-vector embeddings for an entire dataset. A small, custom "head" model is then trained on these embeddings, which is very fast and resource-efficient.
+2.  **Training on Pre-computed Feature Sequences:** Instead of a single vector, the full sequence of patch embeddings is extracted from the vision model. This provides richer, spatially-aware information to a more complex head model, often leading to higher accuracy at the cost of more disk space.
+3.  **End-to-End Training:** The framework also supports training directly from images, where a vision model (like Apple's AIMv2) is combined with a trainable head into a single network. This allows for fine-tuning parts of the vision model for the specific task.
 
-# Classifiers
+## Key Features
 
-[Live Demos](https://huggingface.co/spaces/city96/AnimeClassifiers-demo) | [Model downloads](https://huggingface.co/city96/AnimeClassifiers)
+-   **Multiple Vision Backbones:** Easily use powerful, pre-trained vision models from Hugging Face and `timm`, including **SigLIP**, **DINOv2**, and **AIMv2**.
+-   **Advanced Model Heads:** A collection of highly configurable head models (`PredictorModel`, `HeadModel`, `HybridHeadModel`) featuring modern components like:
+    -   Self-Attention layers
+    -   Residual Blocks (ResBlocks)
+    -   **RMSNorm** Layer Normalization
+    -   **SwiGLU** activation functions
+    -   Attention Pooling
+-   **Flexible Training Modes:** Train on embeddings, feature sequences, or raw images depending on your needs.
+-   **Advanced Loss Functions:** Built-in support for `FocalLoss` and `GHMC_Loss` to effectively handle class imbalance and focus on hard examples.
+-   **YAML-based Configuration:** A clean and powerful configuration system using YAML files allows you to define every aspect of your training run without changing the code.
+-   **Efficient Inference:** Optimized inference pipelines (`inference.py`) for fast predictions on single images or entire folders.
+-   **Interactive Demos:** Launch local web demos with **Gradio** to easily test and showcase your trained models.
+-   **Custom Optimizers & Schedulers:** The framework is extensible with a variety of custom optimizers (`AdamW`, `Lion`, `Sophia`, etc.) and learning rate schedulers.
+-   **Weights & Biases Integration:** Log metrics, configurations, and training progress automatically to your W&B dashboard.
 
-These are models that predict whether a concept is present in an image. The performance on high resolution images isn't very good, especially when detecting subtle image effects such as noise. This is due to CLIP using a fairly low resolution (336x336/224x224).
+## Project Structure
 
-To combat this, tiling is used at inference time. The input image is first downscaled to 1536 (shortest edge - See `TF.functional.resize`), then 5 separate areas are selected (double the res of the CLIP preprocessor. 4 corners + center - See `TF.functional.five_crop`). This helps as the downscale factor isn't nearly as drastic as passing the entire image to CLIP. As a bonus, it also avoids the issues with odd aspect ratios requiring cropping or letterboxing to work.
-
-![Tiling](https://github.com/city96/CityClassifiers/assets/125218114/66a30048-93ce-4c00-befc-0d986c84ec9f)
-
-As for the training, it will be detailed in the sections below for the individual classifiers. At first, specialized models will be trained to a relatively high accuracy, building up a high quality but specific dataset in the process.
-
-Then, these models will be used to split/sort each other's the datasets. The code will need to be updated to support one image being part of more than one class, but the final result should be a clean dataset where each target aspect acts as a "tag" rather than a class.
-
-## Future/planned
-
-- Unified (by joining the datasets of the other classifiers)
-- Composition/shot type/camera angle
-- Noise
-
-## Chromatic Aberration - Anime
-
-### Design goals
-
-The goal was to detect [chromatic aberration](https://en.wikipedia.org/wiki/Chromatic_aberration?useskin=vector) in images.
-
-For some odd reason, this effect has become a popular post processing effect to apply to images and drawings. While attempting to train an ESRGAN model, I noticed an odd halo around images and quickly figured out that this effect was the cause. This classifier aims to work as a base filter to remove such images from the dataset.
-
-### Issues
-
-- Seems to get confused by excessive HSV noise
-- Triggers even if the effect is only applied to the background
-- Sometimes triggers on rough linework/sketches (i.e. multiple semi-transparent lines overlapping)
-- Low accuracy on 3D/2.5D with possible false positives.
-
-### Training
-
-The training settings can be found in the `config/CCAnime-ChromaticAberration-v1.yaml` file (1.5e-6 LR, cosine scheduler, 30K steps).
-
-![loss](https://github.com/city96/CityClassifiers/assets/125218114/475f1241-2b4e-4fc9-bbcd-261b85b8b491)
-
-![loss-eval](https://github.com/city96/CityClassifiers/assets/125218114/88d6f090-aa6f-42ad-9fd0-8c5d267fce5e)
-
-
-Final dataset score distribution for v1.16:
 ```
-3215 images in dataset.
-0_reg       -  395 ||||
-0_reg_booru - 1805 ||||||||||||||||||||||
-1_chroma    -  515 ||||||
-1_synthetic -  500 ||||||
-
-Class ratios:
-00 - 2200 |||||||||||||||||||||||||||
-01 - 1015 ||||||||||||
+.
+├── config/                 # YAML configuration files for training runs.
+├── data/                   # Default directory for datasets and generated features.
+├── models/                 # Default directory for saved model checkpoints.
+├── optimizer/              # Custom optimizer and scheduler implementations.
+├── anatomy/                # (Example) Data and scripts for a specific project.
+├── dataset.py              # PyTorch Dataset for loading single-vector embeddings.
+├── sequence_dataset.py     # PyTorch Dataset for loading feature sequences.
+├── image_dataset.py        # PyTorch Dataset for loading raw images (end-to-end).
+├── model.py                # Defines the `PredictorModel` head.
+├── head_model.py           # Defines the `HeadModel` for feature sequences.
+├── hybrid_model.py         # Defines the `HybridHeadModel`.
+├── model_early_extract.py  # Defines the end-to-end `EarlyExtractAnatomyModel`.
+├── generate_embeddings.py  # Script to pre-compute single-vector embeddings.
+├── generate_feature_sequences.py # Script to pre-compute feature sequences.
+├── train.py                # Main training script for embedding-based models.
+├── train_features.py       # Main training script for feature sequence models.
+├── inference.py            # Core module for loading models and running inference.
+├── demo_folder.py          # CLI tool for batch-processing a folder of images.
+├── demo_class_gradio.py    # Gradio demo for classifier models.
+└── demo_score_gradio.py    # Gradio demo for scoring/predictor models.
 ```
 
-Version history:
+## Usage
 
-- v1.0 - Initial test model, dataset is fully synthetic (500 images). Effect added by shifting red/blue channel by a random amount using chaiNNer.
-- v1.1 - Added 300 images tagged "chromatic_aberration" from gelbooru. Added first 1000 images from danbooru2021 as reg images
-- v1.2 - Used the newly trained predictor to filter the existing datasets - found ~70 positives in the reg set and ~30 false positives in the target set.
-- v1.3-v1.16 - Repeatedly ran predictor against various datasets, adding false positives/negatives back into the dataset, sometimes running against the training set to filter out misclassified images as the predictor got better. Added/removed images were manually checked (My eyes hurt).
+### 1. Setup
 
-## Image Compression - Anime
+First, clone the repository and install the required dependencies.
 
-### Design goals
-
-The goal was to detect [compression artifacts](https://en.wikipedia.org/wiki/Compression_artifact?useskin=vector) in images.
-
-This seems like the next logical step in dataset filtering. The flagged images can either be cleaned up or tagged correctly so the resulting network won't inherit the image artifacts.
-
-### Issues
-
-- Low accuracy on 3D/2.5D with possible false positives.
-
-### Training
-
-The training settings can be found in the `config/CCAnime-Compression-v1.yaml` file (2.7e-6 LR, cosine scheduler, 40K steps).
-
-![loss](https://github.com/city96/CityClassifiers/assets/125218114/9d0294bf-81ee-4b30-89ae-3b1aca27788e)
-
-The eval loss only uses a single image for each target class, hence the questionable nature of the graph.
-
-![loss-eval](https://github.com/city96/CityClassifiers/assets/125218114/77c9882f-6263-4926-b3ee-a032ef7784ea)
-
-
-Final dataset score distribution for v1.5:
-```
-22736 images in dataset.
-0_fpl      -  108
-0_reg_aes  -  142
-0_reg_gel  - 7445 |||||||||||||
-1_aes_jpg  -  103
-1_fpl      -    8
-1_syn_gel  - 7445 |||||||||||||
-1_syn_jpg  -   40
-2_syn_gel  - 7445 |||||||||||||
-2_syn_webp -    0
-
-Class ratios:
-00 - 7695 |||||||||||||
-01 - 7596 |||||||||||||
-02 - 7445 |||||||||||||
+```bash
+git clone https://github.com/Enferlain/CityClassifiers.git
+cd CityClassifiers
+pip install -r requirements.txt
 ```
 
-Version history:
+### 2. Data Preparation (Optional but Recommended)
 
-- v1.0 - Initial test model, dataset consists of 40 hand picked images and their jpeg compressed counterpart. Compression is done with ChaiNNer, compression rate is randomized.
-- v1.1 - Added more images by re-filtering the input dataset using the v1 model, keeping only the top/bottom 10%.
-- v1.2 - Used the newly trained predictor to filter the existing datasets - found ~70 positives in the reg set and ~30 false positives in the target set.
-- v1.3 - Scraped ~7500 images from gelbooru, filtering for min. image size of at least 3000 and a file size larger than 8MB. Compressed using ChaiNNer as before.
-- v1.4 - Added webm compression to the list, decided against adding GIF/dithering since it's rarely used nowadays.
-- v1.5 - Changed LR/step count to better match larger dataset. Added false positives/negatives from v1.4.
+For most use cases, you'll pre-compute features from your image dataset. Your images should be organized into class-based subfolders (e.g., `data/my_dataset/0/`, `data/my_dataset/1/`).
 
+**Option A: Generate Single-Vector Embeddings**
 
-# Predictors
+Use `generate_embeddings.py` to create embeddings. This is fast and uses less disk space.
 
-## CityAesthetics - Anime
-
-![Logo](https://github.com/city96/CityClassifiers/assets/125218114/0413003a-851d-42fc-b795-eae525b7b2e5)
-
-[Live Demo](https://huggingface.co/spaces/city96/CityAesthetics-demo) | [Model download](https://huggingface.co/city96/CityAesthetics)
-
-### Design goals
-
-The goal was to create an aesthetic predictor that can work well on one specific type of image (in this case, anime) while filtering out everything else. To achieve this, the model was trained on a set of 3080 hand-scored images with multiple refinement steps, where false positives and negatives would be added to the training set with corrected scores after each test run.
-
-This model focuses on as few false positives as possible. Only having one type of media seems to help with this, as predictors that attempt to do both real life and 2D images tend to produce false positives. If one were to have a mixed dataset with both types of images, then the simplest solution would be to use two separate aesthetic score models and a classifier to pick the appropriate one to use.
-
-#### Intentional biases
-
-- Completely negative towards real life photos (ideal score of 0%)
-- Strongly Negative towards text (subtitles, memes, etc) and manga panels
-- Fairly negative towards 3D and to some extent 2.5D images
-- Negative towards western cartoons and stylized images (chibi, parody)
-
-#### Issues
-
-- Tends to filter male characters due to being underrepresented in the training set
-- Requires at least 1 subject to be present in the image - doesn't work for scenery/landscapes
-- Noticeable positive bias towards anime characters with animal ears
-- Hit-or-miss with AI generated images due to style/quality not being correlated
-
-#### Out-of-scope
-
-- This model is not meant for moderation/live filtering/etc
-- The demo code is not meant to work with large-scale datasets and is therefore only single-threaded. If you're working on something that requires an optimized version that can work on pre-computed CLIP embeddings for faster iteration, feel free to [contact me](https://v100s.net).
-
-### Usecases
-
-The main usecase will be to provide baseline filtering on large datasets (i.e. a high pass filter). For this, the score brackets were decided as follows:
-
-- <10% - Real life photos, noise, excessive text (subtitles, memes, etc)
-- 10-20% - Manga panels, images with no subject, non-human subjects
-- 20-40% - Sketches, oekaki, rough lineart (score depends on quality)
-- 40-50% - Flat shading, TV anime screenshots, average images
-- \>50% - "High quality" images based on my personal style preferences
-
-The \>60% score range is intended to help pick out the "best" images from a dataset. One could use it to filter by score (i.e. using it as a band pass filter), but the scores above 50% are a lot more vague. Instead, I'd recommend sorting the dataset by score instead and setting a limit on the total number of images to select.
-
-Top 100 images from a subset of danbooru2021 using the v1.7 model:
-
-![AesPredv17_T100C](https://github.com/city96/CityClassifiers/assets/125218114/b7d8a167-a53a-46bb-8737-6c6c2a04f50f)
-
-### Training
-
-The training settings are initialized from the `config/CityAesthetics-v1.yaml` file (7e-6 LR, cosine scheduler, 100K steps).
-
-![loss](https://github.com/city96/CityClassifiers/assets/125218114/611ae144-1390-48d3-988d-59a03c4a2f26)
-
-Final dataset score distribution for v1.8:
-```
-3080 images in dataset.
-  0 -   31 |
-  1 -  162 |||||
-  2 -  533 |||||||||||||||||
-  3 -  675 |||||||||||||||||||||
-  4 -  690 ||||||||||||||||||||||
-  5 -  576 ||||||||||||||||||
-  6 -  228 |||||||
-  7 -   95 |||
-  8 -   54 |
-  9 -   29
- 10 -    7
-raw -    0
+```bash
+python generate_embeddings.py \
+  --image_dir path/to/your/images \
+  --output_dir_root data \
+  --model_name google/siglip-so400m-patch14-384 \
+  --preprocess_mode fit_pad
 ```
 
-Version history:
+**Option B: Generate Feature Sequences**
 
-- v1.0 - Initial test model with ~150 images to test viability
-- v1.1 - Initialized top 5 score brackets with ~250 hand-picked images
-- v1.2 - Manually scored ~2500 danbooru images for the main training set
-- v1.3-v1.7 - Repeatedly ran the model against various datasets, adding the false negatives/positives to the training set to try and correct for various edgecases
-- v1.8 - Added 3D and 2.5D images to the negative brackets to filter these as well
+Use `generate_feature_sequences.py` for richer features. This can lead to higher accuracy but requires more disk space.
 
-### Demo
+```bash
+python generate_feature_sequences.py \
+  --image_dir path/to/your/images \
+  --output_dir_root data \
+  --model_name apple/aimv2-large-patch14-224-way-2b \
+  --save_precision fp16
+```
 
-A live demo can be accessed on [Huggingface](https://huggingface.co/spaces/city96/CityAesthetics-demo). The same demo can also be started locally by running `demo_score_gradio.py` after installing the requirements (`pip install -r requirements.txt`). Optionally, if a "models" folder with the correct files is present, then it will be used instead of huggingface.
+### 3. Training
 
-`demo_score_folder.py` is a simple test script that can be used to recursively score all images in a folder, optionally copying the images between a set threshold to the output folder. Check --help for more info.
+Training is controlled via YAML configuration files located in the `config/` directory.
+
+1.  **Create a Config File:** Copy an existing config (e.g., `config/anatomy_so400nf.yaml`) and modify it for your needs. Key parameters include:
+    -   `data.mode`: `embeddings`, `features`, or `images`.
+    -   `data.feature_dir_name`: The name of the folder generated in step 2.
+    -   `model.base_vision_model`: The vision model used for feature generation.
+    -   `head_params`: The architecture of the trainable head model.
+    -   `train`: Training parameters like learning rate, batch size, optimizer, and loss function.
+
+2.  **Start Training:**
+    -   For feature sequences: `python train_features.py --config config/your_config.yaml`
+    -   For embeddings: `python train.py --config config/your_config.yaml`
+
+The script will handle setting up the dataset, model, optimizer, and training loop, logging progress to the console and Weights & Biases.
+
+### 4. Inference and Demos
+
+Once a model is trained, you can use it for inference.
+
+**Batch Processing a Folder**
+
+Use `demo_folder.py` to classify or score all images in a directory.
+
+```bash
+python demo_folder.py \
+  --src path/to/your/images \
+  --dst output_folder \
+  --model models/your_model_name.safetensors \
+  --arch class \
+  --target_label_name "Good Anatomy" \
+  --copy_passed
+```
+
+**Running a Live Demo**
+
+Launch an interactive Gradio web UI to test your model.
+
+```bash
+# For a classifier
+python demo_class_gradio.py
+
+# For a scorer/predictor
+python demo_score_gradio.py
+```
+
+## Pre-trained Models
+
+This repository includes configurations and information for several pre-trained models.
+
+### CityAesthetics - Anime
+
+An aesthetic predictor optimized for scoring anime images. It is trained to filter out real-life photos, text, 3D renders, and manga panels.
+
+-   **Live Demo:** [Hugging Face Space](https://huggingface.co/spaces/city96/CityAesthetics-demo)
+-   **Model Download:** [Hugging Face Hub](https://huggingface.co/city96/CityAesthetics)
+-   **Config:** `config/CityAesthetics-v1.yaml`
+
+### Anime Classifiers
+
+A collection of classifiers trained to detect specific artifacts or styles in anime images.
+
+-   **Live Demos:** [Hugging Face Space](https://huggingface.co/spaces/city96/AnimeClassifiers-demo)
+-   **Model Downloads:** [Hugging Face Hub](https://huggingface.co/city96/AnimeClassifiers)
+
+#### Chromatic Aberration
+
+Detects the presence of chromatic aberration, a common post-processing effect.
+
+-   **Config:** `config/CCAnime-ChromaticAberration-v1.yaml`
+
+#### Image Compression
+
+Detects artifacts from JPEG or WebP compression.
+
+-   **Config:** `config/CCAnime-Compression-v1.yaml`
