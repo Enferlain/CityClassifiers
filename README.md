@@ -1,6 +1,8 @@
 # CityClassifiers
 
-A flexible and powerful framework for training and deploying high-performance image classifiers and aesthetic predictors. This project utilizes modern vision transformers and advanced training techniques to achieve state-of-the-art results.
+A flexible and powerful framework for training and deploying high-performance image classifiers and aesthetic predictors. This project utilizes modern vision transformers and advanced training techniques to achieve ~~state-of-the-art~~ results.
+
+#### CHECK ORIGINAL README FOR THE ORIGINAL INFO, AND THE SIGLIP AND DINO BRANCHES FOR "STABLE" CHECKPOINTS
 
 ## Core Concepts
 
