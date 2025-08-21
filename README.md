@@ -172,3 +172,7 @@ Detects the presence of chromatic aberration, a common post-processing effect.
 Detects artifacts from JPEG or WebP compression.
 
 -   **Config:** `config/CCAnime-Compression-v1.yaml`
+
+---
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Enferlain/CityClassifiers)
