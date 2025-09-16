@@ -15,6 +15,7 @@ from transformers import AutoProcessor, AutoModel, AutoImageProcessor # Use Auto
 import math
 
 # --- Import Models ---
+import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
 try:
     from model import PredictorModel # Original head
     from head_model import HeadModel # Sequence head (unused by these pipelines directly)
@@ -36,6 +37,10 @@ except ImportError:
 TARGET_LEN_INFERENCE = 4096 # Keep if needed by any preprocess func
 AIMV2_PATCH_SIZE = 14
 AIMV2_TARGET_MAX_PATCHES = 4096
+# <<< ADDED: DINOv3 Specific Constants >>>
+DINOV3_PATCH_SIZE = 16 # DINOv3 patch size
+MAX_DINOV3_RESOLUTION = 4096 # Max resolution for DINOv3, adjust based on GPU memory
+# <<< END ADDED DINOv3 Specific Constants >>>
 
 
 # --- v4.0: Aims for target_patches, ensures dims multiple of patch_size (floor) ---
@@ -267,7 +272,10 @@ class BasePipeline:
         # --- Preprocessing function selection (Based on embed_ver or model type) ---
         self.preprocess_func = None
         # <<< Use more robust checking based on model name/embed_ver >>>
-        if "naflex" in self.base_vision_model_name.lower() or ("Naflex" in (self.embed_ver or "")):
+        if "dinov3" in self.base_vision_model_name.lower():
+            print("DEBUG BasePipeline: Selecting DINOv3 variable resolution logic.")
+            self.preprocess_func = None # Signal internal handling
+        elif "naflex" in self.base_vision_model_name.lower() or ("Naflex" in (self.embed_ver or "")):
             print("DEBUG BasePipeline: Selecting NaFlex processor logic (via get_clip_emb).")
             # NaFlex uses the processor directly, no manual func needed here
             self.preprocess_func = None # Signal direct processor use
@@ -282,7 +290,7 @@ class BasePipeline:
              print("DEBUG BasePipeline: Selecting FitPad preprocessing (likely SigLIP).")
              self.preprocess_func = preprocess_fit_pad # Default FitPad
         else: # Fallback
-            print(f"DEBUG BasePipeline: Unknown model type. Defaulting to FitPad preprocessing.")
+            print(f"DEBUG BasePipeline: Unknown model type '{self.base_vision_model_name}'. Defaulting to FitPad preprocessing.")
             self.preprocess_func = preprocess_fit_pad
 
         # --- Model Head Setup (Loaded in subclasses using _load_model_head) ---
@@ -361,9 +369,22 @@ class BasePipeline:
             print("  Detected Hugging Face model type.")
             try:
                 self.hf_processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-                self.vision_model = AutoModel.from_pretrained(
-                    model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
-                ).to(self.device).eval()
+                
+                # <<< MODIFIED: DINOv3 8-bit BnB Model Loading >>>
+                if model_name == "dinov3-vit7b16-pretrain-lvd1689m-8bit":
+                    print(f"  Loading DINOv3 8-bit BnB model from saved path: {model_name}")
+                    self.vision_model, self.hf_processor = dinov3_7b_quant_bnb.load_from_saved_bnb(save_path=f"./{model_name}")
+                    # For 8-bit models, device_map="auto" already handles device placement.
+                    # Do NOT call .to(device) again, as it's not supported and causes an error.
+                    self.vision_model.eval() # Ensure model is in eval mode
+                    print("  INFO: Skipping .to(device) for 8-bit DINOv3 model.")
+                else:
+                    self.hf_processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+                    self.vision_model = AutoModel.from_pretrained(
+                        model_name, torch_dtype=self.clip_dtype, trust_remote_code=True
+                    ).to(self.device).eval()
+                # <<< END MODIFIED >>>
+
                 print(f"  Loaded HF model: {self.vision_model.__class__.__name__}")
                 print(f"  Loaded HF processor: {self.hf_processor.__class__.__name__}")
 
@@ -463,6 +484,8 @@ class BasePipeline:
                 is_aimv2_model = "aimv2" in self.base_vision_model_name.lower()
                 is_siglip_model = "siglip" in self.base_vision_model_name.lower() and not is_aimv2_model # Avoid conflict
                 is_dinov2_model = "dinov2" in self.base_vision_model_name.lower() and not is_aimv2_model
+                # <<< MODIFIED: Check for DINOv3ViTModel name >>>
+                is_dinov3_model = "dinov3" in self.base_vision_model_name.lower() and not is_aimv2_model # Avoid conflict
 
                 # --- SubPath 2a: SigLIP NaFlex ---
                 if is_siglip_model and is_naflex_mode:
@@ -498,14 +521,26 @@ class BasePipeline:
                                if original_width > 0 and original_height > 0:
                                     patches_w = math.floor(original_width / AIMV2_PATCH_SIZE); patches_h = math.floor(original_height / AIMV2_PATCH_SIZE)
                                     if patches_w * patches_h > AIMV2_TARGET_MAX_PATCHES:
-                                         # ... (iterative resizing logic to fit AIMV2_TARGET_MAX_PATCHES) ...
+                                         # (iterative resizing logic to fit AIMV2_TARGET_MAX_PATCHES)
                                          scale_factor = math.sqrt(AIMV2_TARGET_MAX_PATCHES / (patches_w * patches_h))
-                                         # ... find target_w, target_h that are multiples of 14 ...
-                                         target_w = 1120; target_h = 840 # Example placeholder values
+                                         # find target_w, target_h that are multiples of 14
+                                         target_w = int(original_width * scale_factor + 0.5)
+                                         target_h = int(original_height * scale_factor + 0.5)
+                                         if target_w < 1: target_w = 1
+                                         if target_h < 1: target_h = 1
+                                         target_w = math.floor(target_w / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                                         target_h = math.floor(target_h / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                                         if target_w == 0: target_w = AIMV2_PATCH_SIZE
+                                         if target_h == 0: target_h = AIMV2_PATCH_SIZE
                                          img_to_process = raw_img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
                                     else: # Ensure dims are multiple of patch size even if not resizing
-                                         # ... (adjust dims to be multiple of 14) ...
-                                         pass # Placeholder
+                                         current_w, current_h = img_to_process.size
+                                         new_w = math.floor(current_w / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                                         new_h = math.floor(current_h / AIMV2_PATCH_SIZE) * AIMV2_PATCH_SIZE
+                                         if new_w == 0: new_w = AIMV2_PATCH_SIZE
+                                         if new_h == 0: new_h = AIMV2_PATCH_SIZE
+                                         if new_w != current_w or new_h != current_h:
+                                              img_to_process = img_to_process.resize((new_w, new_h), Image.Resampling.LANCZOS)
                           except Exception as e_resize: print(f"Resize error AIMv2 Inf: {e_resize}"); continue
                           # <<< End pre-resizing >>>
                           # Now process the (maybe resized) image
@@ -521,7 +556,55 @@ class BasePipeline:
                      emb = last_hidden_state[:, 0, :] # CLS token
                      do_l2_normalize = True
 
-                # --- SubPath 2b: Manual Preprocessing (FB DINOv2 or SigLIP FitPad/CenterCrop) ---
+                # <<< ADDED: DINOv3 7B 8-bit BnB Mode (Variable Resolution + Mean Pooling) >>>
+                elif is_dinov3_model:
+                    processed_tensors = []
+                    for raw_img_pil in img_list:
+                        current_w, current_h = raw_img_pil.size
+                        img_to_process = raw_img_pil
+
+                        # Optional: Add max resolution limit for memory protection
+                        if max(current_w, current_h) > MAX_DINOV3_RESOLUTION:
+                            scale = MAX_DINOV3_RESOLUTION / max(current_w, current_h)
+                            current_w = int(current_w * scale)
+                            current_h = int(current_h * scale)
+                            img_to_process = raw_img_pil.resize((current_w, current_h), Image.Resampling.LANCZOS)
+                            print(f"  - INFO: Scaling down image to fit within {MAX_DINOV3_RESOLUTION}px limit.")
+
+                        # Validate reasonable image sizes after potential downscaling
+                        if current_w < DINOV3_PATCH_SIZE or current_h < DINOV3_PATCH_SIZE:
+                            raise ValueError(f"Image too small: {current_w}x{current_h}. Minimum size is {DINOV3_PATCH_SIZE}x{DINOV3_PATCH_SIZE} pixels.")
+                        if current_w > 4096 or current_h > 4096: # Max observed, but warn if exceeding common limits
+                            print(f"  - WARNING: Very large image size {current_w}x{current_h} may cause memory issues.")
+
+                        # Ensure image dimensions are multiples of 16 (DINOV3_PATCH_SIZE)
+                        # This logic rounds up to the nearest multiple of 16, as praised in feedback.
+                        new_w = ((current_w + DINOV3_PATCH_SIZE - 1) // DINOV3_PATCH_SIZE) * DINOV3_PATCH_SIZE
+                        new_h = ((current_h + DINOV3_PATCH_SIZE - 1) // DINOV3_PATCH_SIZE) * DINOV3_PATCH_SIZE
+
+                        if new_w != current_w or new_h != current_h:
+                            print(f"  - INFO: Adjusting dims ({current_w}x{current_h}) -> ({new_w}x{new_h}) to be multiples of {DINOV3_PATCH_SIZE} for DINOv3.")
+                            img_to_process = img_to_process.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+                        # Use processor for ToTensor/Normalize
+                        inputs = processor(images=[img_to_process], return_tensors="pt")
+                        processed_tensors.append(inputs.pixel_values)
+
+                    if not processed_tensors: raise ValueError("DINOv3 processing failed for all images.")
+                    pixel_values = torch.cat(processed_tensors, dim=0).to(device=self.device, dtype=self.clip_dtype)
+                    model_call_kwargs = {"pixel_values": pixel_values}
+                    # Call DINOv3 model
+                    with torch.no_grad(): outputs = model(**model_call_kwargs)
+                    last_hidden_state = getattr(outputs, 'last_hidden_state', None)
+                    if last_hidden_state is None: raise ValueError("DINOv3 model did not return last_hidden_state.")
+                    # Use mean pooling of patch tokens (exclude CLS and register tokens)
+                    # DINOv3-7B has 4 register tokens. We skip CLS (pos 0) and registers (pos 1-4).
+                    nreg = getattr(model.config, 'num_register_tokens', 0)
+                    patch_embeddings = last_hidden_state[:, 1 + nreg:] # Skip CLS and Registers
+                    emb = torch.mean(patch_embeddings, dim=1)  # [B, embed_dim]
+                    do_l2_normalize = True # DINOv3 typically requires L2 normalization
+
+                # --- SubPath 2c: Manual Preprocessing (FB DINOv2 or SigLIP FitPad/CenterCrop) ---
                 elif not is_naflex_mode:
                     # Expects PREPROCESSED PIL images in img_list (processed by _preprocess_images)
                     # Use processor ONLY for ToTensor + Normalize

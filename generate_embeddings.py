@@ -4,7 +4,7 @@
 import os
 from concurrent.futures import ThreadPoolExecutor, Future
 import time
-from typing import List
+from typing import List, Optional # <<< MODIFIED: Added Optional for type hinting >>>
 
 import torch.nn.functional as F
 import torch
@@ -12,13 +12,8 @@ import torchvision.transforms.functional as TF # Renamed from F to avoid conflic
 import torch.nn.functional as torch_func
 
 # <<< ADD TIMM IMPORT >>>
-try:
-    import timm
-    import timm.data
-    TIMM_AVAILABLE = True
-except ImportError:
-    print("Warning: timm library not found. TIMM models cannot be used.")
-    TIMM_AVAILABLE = False
+# Note: 'timm' is now imported on-demand where needed to satisfy static analysis
+# and avoid 'unbound' errors if the library is not present.
 # <<< END ADD >>>
 
 from PIL import Image, UnidentifiedImageError # <<< Added UnidentifiedImageError >>>
@@ -43,6 +38,10 @@ AIMV2_TARGET_MAX_PATCHES = 4096 # Target patch count for resizing, adjust if nee
 # <<< ADDED: Threading config >>>
 NUM_LOAD_WORKERS = 64 # Number of threads for loading images
 LOAD_QUEUE_SIZE = 32  # How many images to keep loaded ahead of time
+# <<< ADDED: DINOv3 Specific Constants >>>
+DINOV3_PATCH_SIZE = 16 # DINOv3 patch size
+MAX_DINOV3_RESOLUTION = 4096 # Max resolution for DINOv3, adjust based on GPU memory
+# <<< END ADDED DINOv3 Specific Constants >>>
 
 
 # --- Argument Parsing ---
@@ -62,7 +61,8 @@ def parse_gen_args():
                             'naflex_resize2',  # NaFlex HF (Proc Logic @ 2048)
                             'dinov2_large_timm_fitpad',  # DINOv2 TIMM (TIMM Transforms)
                             'dinov2_giant_fb_fitpad',  # DINOv2 Facebook (Manual FitPad 518)
-                            'aimv2_native_cls'  # <<< ADDED: AIMv2 Native CLS Token (HF Processor) >>>
+                            'aimv2_native_cls',  # <<< ADDED: AIMv2 Native CLS Token (HF Processor) >>>
+                            'dinov3_7b_8bit_bnb' # <<< ADDED: DINOv3 7B 8-bit BnB >>>
                         ],
                         help="Image preprocessing method before embedding.")
     # parser.add_argument('--resize_factor_avg_crop', type=float, default=2.0,
@@ -73,15 +73,21 @@ def parse_gen_args():
     args = parser.parse_args()
 
     # --- Validation ---
-    if args.preprocess_mode == 'dinov2_large_fb_fitpad' and not TIMM_AVAILABLE:
-         parser.error("preprocess_mode 'dinov2_large_fb_fitpad' requires 'timm'.")
-    if args.preprocess_mode == 'dinov2_large_fb_fitpad' and not args.model_name.startswith('timm/'):
-         print(f"Warning: Mode 'dinov2_large_fb_fitpad' expects a TIMM model (timm/...), got '{args.model_name}'.")
+    if args.preprocess_mode == 'dinov2_large_timm_fitpad':
+        try:
+            import timm
+        except ImportError:
+            parser.error("preprocess_mode 'dinov2_large_timm_fitpad' requires 'timm' to be installed.")
+    if args.preprocess_mode == 'dinov2_large_timm_fitpad' and not args.model_name.startswith('timm/'):
+         print(f"Warning: Mode 'dinov2_large_timm_fitpad' expects a TIMM model (timm/...), got '{args.model_name}'.")
     if args.preprocess_mode == 'dinov2_giant_fb_fitpad' and not args.model_name.startswith('facebook/dinov2'):
          print(f"Warning: Mode 'dinov2_giant_fb_fitpad' expects a Facebook DINOv2 model (facebook/dinov2-...), got '{args.model_name}'.")
     # <<< ADDED: Validation for aimv2_native_cls >>>
     if args.preprocess_mode == 'aimv2_native_cls' and not args.model_name.startswith('apple/aimv2'):
          print(f"Warning: Mode 'aimv2_native_cls' expects an Apple AIMv2 model (apple/aimv2-...), got '{args.model_name}'.")
+    # <<< ADDED: Validation for dinov3_7b_8bit_bnb >>>
+    if args.preprocess_mode == 'dinov3_7b_8bit_bnb' and not args.model_name.startswith('dinov3-vit7b16-pretrain-lvd1689m-8bit'):
+         print(f"Warning: Mode 'dinov3_7b_8bit_bnb' expects model_name 'dinov3-vit7b16-pretrain-lvd1689m-8bit', got '{args.model_name}'.")
 
     return args
 
@@ -151,19 +157,24 @@ def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
         ideal_height_f = ideal_patch_h_f * patch_size
         new_width = math.floor(ideal_width_f / patch_size) * patch_size
         new_height = math.floor(ideal_height_f / patch_size) * patch_size
-        if new_width == 0: new_width = patch_size
-        if new_height == 0: new_height = patch_size
-        num_patches_w = new_width // patch_size
-        num_patches_h = new_height // patch_size
+        
+        # Assign to new_w and new_h at the beginning
+        new_w = new_width # <<< FIXED: Assign new_width to new_w >>>
+        new_h = new_height # <<< FIXED: Assign new_height to new_h >>>
+
+        if new_w == 0: new_w = patch_size
+        if new_h == 0: new_h = patch_size
+        num_patches_w = new_w // patch_size # <<< FIXED: Use new_w and new_h >>>
+        num_patches_h = new_h // patch_size # <<< FIXED: Use new_w and new_h >>>
         total_patches = num_patches_w * num_patches_h
 
-        print(f"  DEBUG Preprocess NaflexResize(v4.1): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_width}x{new_height}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})")
+        print(f"  DEBUG Preprocess NaflexResize(v4.1): Original: {original_width}x{original_height}, TargetPatches: {target_patches}, New: {new_w}x{new_h}, Patches: {total_patches} ({num_patches_w}x{num_patches_h})") # <<< FIXED: Use new_w and new_h >>>
 
         if total_patches > target_patches * 1.05: # Allow small overshoot? Or strict?
             print(f"  ERROR: Calculated patches ({total_patches}) exceed target ({target_patches})!")
             return None, 0
 
-        img_resized = img_pil.resize((int(new_width), int(new_height)), Image.Resampling.LANCZOS)
+        img_resized = img_pil.resize((int(new_w), int(new_h)), Image.Resampling.LANCZOS) # <<< FIXED: Use new_w and new_h >>>
         return img_resized, total_patches
     except Exception as e:
         print(f"Error during preprocess_naflex_resize: {e}")
@@ -172,17 +183,30 @@ def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
 
 # --- Model Initialization (Now uses AutoImageProcessor) ---
 # v4.3.0: Use AutoImageProcessor
+import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
+
 def init_vision_model(model_name, device, dtype):
     """Initializes vision model and image processor."""
     print(f"Initializing Vision Model: {model_name} on {device} with dtype {dtype}")
     try:
-        # <<< Use AutoImageProcessor explicitly >>>
-        # trust_remote_code might be needed for AIMv2's processor config
-        processor = AutoImageProcessor.from_pretrained(model_name, attn_implementation="sdpa", trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_name, torch_dtype=dtype, attn_implementation="sdpa", trust_remote_code=True).to(device).eval()
+        # <<< ADDED: DINOv3 8-bit BnB Model Loading >>>
+        if model_name == "dinov3-vit7b16-pretrain-lvd1689m-8bit":
+            print(f"  Loading DINOv3 8-bit BnB model from saved path: {model_name}")
+            model, processor = dinov3_7b_quant_bnb.load_from_saved_bnb(save_path=f"./{model_name}")
+            # For 8-bit models, device_map="auto" already handles device placement.
+            # Do NOT call .to(device) again, as it's not supported and causes an error.
+            model.eval() # Ensure model is in eval mode
+            
+            print(f"  Loaded DINOv3 8-bit BnB model class: {model.__class__.__name__}")
+            print(f"  Loaded DINOv3 8-bit BnB processor class: {processor.__class__.__name__}")
+        else:
+            # <<< Use AutoImageProcessor explicitly >>>
+            # trust_remote_code might be needed for AIMv2's processor config
+            processor = AutoImageProcessor.from_pretrained(model_name, attn_implementation="sdpa", trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_name, torch_dtype=dtype, attn_implementation="sdpa", trust_remote_code=True).to(device).eval()
 
-        print(f"  Loaded model class: {model.__class__.__name__}")
-        print(f"  Loaded processor class: {processor.__class__.__name__}")
+            print(f"  Loaded model class: {model.__class__.__name__}")
+            print(f"  Loaded processor class: {processor.__class__.__name__}")
 
         # --- Disable Processor Auto-Preprocessing for manual modes ONLY ---
         # <<< This logic is now less critical if we use processor directly for AIMv2 CLS >>>
@@ -237,7 +261,7 @@ def get_embedding(
     device,
     dtype,
     model_image_size: int, # Needed for manual modes like FitPad
-    filename: str = None,
+    filename: Optional[str] = None, # <<< MODIFIED: Use Optional for type hinting >>>
     naflex_max_patches: int = 1024 # Default for SigLIP NaFlex
 ) -> np.ndarray | None:
     """
@@ -271,6 +295,8 @@ def get_embedding(
             is_dinov2_model = "Dinov2Model" in model.__class__.__name__
             # <<< ADDED: Check for AIMv2Model name >>>
             is_aimv2_model = "AIMv2Model" in model.__class__.__name__
+            # <<< MODIFIED: Check for DINOv3ViTModel name >>>
+            is_dinov3_model = "DINOv3ViTModel" in model.__class__.__name__
 
             # --- HF NaFlex Mode (SigLIP Processor Logic @ 1024) ---
             if is_siglip_model and preprocess_mode == 'naflex_resize':
@@ -380,6 +406,50 @@ def get_embedding(
                 if last_hidden_state is None: raise ValueError("AIMv2 model did not return last_hidden_state.")
                 emb = last_hidden_state[:, 0, :]; do_l2_normalize = True
 
+            # <<< ADDED: DINOv3 7B 8-bit BnB Mode (Variable Resolution + Mean Pooling) >>>
+            elif is_dinov3_model and preprocess_mode == 'dinov3_7b_8bit_bnb':
+                current_w, current_h = raw_img_pil.size
+                img_to_process = raw_img_pil
+
+                # Optional: Add max resolution limit for memory protection
+                if max(current_w, current_h) > MAX_DINOV3_RESOLUTION:
+                    scale = MAX_DINOV3_RESOLUTION / max(current_w, current_h)
+                    current_w = int(current_w * scale)
+                    current_h = int(current_h * scale)
+                    img_to_process = raw_img_pil.resize((current_w, current_h), Image.Resampling.LANCZOS)
+                    print(f"  - INFO: Scaling down {img_name} to fit within {MAX_DINOV3_RESOLUTION}px limit.")
+
+                # Validate reasonable image sizes after potential downscaling
+                if current_w < DINOV3_PATCH_SIZE or current_h < DINOV3_PATCH_SIZE:
+                    raise ValueError(f"Image too small: {current_w}x{current_h}. Minimum size is {DINOV3_PATCH_SIZE}x{DINOV3_PATCH_SIZE} pixels.")
+                if current_w > 4096 or current_h > 4096: # Max observed, but warn if exceeding common limits
+                    print(f"  - WARNING: Very large image size {current_w}x{current_h} may cause memory issues.")
+
+                # Ensure image dimensions are multiples of 16 (DINOV3_PATCH_SIZE)
+                # This logic rounds up to the nearest multiple of 16, as praised in feedback.
+                new_w = ((current_w + DINOV3_PATCH_SIZE - 1) // DINOV3_PATCH_SIZE) * DINOV3_PATCH_SIZE
+                new_h = ((current_h + DINOV3_PATCH_SIZE - 1) // DINOV3_PATCH_SIZE) * DINOV3_PATCH_SIZE
+
+                if new_w != current_w or new_h != current_h:
+                    print(f"  - INFO: Adjusting {img_name} dims ({current_w}x{current_h}) -> ({new_w}x{new_h}) to be multiples of {DINOV3_PATCH_SIZE} for DINOv3.")
+                    img_to_process = img_to_process.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+                # Use processor for ToTensor/Normalize
+                inputs = processor(images=[img_to_process], return_tensors="pt")
+                pixel_values = inputs.get("pixel_values")
+                if pixel_values is None: raise ValueError("HF DINOv3 Processor didn't return 'pixel_values'.")
+                model_call_kwargs = {"pixel_values": pixel_values.to(device=device, dtype=dtype)}
+                # Call DINOv3 model
+                outputs = model(**model_call_kwargs)
+                last_hidden_state = getattr(outputs, 'last_hidden_state', None)
+                if last_hidden_state is None: raise ValueError("DINOv3 model did not return last_hidden_state.")
+                # Use mean pooling of patch tokens (exclude CLS and register tokens)
+                # DINOv3-7B has 4 register tokens. We skip CLS (pos 0) and registers (pos 1-4).
+                nreg = getattr(model.config, 'num_register_tokens', 0)
+                patch_embeddings = last_hidden_state[:, 1 + nreg:] # Skip CLS and Registers
+                emb = torch.mean(patch_embeddings, dim=1)  # [B, embed_dim]
+                do_l2_normalize = True # DINOv3 typically requires L2 normalization
+
             # --- HF Manual Modes (FitPad / CenterCrop for SigLIP/non-FB DINOv2) ---
             elif preprocess_mode in ['fit_pad', 'center_crop']:
                 processed_img_pil = None
@@ -479,11 +549,13 @@ if __name__ == "__main__":
     model_image_size = 0 # Needed for manual preprocessing
 
     # --- TIMM Model Handling ---
-    if args.model_name.startswith("timm/") and TIMM_AVAILABLE:
+    if args.model_name.startswith("timm/"):
          print("Detected TIMM model name.")
          if args.preprocess_mode != 'dinov2_large_timm_fitpad':
              exit("Error: TIMM model requires 'dinov2_large_timm_fitpad' preprocess_mode.")
          try:
+              import timm
+              import timm.data
               print(f"Initializing TIMM Model: {args.model_name}...")
               timm_model = timm.create_model(args.model_name, pretrained=True, num_classes=0)
               data_config = timm.data.resolve_model_data_config(timm_model)
@@ -495,7 +567,10 @@ if __name__ == "__main__":
               timm_model = timm_model.to(device=TARGET_DEV, dtype=COMPUTE_DTYPE).eval()
 
               model_info = {"type": "timm", "model": timm_model, "transforms": timm_transforms}
-         except Exception as e: # ... (error handling) ...
+         except ImportError:
+             exit("Error: TIMM model requested but timm library is not available. Please install it via 'pip install timm'.")
+         except Exception as e:
+              print(f"Error initializing TIMM model {args.model_name}: {e}")
               exit(1)
 
     # --- Hugging Face Model Handling (SigLIP or FB DINOv2) ---
@@ -529,6 +604,7 @@ if __name__ == "__main__":
         'dinov2_large_timm_fitpad': "FitPad",
         'dinov2_giant_fb_fitpad': "FitPad518", # Make FB DINOv2 distinct
         'aimv2_native_cls': "AIMv2CLS",       # <<< New Suffix >>>
+        'dinov3_7b_8bit_bnb': "DINOv3_8bit_BnB" # <<< New Suffix for DINOv3 8-bit >>>
     }
     mode_suffix = mode_suffix_map.get(args.preprocess_mode, "UnknownMode")
 
@@ -537,6 +613,8 @@ if __name__ == "__main__":
     if model_info["type"] == "timm": model_prefix = "timm_"
     elif model_info["type"] == "hf" and "dinov2" in args.model_name.lower(): model_prefix = "fb_" # DINOv2 models are typically FB
     elif model_info["type"] == "hf" and "aimv2" in args.model_name.lower(): model_prefix = "apple_" # Prefix for Apple AIMv2
+    # <<< ADDED: Prefix for DINOv3 8-bit >>>
+    elif model_info["type"] == "hf" and "dinov3" in args.model_name.lower(): model_prefix = "fb_" # DINOv3 models are typically FB
 
     output_subdir_name = f"{model_prefix}{model_name_safe}_{mode_suffix}{args.output_dir_suffix}"
     final_output_dir = os.path.join(args.output_dir_root, output_subdir_name)
@@ -549,6 +627,7 @@ if __name__ == "__main__":
     if args.preprocess_mode == 'dinov2_large_timm_fitpad': print(f"  (Using TIMM transforms with input size {model_image_size})")
     if args.preprocess_mode == 'dinov2_giant_fb_fitpad': print(f"  (Using Manual FitPad to size {model_image_size})")
     if args.preprocess_mode == 'aimv2_native_cls': print(f"  (Using HF Processor for native transforms, extracting CLS token)")
+    if args.preprocess_mode == 'dinov3_7b_8bit_bnb': print(f"  (Using DINOv3 7B 8-bit BnB model, variable resolution (multiples of 16), mean pooling)") # <<< UPDATED Print Statement >>>
     print(f"Embeddings will be saved in: {final_output_dir}")
 
     # --- Process Source Folders (Main Loop with Threading) ---
@@ -623,6 +702,7 @@ if __name__ == "__main__":
                          task_map[new_future] = next_out_p
 
                      # --- Process the completed image load job ---
+                     loaded_path: Optional[str] = None # <<< MODIFIED: Initialize loaded_path with Optional type hint >>>
                      try:
                          loaded_image, loaded_path = completed_future.result() # Get result (PIL image, path)
 
@@ -637,7 +717,7 @@ if __name__ == "__main__":
                                  device=TARGET_DEV,
                                  dtype=COMPUTE_DTYPE,
                                  model_image_size=model_image_size,
-                                 filename=os.path.basename(loaded_path), # Pass basename for logging
+                                 filename=os.path.basename(loaded_path) if loaded_path else 'UNKNOWN', # Pass basename for logging
                                  naflex_max_patches=args.naflex_max_patches # Pass limit
                              )
 
@@ -650,7 +730,7 @@ if __name__ == "__main__":
                                       print(f"\nError saving {output_path_for_task}: {e_save}")
                                       error_in_folder += 1
                              elif embedding_result is not None: # Wrong shape
-                                  print(f"Error: Embedding for {os.path.basename(loaded_path)} not 1D. Shape: {embedding_result.shape}. Skipping save.")
+                                  print(f"Error: Embedding for {os.path.basename(loaded_path if loaded_path else 'UNKNOWN')} not 1D. Shape: {embedding_result.shape}. Skipping save.") # <<< MODIFIED: Handle None for loaded_path >>>
                                   error_in_folder += 1
                              else: # Generation failed (error printed in get_embedding)
                                   error_in_folder += 1
@@ -658,7 +738,7 @@ if __name__ == "__main__":
                              del loaded_image, embedding_result
 
                      except Exception as e_proc: # Catch errors during result processing/embedding gen
-                         print(f"\nError processing result for task {current_task_index} (path: {loaded_path if 'loaded_path' in locals() else 'unknown'}): {e_proc}")
+                         print(f"\nError processing result for task {current_task_index} (path: {loaded_path if loaded_path else 'unknown'}): {e_proc}") # <<< FIXED: Check if loaded_path is not None >>>
                          traceback.print_exc()
                          error_in_folder += 1
                      finally:

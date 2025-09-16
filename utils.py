@@ -276,9 +276,11 @@ def get_embed_params(ver):
         "fb_dinov2_giant_FitPad": {"features": 1536, "hidden": 1280}, # ViT-Giant
         "timm_vit_large_patch14_dinov2.lvd142m_FitPad": {"features": 1024, "hidden": 1280}, # ViT-Large
 
+        # --- DINOv3 ---
+        "fb_dinov3_vit7b16_pretrain_lvd1689m_8bit_DINOv3_8bit_BnB": {"features": 4096, "hidden": 1280}, # DINOv3 7B 8-bit BnB
+
         # --- Other ---
         "META": {"features": 1024, "hidden": 1280}, # Legacy MetaCLIP Example
-        # <<< Add AIMv2 placeholder? Or let it be handled by E2E path? >>>
         # Let's omit AIMv2 here since it's handled by the E2E path.
     }
     if ver in embed_configs:
@@ -312,6 +314,12 @@ def run_validation_embeddings(model, val_loader, criterion, device, scaler, best
 
     val_iterator = tqdm(val_loader, desc="Validation (Embeddings)", leave=False, dynamic_ncols=True)
     for batch_data in val_iterator:
+        emb_input = None
+        target_val = None
+        target = None
+        y_pred = None
+        y_pred_for_loss = None
+        loss = None
         if batch_data is None or not batch_data:
             continue
         try:
@@ -324,14 +332,13 @@ def run_validation_embeddings(model, val_loader, criterion, device, scaler, best
             # Target type adjusted based on loss later
             current_batch_size = emb_input.size(0)
             num_classes = getattr(model, 'num_classes', 1)
-            target = None # Initialize target
 
             if num_classes == 1:
                 target = target_val.to(device=device, dtype=torch.float32).view(current_batch_size, -1).squeeze(-1)
             else:
                 target = target_val.to(device=device, dtype=torch.long).view(current_batch_size)
 
-            with torch.amp.autocast(device_type=device, enabled=autocast_enabled, dtype=amp_dtype):
+            with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=amp_dtype):
                 y_pred = model(emb_input)
                 y_pred_for_loss = y_pred
                 if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and num_classes == 1:
@@ -402,6 +409,13 @@ def run_validation_sequences(model, val_loader, criterion, device, scaler, num_l
     should_save_best = False # Initialize
 
     for batch_data in val_iterator:
+        sequence_batch = None
+        mask_batch = None
+        label_batch = None
+        target_for_loss = None
+        y_pred = None
+        y_pred_for_loss = None
+        loss = None
         if batch_data is None or not batch_data:
             continue
         try:
@@ -421,9 +435,8 @@ def run_validation_sequences(model, val_loader, criterion, device, scaler, num_l
             batch_size = sequence_batch.size(0)
 
             y_pred_final = None
-            loss = torch.tensor(float('nan'), device=device)
             try:
-                with torch.amp.autocast(device_type=device, enabled=autocast_enabled, dtype=amp_dtype):
+                with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=amp_dtype):
                     y_pred = model(sequence_batch, attention_mask=mask_batch)
                     y_pred_for_loss = y_pred
                     if num_labels == 1 and isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)):
@@ -434,7 +447,6 @@ def run_validation_sequences(model, val_loader, criterion, device, scaler, num_l
                 print(f"Error during validation prediction: {e_pred}")
                 continue
 
-            target_for_loss = None
             try:
                 if isinstance(criterion, (nn.CrossEntropyLoss, FocalLoss, nn.NLLLoss, GHMC_Loss)):
                     target_for_loss = label_batch.squeeze().to(device=device, dtype=torch.long)
