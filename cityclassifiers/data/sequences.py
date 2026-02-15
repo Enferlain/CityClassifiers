@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 
-from torch.utils.data import DataLoader
-
+from cityclassifiers.data.dataloaders import (
+    build_training_dataloader,
+    build_validation_dataloader,
+    log_train_val_loader_summary,
+)
 from sequence_dataset import FeatureSequenceDataset, collate_sequences
 
 
@@ -26,23 +29,29 @@ def build_feature_sequence_dataloaders(args):
     if len(dataset.train_indices) == 0:
         raise RuntimeError("Training dataset partition is empty.")
 
-    val_loader = dataset.get_validation_loader(
+    val_loader = build_validation_dataloader(
+        dataset,
         batch_size=args.batch,
         num_workers=args.num_workers,
     )
 
     print("DEBUG: Creating standard DataLoader for training...")
-    train_loader = DataLoader(
+    train_loader = build_training_dataloader(
         dataset,
         batch_size=args.batch,
-        shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_sequences,
         persistent_workers=True if args.num_workers > 0 else False,
         prefetch_factor=getattr(args, "prefetch_factor", 2) if args.num_workers > 0 else None,
         drop_last=getattr(args, "train_drop_last", True),
     )
-    print(f"Created training loader with shuffle=True ({len(dataset.train_indices)} samples).")
+    log_train_val_loader_summary(
+        mode_name="feature-sequence",
+        train_loader=train_loader,
+        train_samples=len(dataset.train_indices),
+        val_loader=val_loader,
+        val_split_count=args.val_split_count,
+    )
 
     num_train_samples = len(dataset.train_indices)
     if num_train_samples == 0:

@@ -238,9 +238,9 @@ cityclassifiers/
 2. Phase 1: completed
 3. Phase 2: completed
 4. Phase 3: completed
-5. Phase 4: in progress
+5. Phase 4: completed
 6. Phase 5: completed
-7. Phase 6: partially completed
+7. Phase 6: completed
 8. Phase 7: in progress
 9. Phase 8: not started
 
@@ -255,7 +255,8 @@ cityclassifiers/
 5. Data loader setup is extracted to `cityclassifiers/data/*` for embeddings, sequences, and images.
 6. Data batch contracts are now documented centrally in `cityclassifiers/data/contracts.py`.
 7. End-to-end processor loading is now isolated in `cityclassifiers/data/transforms.py`.
-8. Shared training helpers now cover:
+8. Data adapters now share reusable train/validation dataloader build + summary helpers in `cityclassifiers/data/dataloaders.py`.
+9. Shared training helpers now cover:
    - train-mode + scheduler + progress postfix
    - optimizer/scheduler setup
    - checkpoint load + periodic/best-save helpers
@@ -265,17 +266,14 @@ cityclassifiers/
    - global-step/progress/wrapper propagation
    - step-limit checks and periodic interval gating
    - validation loss-state updates and post-validation mode restoration
-9. Training-loop implementations live in `cityclassifiers/training/loops.py`, and CLI training loops now delegate to package code.
-10. Refactor smoke suite is active and passing.
+10. Training-loop implementations live in `cityclassifiers/training/loops.py`, and CLI training loops now delegate to package code.
+11. Inference postprocessing is now isolated in `cityclassifiers/inference/postprocess.py`.
+12. Added focused unit tests for `training.engine`, `training.metrics`, and `training.checkpoint` in `tests/unit/`.
+13. Refactor smoke suite is active and passing.
 
 ## Remaining Work Queue
-1. Continue Phase 4:
-   - optional follow-up: add a common dataloader-builder helper to reduce remaining duplication
-2. Continue Phase 6:
-   - split postprocess from `cityclassifiers/inference/pipeline.py` into `cityclassifiers/inference/postprocess.py`
-3. Continue Phase 7:
-   - add focused unit tests for `training.engine`, `training.metrics`, `training.checkpoint`
+1. Continue Phase 7:
    - add minimal integration test(s) that execute one forward/backward step with synthetic data
-4. Phase 8 cleanup:
+2. Phase 8 cleanup:
    - contributor docs for adding models/datasets
    - final deprecation notes and surface cleanup

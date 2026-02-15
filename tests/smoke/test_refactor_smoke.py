@@ -41,6 +41,7 @@ def test_inference_wrapper_targets_package_pipeline() -> None:
 def test_inference_pipeline_uses_package_head_adapters() -> None:
     text = (REPO_ROOT / "cityclassifiers" / "inference" / "pipeline.py").read_text(encoding="utf-8")
     assert "from cityclassifiers.models.heads import (" in text
+    assert "from cityclassifiers.inference.postprocess import (" in text
     assert "from model import PredictorModel" not in text
     assert "from head_model import HeadModel" not in text
     assert "from hybrid_model import HybridHeadModel" not in text
@@ -245,6 +246,27 @@ def test_training_clis_delegate_dataloaders_to_data_layer() -> None:
 
     assert "from cityclassifiers.data.sequences import build_feature_sequence_dataloaders" in features_text
     assert "return build_feature_sequence_dataloaders(args)" in features_text
+
+
+def test_data_adapters_use_shared_dataloader_helper() -> None:
+    embeddings_text = (REPO_ROOT / "cityclassifiers" / "data" / "embeddings.py").read_text(encoding="utf-8")
+    images_text = (REPO_ROOT / "cityclassifiers" / "data" / "images.py").read_text(encoding="utf-8")
+    sequences_text = (REPO_ROOT / "cityclassifiers" / "data" / "sequences.py").read_text(encoding="utf-8")
+
+    assert "from cityclassifiers.data.dataloaders import (" in embeddings_text
+    assert "build_training_dataloader(" in embeddings_text
+    assert "build_validation_dataloader(" in embeddings_text
+    assert "log_train_val_loader_summary(" in embeddings_text
+
+    assert "from cityclassifiers.data.dataloaders import (" in images_text
+    assert "build_training_dataloader(" in images_text
+    assert "build_validation_dataloader(" in images_text
+    assert "log_train_val_loader_summary(" in images_text
+
+    assert "from cityclassifiers.data.dataloaders import (" in sequences_text
+    assert "build_training_dataloader(" in sequences_text
+    assert "build_validation_dataloader(" in sequences_text
+    assert "log_train_val_loader_summary(" in sequences_text
 
 
 def test_train_embeddings_avoids_direct_autoprocessor_import() -> None:
@@ -492,6 +514,7 @@ def test_refactor_core_modules_compile() -> None:
         "inference.py",
         "cityclassifiers/data/__init__.py",
         "cityclassifiers/data/contracts.py",
+        "cityclassifiers/data/dataloaders.py",
         "cityclassifiers/data/embeddings.py",
         "cityclassifiers/data/images.py",
         "cityclassifiers/data/sequences.py",
@@ -514,6 +537,7 @@ def test_refactor_core_modules_compile() -> None:
         "cityclassifiers/cli/train_features.py",
         "cityclassifiers/cli/infer.py",
         "cityclassifiers/inference/pipeline.py",
+        "cityclassifiers/inference/postprocess.py",
         "cityclassifiers/training/checkpoint.py",
         "cityclassifiers/training/engine.py",
         "cityclassifiers/training/loops.py",

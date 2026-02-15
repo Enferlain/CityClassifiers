@@ -25,6 +25,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Package-level data-loading layer:
   - `cityclassifiers/data/__init__.py`
   - `cityclassifiers/data/contracts.py`
+  - `cityclassifiers/data/dataloaders.py`
   - `cityclassifiers/data/embeddings.py`
   - `cityclassifiers/data/images.py`
   - `cityclassifiers/data/sequences.py`
@@ -40,6 +41,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   - `cityclassifiers/training/loops.py`
 - Package-level inference module:
   - `cityclassifiers/inference/pipeline.py`
+  - `cityclassifiers/inference/postprocess.py`
 - Refactor docs:
   - `docs/refactor-plan.md`
   - `docs/architecture.md`
@@ -47,6 +49,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Smoke test harness and smoke tests:
   - `scripts/smoke/run_smoke.sh`
   - `tests/smoke/test_refactor_smoke.py`
+- Focused unit tests for shared training helpers:
+  - `tests/unit/test_training_engine.py`
+  - `tests/unit/test_training_metrics.py`
+  - `tests/unit/test_training_checkpoint.py`
 
 ### Changed
 - Root entrypoints are now compatibility wrappers that forward to package modules:
@@ -69,12 +75,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Training CLIs now delegate `train_loop(...)` execution to `cityclassifiers.training.loops`.
 - Model and loss imports now route through package adapter modules instead of root-level model/loss imports in registry/factory/engine paths.
 - Inference pipeline model-head imports now route through `cityclassifiers.models.heads`.
+- Inference output formatting now routes through `cityclassifiers.inference.postprocess` helpers shared by single-model, multi-model, and sequence pipelines.
 - Config normalization now infers mode from raw config only (no runtime-args fallback coupling), including `model.is_end_to_end` inference for image mode.
 - Config schema now exposes typed mode-specific sections (`predictor_params`, `head_params`, `e2e_params`) for orchestration paths.
 - Training model/criterion setup paths now consume typed normalized config sections instead of ad-hoc `getattr` defaults for core model behavior.
 - Image-mode dataloader setup now lives in `cityclassifiers.data.images` and embeddings loader no longer owns end-to-end image mode branching.
 - Data layer now documents explicit batch-key contracts via `cityclassifiers.data.contracts`.
 - End-to-end image processor loading now routes through `cityclassifiers.data.transforms.load_image_processor` instead of direct CLI import/use.
+- Data adapters now share common train/validation DataLoader construction and summary logging helpers via `cityclassifiers.data.dataloaders`.
 
 ### Fixed
 - Config normalization supports both new and legacy YAML shapes, with numeric coercion for string numeric values.

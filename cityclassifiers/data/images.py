@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from torch.utils.data import DataLoader
-
+from cityclassifiers.data.dataloaders import (
+    build_training_dataloader,
+    build_validation_dataloader,
+    log_train_val_loader_summary,
+)
 from image_dataset import ImageFolderDataset, collate_group_by_size
 
 
@@ -29,26 +32,23 @@ def build_image_training_dataloaders(args, image_processor):
     if len(dataset) == 0:
         print("Warning: Training dataset is empty! Check image path and configuration.")
 
-    train_loader = DataLoader(
+    train_loader = build_training_dataloader(
         dataset,
         batch_size=args.batch,
-        shuffle=True,
-        drop_last=True,
-        pin_memory=False,
         num_workers=args.num_workers,
         collate_fn=collate_group_by_size,
     )
-    val_loader = dataset.get_validation_loader(
+    val_loader = build_validation_dataloader(
+        dataset,
         batch_size=args.batch,
         num_workers=args.num_workers,
     )
-
-    print(f"Created image training loader with {len(train_loader)} batches ({len(dataset)} samples).")
-    if val_loader and hasattr(val_loader, "dataset") and len(val_loader.dataset) > 0:
-        print(f"Created image validation loader with {len(val_loader)} batches ({len(val_loader.dataset)} samples).")
-    elif args.val_split_count > 0:
-        print("Validation split requested, but image validation loader is empty or could not be created.")
-    else:
-        print("No validation split requested or validation data available.")
+    log_train_val_loader_summary(
+        mode_name="image",
+        train_loader=train_loader,
+        train_samples=len(dataset),
+        val_loader=val_loader,
+        val_split_count=args.val_split_count,
+    )
 
     return dataset, train_loader, val_loader

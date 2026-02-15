@@ -22,6 +22,11 @@ try:
         HybridHeadModel,
         PredictorModel,
     )
+    from cityclassifiers.inference.postprocess import (
+        format_classifier_prediction,
+        format_multi_model_prediction_raw,
+        format_sequence_prediction,
+    )
     from utils import get_embed_params # Keep utils import
 except ImportError as e:
     print(f"Error importing model classes or get_embed_params: {e}")
@@ -1049,53 +1054,14 @@ class CityClassifierPipeline(BasePipeline):
         return formatted_output
 
     def format_pred(self, pred: torch.Tensor, labels: dict, drop_default: bool = False, tile_strategy: str = "mean") -> dict:
-        # Expects pred [Tiles, Classes] or [Classes]
-        # Uses self.model.output_mode (loaded during init) if available
-        # Uses self.num_labels (set during init)
-        model_output_mode = getattr(self.model, 'output_mode', 'linear').lower() # Get mode from loaded model
-        num_classes_model = self.num_labels # Use num_labels from loaded model
-        num_tiles = pred.shape[0] if pred.ndim >= 2 else 1
-
-        if pred.ndim >= 2 and tile_strategy != "raw":
-            # Combine tile predictions
-            combined_pred = torch.zeros(num_classes_model, device='cpu') # Calc on CPU
-            for k in range(num_classes_model):
-                tile_scores = pred[:, k].cpu() # Move tiles to CPU
-                val = 0.0
-                try:
-                    if   tile_strategy == "mean":   val = torch.mean(tile_scores).item()
-                    elif tile_strategy == "median": val = torch.median(tile_scores).item() # Get median value
-                    elif tile_strategy == "max":    val = torch.max(tile_scores).item()
-                    elif tile_strategy == "min":    val = torch.min(tile_scores).item()
-                    else: raise NotImplementedError(f"Invalid strategy '{tile_strategy}'")
-                except Exception as e_comb:
-                    print(f"Error calculating tile strategy '{tile_strategy}' for class {k}: {e_comb}")
-                    val = 0.0
-                combined_pred[k] = val
-            pred_to_format = combined_pred # Shape [num_classes_model] on CPU
-        else:
-            # Single tile/embedding or raw output requested
-            # Ensure it's at least 1D before potential squeeze, move to CPU
-            pred_to_format = pred.cpu().squeeze(0) if pred.ndim > 1 else pred.cpu() # Shape [num_classes_model] or [] if scalar output initially?
-
-        # --- Handle Output Formatting Based on num_classes_model ---
-        out = {}; probabilities = pred_to_format
-        if num_classes_model == 1: # Binary case
-             scalar_value = probabilities.item() if probabilities.ndim == 0 else probabilities[0].item()
-             final_score = scalar_value
-             if model_output_mode == 'linear': final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
-             positive_label_name = labels.get('1', '1'); negative_label_name = labels.get('0', '0')
-             if not (drop_default and negative_label_name == labels.get('0')): out[negative_label_name] = float(1.0 - final_score)
-             out[positive_label_name] = float(final_score)
-        elif num_classes_model > 1: # Multi-class case
-             if model_output_mode == 'linear': probabilities = F.softmax(pred_to_format, dim=-1)
-             for k in range(num_classes_model):
-                 if k == 0 and drop_default: continue
-                 key = labels.get(str(k), str(k))
-                 value = probabilities[k].item()
-                 out[key] = float(value)
-        else: print(f"ERROR: Invalid num_classes_model ({num_classes_model}).")
-        return out
+        return format_classifier_prediction(
+            pred,
+            labels=labels,
+            num_classes=self.num_labels,
+            output_mode=getattr(self.model, "output_mode", "linear"),
+            drop_default=drop_default,
+            tile_strategy=tile_strategy,
+        )
 
 # ================================================
 #        Multi-Model Classifier Pipeline
@@ -1258,37 +1224,13 @@ class CityClassifierMultiModelPipeline(BasePipeline):
     # v1.1: Corrected median/max/min, final formatting
     def _format_single_pred(self, pred: torch.Tensor, labels: dict, drop_default: bool, tile_strategy: str, num_classes: int) -> dict:
         """Helper to format predictions for one model in the multi-pipeline."""
-        # (Identical logic to CityClassifierPipeline.format_pred)
-        num_tiles = pred.shape[0] if pred.ndim == 2 else 1
-        if num_tiles > 1 and tile_strategy != "raw":
-            combined_pred = torch.zeros(num_classes, device=pred.device)
-            for k in range(num_classes):
-                tile_scores = pred[:, k]
-                val = 0.0
-                try:
-                    if   tile_strategy == "mean":   val = torch.mean(tile_scores).item()
-                    elif tile_strategy == "median":
-                        median_value_tensor = torch.median(tile_scores)
-                        val = median_value_tensor.item()
-                    elif tile_strategy == "max":    val = torch.max(tile_scores).item()
-                    elif tile_strategy == "min":    val = torch.min(tile_scores).item()
-                    else: raise NotImplementedError(f"Invalid strategy '{tile_strategy}'")
-                except Exception as e_comb:
-                    print(f"Error calculating tile strategy '{tile_strategy}' for class {k}: {e_comb}")
-                    val = 0.0
-                combined_pred[k] = val
-            pred_to_format = combined_pred.cpu()
-        else:
-            pred_to_format = pred[0].cpu()
-
-        out = {}
-        for k in range(num_classes):
-            label_index_str = str(k)
-            if k == 0 and drop_default: continue
-            key = labels.get(label_index_str, label_index_str)
-            value = pred_to_format[k].item() if isinstance(pred_to_format[k], torch.Tensor) else pred_to_format[k]
-            out[key] = float(value)
-        return out
+        return format_multi_model_prediction_raw(
+            pred,
+            labels=labels,
+            num_classes=num_classes,
+            drop_default=drop_default,
+            tile_strategy=tile_strategy,
+        )
 
 
 # ================================================
@@ -1436,32 +1378,14 @@ class HeadSequencePipeline(BasePipeline):
         except Exception as e_pred:
              print(f"Error during HeadModel prediction: {e_pred}"); traceback.print_exc(); return {"error": "Prediction failed"}
 
-        # 4. Format Output (remains the same as before)
+        # 4. Format Output
         pred_cpu = pred.detach().cpu()
-        formatted_output = {}
-        try:
-            if self.num_labels == 1:
-                scalar_value = pred_cpu.item()
-                final_score = scalar_value
-                if self.model.output_mode == 'linear': final_score = torch.sigmoid(torch.tensor(scalar_value)).item()
-                pos_label_name = self.labels.get('1', '1')
-                neg_label_name = self.labels.get('0', '0')
-                formatted_output[neg_label_name] = float(1.0 - final_score)
-                formatted_output[pos_label_name] = float(final_score)
-            elif self.num_labels > 1:
-                probabilities = pred_cpu.squeeze(0)  # Shape [C]
-                if self.model.output_mode == 'linear': probabilities = F.softmax(probabilities, dim=-1)
-                for k in range(self.num_labels):
-                    label_index_str = str(k)
-                    key = self.labels.get(label_index_str, label_index_str)
-                    value = probabilities[k].item()
-                    formatted_output[key] = float(value)
-            else:
-                formatted_output = {"error": f"Invalid num_labels: {self.num_labels}"}
-        except Exception as e_format:
-            print(f"Error formatting prediction: {e_format}"); return {"error": "Formatting failed"}
-
-        return formatted_output
+        return format_sequence_prediction(
+            pred_cpu,
+            labels=self.labels,
+            num_labels=self.num_labels,
+            output_mode=getattr(self.model, "output_mode", "linear"),
+        )
 
 
 # --- get_model_path (Utility) ---
