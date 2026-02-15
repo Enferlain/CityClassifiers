@@ -1,0 +1,237 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cityclassifiers"
+version = "0.1.0"
+description = "Training and inference utilities for image classifiers and aesthetic predictors."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "Pillow",
+  "tqdm",
+  "accelerate>=1.12.0",
+  "safetensors>=0.7.0",
+  "transformers>=4.57.0,<6.0.0",
+  "gradio>=3.23.0",
+  "huggingface-hub",
+  "matplotlib",
+  "sentencepiece",
+]
+
+[project.optional-dependencies]
+# Torch profiles. Pick exactly one for your machine.
+torch-cu124 = ["torch", "torchvision"]
+torch-cu128 = ["torch", "torchvision"]
+torch-cu129 = ["torch", "torchvision"]
+torch-cu130 = ["torch", "torchvision"]
+
+# Torch version profiles. Pick exactly one.
+# Windows: pin triton-windows to the matching Triton line.
+# Non-Windows: do not pin triton here; let Torch manage its Triton dependency.
+torch-v29 = [
+  "torch>=2.9,<2.10",
+  "pytorch_optimizer>=3.3.2",
+  "torchao",
+  "timm",
+  "bitsandbytes; platform_system != 'Windows'",
+  "triton-windows>=3.5,<3.6; platform_system == 'Windows'",
+]
+torch-v210 = [
+  "torch>=2.10,<2.11",
+  "pytorch_optimizer>=3.3.2",
+  "torchao",
+  "timm",
+  "bitsandbytes; platform_system != 'Windows'",
+  "triton-windows>=3.6,<3.7; platform_system == 'Windows'",
+]
+
+onnx-cpu = ["onnxruntime>=1.20"]
+onnx-gpu = ["onnxruntime-gpu>=1.20"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.6.0",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+conflicts = [
+  [
+    { extra = "torch-cu124" },
+    { extra = "torch-cu128" },
+    { extra = "torch-cu129" },
+    { extra = "torch-cu130" },
+  ],
+  [
+    { extra = "torch-v29" },
+    { extra = "torch-v210" },
+  ],
+  [
+    { extra = "onnx-cpu" },
+    { extra = "onnx-gpu" },
+  ],
+  [
+    { extra = "torch-cu124" },
+    { extra = "torch-v29" },
+    { extra = "torch-v210" },
+  ],
+  [
+    { extra = "torch-cu129" },
+    { extra = "torch-v29" },
+    { extra = "torch-v210" },
+  ],
+  [
+    { extra = "torch-cu128" },
+    { extra = "torch-v210" },
+  ],
+  [
+    { extra = "torch-cu130" },
+    { extra = "torch-v29" },
+  ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu124", extra = "torch-cu124" },
+  { index = "pytorch-cu128", extra = "torch-cu128" },
+  { index = "pytorch-cu129", extra = "torch-cu129" },
+  { index = "pytorch-cu130", extra = "torch-cu130" },
+]
+torchvision = [
+  { index = "pytorch-cu124", extra = "torch-cu124" },
+  { index = "pytorch-cu128", extra = "torch-cu128" },
+  { index = "pytorch-cu129", extra = "torch-cu129" },
+  { index = "pytorch-cu130", extra = "torch-cu130" },
+]
+
+# =============================================================================
+# Ruff - Linting and Formatting
+# =============================================================================
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+
+exclude = [
+  ".git",
+  ".idea",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".uv-cache",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "*.egg-info",
+  "data",
+  "models",
+  "wandb",
+  "anatomy",
+  "pass",
+  "fail",
+  "other",
+  "images",
+  "output_passed",
+  "external",
+  "optimizer/distributed_shampoo",
+  "optimizer/low_bit_optim",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    # "I",    # isort - disabled, using custom import ordering
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "C4",     # flake8-comprehensions
+]
+
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E741",   # ambiguous variable name (common in ML code: l, I, O)
+    "B008",   # function call in default argument (dataclasses pattern)
+    "B905",   # zip without strict= (3.10+ only)
+    "SIM108", # ternary operator (sometimes less readable)
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+# isort rules are intentionally disabled for now.
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# =============================================================================
+# ty - Type Checking
+# =============================================================================
+[tool.ty.environment]
+python-version = "3.11"
+python = "./.venv"
+
+[tool.ty.src]
+# Exclude non-runtime, third-party, and exploratory code from type checking.
+exclude = [
+  ".git",
+  ".idea",
+  ".uv-cache",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "data",
+  "models",
+  "wandb",
+  "anatomy",
+  "pass",
+  "fail",
+  "other",
+  "images",
+  "output_passed",
+  "external",
+  "optimizer/distributed_shampoo",
+  "optimizer/low_bit_optim",
+]
+
+[tool.ty.rules]
+# Downgrade noisy rules to warnings for gradual adoption
+possibly-unresolved-reference = "warn"
+invalid-argument-type = "warn"
+possibly-missing-attribute = "warn"
+unresolved-attribute = "warn"
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests",
+]
+markers = [
+  "smoke: quick non-training runtime checks",
+]

@@ -7,8 +7,12 @@ other/
 images/
 ratings*
 models/
+!cityclassifiers/models
 external/
 preprocess_*
+wandb/
+anatomy/
+.idea/
 
 *.png
 *.zip

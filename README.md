@@ -64,7 +64,9 @@ First, clone the repository and install the required dependencies.
 ```bash
 git clone https://github.com/Enferlain/CityClassifiers.git
 cd CityClassifiers
-pip install -r requirements.txt
+uv venv .venv --python 3.13.5
+uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu130 torch==2.10.*
+uv sync --python .venv/bin/python
 ```
 
 ### 2. Data Preparation (Optional but Recommended)

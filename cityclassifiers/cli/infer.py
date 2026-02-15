@@ -1,4 +1,3 @@
-"""Compatibility wrapper for inference pipeline exports."""
+"""Inference entry module."""
 
 from cityclassifiers.inference.pipeline import *  # noqa: F403
-
