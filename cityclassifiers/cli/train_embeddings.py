@@ -1,19 +1,16 @@
 # Version: 2.3.0 (Handles E2E Dataset Loading)
 import argparse
+import importlib
 import os
 import traceback
+from typing import Any
 
 import torch
-try:
-    import wandb
-except ImportError:
-    wandb = None
 import math
 import torch.nn as nn
 import torch.nn.functional as F
 
 # --- Local Imports ---
-# Assuming utils.py is in the same directory or accessible
 from cityclassifiers.training.bootstrap import (
     apply_sageattention_patch,
     configure_torch_runtime,
@@ -36,11 +33,26 @@ from cityclassifiers.models.factory import (
     build_model_with_filtered_kwargs,
     resolve_num_classes,
 )
-from utils import (
-    ModelWrapper, get_embed_params, write_config,
-    load_optimizer_state, load_scheduler_state, load_scaler_state,
-    run_validation_embeddings  # Add load helpers if needed here
+from cityclassifiers.config.embed_params import get_embed_params
+from cityclassifiers.config.runtime_args import write_config
+from cityclassifiers.training.state_io import (
+    load_optimizer_state,
+    load_scaler_state,
+    load_scheduler_state,
 )
+from cityclassifiers.training.validation import run_validation_embeddings
+from cityclassifiers.training.wrapper import ModelWrapper
+
+
+def _load_optional_wandb() -> Any | None:
+    """Return wandb module when installed, otherwise None."""
+    try:
+        return importlib.import_module("wandb")
+    except ImportError:
+        return None
+
+
+wandb = _load_optional_wandb()
 
 apply_sageattention_patch(F)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -86,6 +98,12 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
     predictor_cfg = experiment.predictor_params
     head_cfg = experiment.head_params
     e2e_cfg = experiment.e2e_params
+    if head_cfg is None:
+        exit("Config Error: head_params must be set.")
+    if not e2e_cfg.is_end_to_end and predictor_cfg is None:
+        exit("Config Error: predictor_params must be set for embeddings mode.")
+    head = head_cfg
+    predictor = predictor_cfg
 
     num_labels_from_dataset = getattr(dataset, 'num_labels', 0)
     print(f"DEBUG: Labels found by dataset: {num_labels_from_dataset}")
@@ -120,11 +138,13 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
 
     model_output_mode = None
     if e2e_cfg.is_end_to_end:
-        model_output_mode = head_cfg.output_mode
+        model_output_mode = head.output_mode
         if model_output_mode is None:
             exit("Error: 'head_output_mode' missing in config for E2E mode.")
     else:
-        model_output_mode = predictor_cfg.output_mode or head_cfg.output_mode
+        if predictor is None:
+            exit("Error: predictor_params missing.")
+        model_output_mode = predictor.output_mode or head.output_mode
         if model_output_mode is None:
             exit("Error: 'output_mode' missing in predictor_params (or head_params).")
     model_output_mode = model_output_mode.lower()
@@ -170,13 +190,13 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
                 extract_layer=e2e_cfg.extract_layer,
                 pooling_strategy=e2e_cfg.pooling_strategy,
                 head_features=None,
-                head_hidden_dim=head_cfg.hidden_dim,
+                head_hidden_dim=head.hidden_dim,
                 head_num_classes=final_num_classes,
-                head_num_res_blocks=head_cfg.num_res_blocks,
-                head_dropout_rate=head_cfg.dropout_rate,
-                head_output_mode=head_cfg.output_mode,
-                attn_pool_heads=head_cfg.attn_pool_heads,
-                attn_pool_dropout=head_cfg.attn_pool_dropout,
+                head_num_res_blocks=head.num_res_blocks,
+                head_dropout_rate=head.dropout_rate,
+                head_output_mode=head.output_mode,
+                attn_pool_heads=head.attn_pool_heads,
+                attn_pool_dropout=head.attn_pool_dropout,
                 freeze_base_model=e2e_cfg.freeze_base_model,
                 compute_dtype=amp_dtype,
             )
@@ -185,37 +205,39 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
             traceback.print_exc()
             exit("Error instantiating EarlyExtractAnatomyModel.")
     else:
-        features = predictor_cfg.features if predictor_cfg.features is not None else getattr(args, "features", None)
+        if predictor is None:
+            exit("Error: predictor_params missing.")
+        features = predictor.features if predictor.features is not None else getattr(args, "features", None)
         if features is None:
             exit("Error: Features missing.")
 
         embedding_model_id = str(experiment.model.model_id or "hybrid_head_model").strip().lower()
         print(f"DEBUG: Embedding mode. Instantiating model_id='{embedding_model_id}'...")
-        output_mode = predictor_cfg.output_mode or head_cfg.output_mode
+        output_mode = predictor.output_mode or head.output_mode
         if output_mode is None:
             exit("Error: 'output_mode' missing in predictor_params (or head_params).")
-        num_res_blocks = head_cfg.num_res_blocks if head_cfg is not None else predictor_cfg.num_res_blocks
-        dropout_rate = head_cfg.dropout_rate if head_cfg is not None else predictor_cfg.dropout_rate
-        pooling_strategy = predictor_cfg.pooling_strategy or head_cfg.pooling_strategy
-        attn_pool_heads = predictor_cfg.attn_pool_heads if predictor_cfg.attn_pool_heads is not None else head_cfg.attn_pool_heads
+        num_res_blocks = head.num_res_blocks
+        dropout_rate = head.dropout_rate
+        pooling_strategy = predictor.pooling_strategy or head.pooling_strategy
+        attn_pool_heads = predictor.attn_pool_heads if predictor.attn_pool_heads is not None else head.attn_pool_heads
         attn_pool_dropout = (
-            predictor_cfg.attn_pool_dropout
-            if predictor_cfg.attn_pool_dropout is not None
-            else head_cfg.attn_pool_dropout
+            predictor.attn_pool_dropout
+            if predictor.attn_pool_dropout is not None
+            else head.attn_pool_dropout
         )
         try:
             model = build_model_with_filtered_kwargs(
                 embedding_model_id,
                 {
                     "features": features,
-                    "hidden_dim": predictor_cfg.hidden_dim,
+                    "hidden_dim": predictor.hidden_dim,
                     "num_classes": args.num_classes,
-                    "use_attention": predictor_cfg.use_attention,
-                    "num_attn_heads": predictor_cfg.num_attn_heads,
-                    "attn_dropout": predictor_cfg.attn_dropout,
+                    "use_attention": predictor.use_attention,
+                    "num_attn_heads": predictor.num_attn_heads,
+                    "attn_dropout": predictor.attn_dropout,
                     "num_res_blocks": num_res_blocks,
                     "dropout_rate": dropout_rate,
-                    "rms_norm_eps": predictor_cfg.rms_norm_eps,
+                    "rms_norm_eps": predictor.rms_norm_eps,
                     "pooling_strategy": pooling_strategy,
                     "attn_pool_heads": attn_pool_heads,
                     "attn_pool_dropout": attn_pool_dropout,
@@ -288,7 +310,7 @@ def train_loop(args, model, criterion, optimizer, scheduler, scaler,
         is_schedule_free=is_schedule_free,
         target_dev=TARGET_DEV,
         run_validation_embeddings_fn=run_validation_embeddings,
-        is_e2e=False,
+        is_e2e=getattr(args, "is_end_to_end", False),
     )
 
 # ================================================
@@ -391,7 +413,7 @@ def main():
     print("\n--- Final Calculated Args ---")
     for k, v in sorted(vars(args).items()): print(f"  {k}: {v}")
     print("--------------------------\n")
-    write_config(args) # Uses updated function from utils.py
+    write_config(args)
 
     # 9. Setup Wrapper
     wrapper = ModelWrapper(

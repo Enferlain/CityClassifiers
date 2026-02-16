@@ -24,7 +24,7 @@ This framework is built around a modular architecture that separates feature ext
 -   **Flexible Training Modes:** Train on embeddings, feature sequences, or raw images depending on your needs.
 -   **Advanced Loss Functions:** Built-in support for `FocalLoss` and `GHMC_Loss` to effectively handle class imbalance and focus on hard examples.
 -   **YAML-based Configuration:** A clean and powerful configuration system using YAML files allows you to define every aspect of your training run without changing the code.
--   **Efficient Inference:** Optimized inference pipelines (`inference.py`) for fast predictions on single images or entire folders.
+-   **Efficient Inference:** Optimized package inference pipeline (`cityclassifiers/inference/pipeline.py`) for fast predictions on single images or entire folders.
 -   **Interactive Demos:** Launch local web demos with **Gradio** to easily test and showcase your trained models.
 -   **Custom Optimizers & Schedulers:** The framework is extensible with a variety of custom optimizers (`AdamW`, `Lion`, `Sophia`, etc.) and learning rate schedulers.
 -   **Weights & Biases Integration:** Log metrics, configurations, and training progress automatically to your W&B dashboard.
@@ -33,26 +33,24 @@ This framework is built around a modular architecture that separates feature ext
 
 ```
 .
-├── config/                 # YAML configuration files for training runs.
-├── data/                   # Default directory for datasets and generated features.
-├── models/                 # Default directory for saved model checkpoints.
-├── optimizer/              # Custom optimizer and scheduler implementations.
-├── anatomy/                # (Example) Data and scripts for a specific project.
-├── dataset.py              # PyTorch Dataset for loading single-vector embeddings.
-├── sequence_dataset.py     # PyTorch Dataset for loading feature sequences.
-├── image_dataset.py        # PyTorch Dataset for loading raw images (end-to-end).
-├── model.py                # Defines the `PredictorModel` head.
-├── head_model.py           # Defines the `HeadModel` for feature sequences.
-├── hybrid_model.py         # Defines the `HybridHeadModel`.
-├── model_early_extract.py  # Defines the end-to-end `EarlyExtractAnatomyModel`.
-├── generate_embeddings.py  # Script to pre-compute single-vector embeddings.
-├── generate_feature_sequences.py # Script to pre-compute feature sequences.
-├── train.py                # Main training script for embedding-based models.
-├── train_features.py       # Main training script for feature sequence models.
-├── inference.py            # Core module for loading models and running inference.
-├── demo_folder.py          # CLI tool for batch-processing a folder of images.
-├── demo_class_gradio.py    # Gradio demo for classifier models.
-└── demo_score_gradio.py    # Gradio demo for scoring/predictor models.
+├── config/                         # YAML configuration files for training runs
+├── cityclassifiers/
+│   ├── cli/                        # Package CLIs for training and inference
+│   ├── config/                     # Typed schema + config loading/normalization
+│   ├── data/                       # Dataset modules + dataloader builders
+│   ├── models/                     # Registry/factory + backbones/heads/tasks
+│   ├── training/                   # Engine/loops/bootstrap/checkpoint/metrics
+│   └── inference/                  # Shared inference pipeline/postprocessing
+├── optimizer/                      # Custom optimizer and scheduler implementations
+├── docs/                           # Refactor docs, extension guides, architecture
+├── tests/                          # Unit/integration/smoke suites
+├── scripts/quality/                # Quality gate and root-surface checks
+├── scripts/smoke/                  # Smoke command entrypoint
+├── generate_embeddings.py          # Pre-compute single-vector embeddings
+├── generate_feature_sequences.py   # Pre-compute feature sequences
+├── demo_folder.py                  # Batch-processing CLI for folders
+├── demo_class_gradio.py            # Gradio classifier demo
+└── demo_score_gradio.py            # Gradio score/predictor demo
 ```
 
 ## Usage
@@ -68,6 +66,32 @@ uv venv .venv --python 3.13.5
 uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu130 torch==2.10.*
 uv sync --python .venv/bin/python
 ```
+
+### 1.1 Quality Gate
+
+Run the refactor quality gate (lint + compile + unit + integration + smoke):
+
+```bash
+scripts/quality/run_quality.sh
+```
+
+Optional type-check behavior:
+- `TYPECHECK_MODE=auto` (default): run `ty` only if installed.
+- `TYPECHECK_MODE=required`: fail if `ty` is unavailable.
+- `TYPECHECK_MODE=off`: skip `ty`.
+
+### 1.2 Docs By Topic
+
+- Docs index: `docs/README.md`
+- Configs: `docs/topics/configs.md`
+- Datasets: `docs/topics/datasets.md`
+- Models: `docs/topics/models.md`
+- Training: `docs/topics/training.md`
+- Inference: `docs/topics/inference.md`
+- Checkpoints: `docs/topics/checkpoints.md`
+- Implementation checklists:
+  - `docs/how-to-add-model.md`
+  - `docs/how-to-add-dataset.md`
 
 ### 2. Data Preparation (Optional but Recommended)
 
@@ -108,9 +132,11 @@ Training is controlled via YAML configuration files located in the `config/` dir
     -   `head_params`: The architecture of the trainable head model.
     -   `train`: Training parameters like learning rate, batch size, optimizer, and loss function.
 
-2.  **Start Training:**
-    -   For feature sequences: `python train_features.py --config config/your_config.yaml`
-    -   For embeddings: `python train.py --config config/your_config.yaml`
+2.  **Start Training (package-first):**
+    -   For feature sequences: `python -m cityclassifiers.cli.train_features --config config/your_config.yaml`
+    -   For embeddings/images: `python -m cityclassifiers.cli.train_embeddings --config config/your_config.yaml`
+
+    Root wrapper scripts have been removed; use package CLIs only.
 
 The script will handle setting up the dataset, model, optimizer, and training loop, logging progress to the console and Weights & Biases.
 

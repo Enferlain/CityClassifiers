@@ -5,7 +5,8 @@ from __future__ import annotations
 import collections
 import math
 import traceback
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -50,9 +51,13 @@ def update_progress_postfix(progress_bar: Any, postfix_values: Mapping[str, Any]
 def prepare_prediction_for_loss(y_pred: torch.Tensor, criterion: Any, num_classes: int) -> torch.Tensor:
     """Normalize prediction tensor shape/dtype for downstream loss computation."""
     y_pred_for_loss = y_pred
-    if isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss)) and num_classes == 1:
-        if y_pred.ndim > 1 and y_pred.shape[1] == 1:
-            y_pred_for_loss = y_pred.squeeze(-1)
+    if (
+        isinstance(criterion, (nn.BCEWithLogitsLoss, nn.L1Loss, nn.MSELoss))
+        and num_classes == 1
+        and y_pred.ndim > 1
+        and y_pred.shape[1] == 1
+    ):
+        y_pred_for_loss = y_pred.squeeze(-1)
     return y_pred_for_loss.to(torch.float32)
 
 
@@ -86,19 +91,27 @@ def prepare_embedding_sub_batch(
     num_classes: int,
     global_step: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
-    """Extract embedding-mode tensors from a sub-batch and shape targets."""
+    """Extract embedding/image tensors from a sub-batch and shape targets."""
+    model_input_val = sub_batch.get("emb")
     target_val = sub_batch.get("val")
+
+    if model_input_val is None or target_val is None:
+        model_input_val = sub_batch.get("pixel_values")
+        target_val = sub_batch.get("label")
+
     if target_val is None:
         if global_step is not None:
-            print(f"Warning: Missing target 'val' in sub-batch at step {global_step}. Skipping sub-batch.")
+            print(
+                "Warning: Missing target ('val' or 'label') in sub-batch "
+                f"at step {global_step}. Skipping sub-batch."
+            )
         return None
 
-    emb_input = sub_batch.get("emb")
-    if emb_input is None:
+    if model_input_val is None:
         return None
 
-    model_input = emb_input.to(device)
-    current_sub_batch_size = emb_input.size(0)
+    model_input = model_input_val.to(device)
+    current_sub_batch_size = model_input_val.size(0)
 
     target = target_val.to(device=device, dtype=torch.float32 if num_classes == 1 else torch.long).view(-1)
     if target.shape[0] != current_sub_batch_size:

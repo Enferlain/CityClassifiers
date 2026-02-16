@@ -5,6 +5,9 @@ Define a modular architecture that preserves current training/inference behavior
 
 Primary outcome: adding a new model family should not require editing core training loops.
 
+For the current concrete runtime flow, see `docs/how-it-works-now.md`.
+For action-oriented topic docs, see `docs/README.md`.
+
 ## 2. Design Constraints
 1. Backward-compatible CLI commands during migration.
 2. Config-driven runtime behavior remains supported.
@@ -129,10 +132,10 @@ Current repo is script-heavy with significant duplication in training and setup 
 Initial migration already started by introducing shared bootstrap helpers in:
 - `cityclassifiers/training/bootstrap.py`
 
-Remaining work is to complete module separation and move logic out of root scripts.
+Remaining work is to continue reducing legacy root compatibility modules.
 
 ## 8. Migration Policy
-1. Keep root wrappers (`train.py`, `train_features.py`, `inference.py`) until new package CLIs are stable.
+1. Keep package CLIs (`cityclassifiers/cli/*`) as canonical entrypoints.
 2. Move one concern at a time (bootstrap, config, model factory, data, engine).
 3. Run smoke checks after each slice.
 4. Avoid behavior changes unless explicitly planned and documented.

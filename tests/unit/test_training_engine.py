@@ -87,6 +87,17 @@ def test_prepare_embedding_sub_batch_validates_shapes() -> None:
             num_classes=2,
         )
 
+    prepared_image = prepare_embedding_sub_batch(
+        {"pixel_values": torch.randn(2, 3, 8, 8), "label": torch.tensor([0, 1])},
+        device="cpu",
+        num_classes=2,
+    )
+    assert prepared_image is not None
+    image_input, image_target, image_size = prepared_image
+    assert image_input.shape == (2, 3, 8, 8)
+    assert image_target.shape == (2,)
+    assert image_size == 2
+
 
 def test_prepare_sequence_micro_batch_skips_non_finite_inputs() -> None:
     bad_sequence = torch.tensor([[[1.0, float("nan")]]], dtype=torch.float32)

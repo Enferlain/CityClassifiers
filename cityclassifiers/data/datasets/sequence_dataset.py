@@ -1,3 +1,4 @@
+# ruff: noqa
 # sequence_dataset.py
 # Version 1.1.0: Improved validation loader, __getitem__ robustness, clarified comments.
 

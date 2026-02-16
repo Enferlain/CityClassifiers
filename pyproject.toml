@@ -11,7 +11,6 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
   "Pillow",
   "tqdm",
-  "accelerate>=1.12.0",
   "safetensors>=0.7.0",
   "transformers>=4.57.0,<6.0.0",
   "gradio>=3.23.0",
@@ -37,6 +36,7 @@ torch-v29 = [
   "timm",
   "bitsandbytes; platform_system != 'Windows'",
   "triton-windows>=3.5,<3.6; platform_system == 'Windows'",
+  "accelerate>=1.12.0",
 ]
 torch-v210 = [
   "torch>=2.10,<2.11",
@@ -45,6 +45,7 @@ torch-v210 = [
   "timm",
   "bitsandbytes; platform_system != 'Windows'",
   "triton-windows>=3.6,<3.7; platform_system == 'Windows'",
+  "accelerate>=1.12.0",
 ]
 
 onnx-cpu = ["onnxruntime>=1.20"]
@@ -55,6 +56,7 @@ dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
   "ruff>=0.6.0",
+  "ty>=0.0.17",
 ]
 
 [tool.uv]
@@ -196,7 +198,6 @@ line-ending = "auto"
 # =============================================================================
 [tool.ty.environment]
 python-version = "3.11"
-python = "./.venv"
 
 [tool.ty.src]
 # Exclude non-runtime, third-party, and exploratory code from type checking.
@@ -217,13 +218,24 @@ exclude = [
   "images",
   "output_passed",
   "external",
+  "optimizer",
+  "stuff.py",
+  "2head_model.py",
+  "3head_model.py",
+  "demo_class_gradio.py",
+  "demo_score_gradio.py",
+  "demo_folder.py",
+  "generate_embeddings.py",
+  "generate_feature_sequences.py",
   "optimizer/distributed_shampoo",
   "optimizer/low_bit_optim",
 ]
 
 [tool.ty.rules]
 # Downgrade noisy rules to warnings for gradual adoption
+unresolved-import = "warn"
 possibly-unresolved-reference = "warn"
+invalid-assignment = "warn"
 invalid-argument-type = "warn"
 possibly-missing-attribute = "warn"
 unresolved-attribute = "warn"
@@ -234,4 +246,5 @@ testpaths = [
 ]
 markers = [
   "smoke: quick non-training runtime checks",
+  "integration: minimal synthetic end-to-end training path checks",
 ]

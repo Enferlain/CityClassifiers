@@ -1,4 +1,4 @@
-"""Head model adapters exposed under package paths."""
+"""Head model implementations exposed under package paths."""
 
 from .hybrid_head import HybridHeadModel
 from .predictor import PredictorModel

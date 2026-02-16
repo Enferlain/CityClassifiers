@@ -29,10 +29,21 @@ from .metrics import (
     log_eval_loss,
     update_last_eval_loss,
 )
+from .state_io import load_optimizer_state, load_scaler_state, load_scheduler_state
+from .validation import run_validation_embeddings, run_validation_sequences
+from .wrapper import LOSS_MEMORY, SAVE_FOLDER, ModelWrapper
 from .loops import run_embedding_training_loop, run_feature_sequence_training_loop
 from .optim import setup_optimizer_scheduler
 
 __all__ = [
+    "LOSS_MEMORY",
+    "SAVE_FOLDER",
+    "ModelWrapper",
+    "load_optimizer_state",
+    "load_scheduler_state",
+    "load_scaler_state",
+    "run_validation_embeddings",
+    "run_validation_sequences",
     "setup_optimizer_scheduler",
     "load_checkpoint",
     "update_best_and_maybe_save",

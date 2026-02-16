@@ -7,7 +7,7 @@ from cityclassifiers.data.dataloaders import (
     build_validation_dataloader,
     log_train_val_loader_summary,
 )
-from image_dataset import ImageFolderDataset, collate_group_by_size
+from cityclassifiers.data.datasets.image_dataset import ImageFolderDataset, collate_group_by_size
 
 
 def build_image_training_dataloaders(args, image_processor):

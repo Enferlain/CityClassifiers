@@ -6,7 +6,7 @@ This plan defines the target structure and an incremental migration path to move
 ## Refactor Principles
 1. Preserve runtime behavior while restructuring.
 2. Make changes in small slices with verification after each slice.
-3. Keep compatibility wrappers at the repo root until migration is complete.
+3. Use compatibility layers only as a temporary bridge, then remove them once package paths are stable.
 4. New model support should require adapter modules + registration, not training loop edits.
 5. Update `CHANGELOG.md` (`Unreleased`) at the end of each migration slice.
 
@@ -205,7 +205,7 @@ cityclassifiers/
 - Document extension workflows.
 
 ### Deliverables
-- Lean root directory with compatibility wrappers only.
+- Lean root directory with package-first entrypoints and no runtime wrapper scripts.
 - `docs/how-to-add-model.md`
 - `docs/how-to-add-dataset.md`
 - deprecation notes for legacy internals
@@ -213,6 +213,52 @@ cityclassifiers/
 ### Done Criteria
 - New contributors can extend models/datasets without touching core engine logic.
 - Structure is discoverable and documented.
+
+## Phase 9 - Legacy Root Module Elimination
+### Goals
+- Remove remaining runtime dependencies on root implementation modules.
+- Make `cityclassifiers/*` the source of truth for models, losses, data loaders/datasets, and runtime helpers.
+
+### Scope (current refactor targets)
+- Models/losses:
+  - `model.py`
+  - `head_model.py`
+  - `hybrid_model.py`
+  - `model_early_extract.py`
+  - `losses.py`
+- Data/datasets:
+  - `dataset.py`
+  - `sequence_dataset.py`
+  - `image_dataset.py`
+- Runtime helper monolith:
+  - `utils.py`
+
+### Migration Process (must follow in order)
+1. Slice A - Models and losses:
+   - Move full implementations into:
+     - `cityclassifiers/models/heads/*`
+     - `cityclassifiers/models/backbones/*`
+     - `cityclassifiers/models/tasks/losses.py`
+   - Remove adapter-style root imports (for example `from model import PredictorModel`).
+   - Update all package imports to target package-local implementations only.
+2. Slice B - Dataset implementations:
+   - Move dataset classes/collate functions into package data modules (or `cityclassifiers/data/datasets/*` if split).
+   - Update `cityclassifiers/data/embeddings.py`, `cityclassifiers/data/sequences.py`, `cityclassifiers/data/images.py` to import package-local dataset code only.
+3. Slice C - `utils.py` decomposition:
+   - Split config parsing, checkpoint helpers, validation helpers, and wrapper glue into:
+     - `cityclassifiers/config/*`
+     - `cityclassifiers/training/*`
+     - `cityclassifiers/inference/*`
+     - `cityclassifiers/utils/*` (only true utilities)
+   - Remove package runtime imports from root `utils.py`.
+4. Slice D - Root cleanup:
+   - Delete migrated root modules only after import graph confirms no package/runtime references.
+   - Update root surface allowlist and docs.
+
+### Done Criteria
+- No runtime package imports from root implementation modules.
+- Root contains only intended public scripts/assets and non-runtime project files.
+- Quality gate and smoke tests pass with deleted legacy root implementations.
 
 ## Recommended Execution Order
 1. Phase 0
@@ -224,16 +270,17 @@ cityclassifiers/
 7. Phase 6
 8. Phase 7
 9. Phase 8
+10. Phase 9
 
 ## Verification Strategy Per Slice
-1. Move code with compatibility shim.
+1. Move code with compatibility shim only when strictly needed.
 2. Run syntax checks.
 3. Run smoke command(s) for affected path.
 4. Confirm no CLI or config regressions.
 5. Update `CHANGELOG.md` with Added/Changed/Fixed notes.
 6. Commit slice independently.
 
-## Progress Snapshot (2026-02-15)
+## Progress Snapshot (2026-02-16)
 1. Phase 0: completed
 2. Phase 1: completed
 3. Phase 2: completed
@@ -242,10 +289,11 @@ cityclassifiers/
 6. Phase 5: completed
 7. Phase 6: completed
 8. Phase 7: in progress
-9. Phase 8: not started
+9. Phase 8: completed
+10. Phase 9: completed
 
 ## Completed Highlights
-1. Root wrappers and package CLIs are in place (`train.py`, `train_features.py`, `inference.py` -> `cityclassifiers/cli/*`).
+1. Package CLIs are now the canonical entrypoints, and legacy root wrappers have been removed.
 2. Config schema/loader now includes stricter normalization with typed mode-specific sections used by training setup paths.
 3. Model registry/factory now drives both training CLIs.
 4. Model package adapters now expose explicit module paths under:
@@ -269,11 +317,73 @@ cityclassifiers/
 10. Training-loop implementations live in `cityclassifiers/training/loops.py`, and CLI training loops now delegate to package code.
 11. Inference postprocessing is now isolated in `cityclassifiers/inference/postprocess.py`.
 12. Added focused unit tests for `training.engine`, `training.metrics`, and `training.checkpoint` in `tests/unit/`.
-13. Refactor smoke suite is active and passing.
+13. Added minimal synthetic integration tests that execute real one-step forward/backward optimizer updates for:
+    - embedding loop
+    - feature-sequence loop
+    - image-mode batch path through embedding loop
+14. Added a single quality-gate command in `scripts/quality/run_quality.sh` (lint + compile + unit + integration + smoke).
+15. Added contributor extension docs and deprecation notes:
+    - `docs/how-to-add-model.md`
+    - `docs/how-to-add-dataset.md`
+    - `docs/deprecations.md`
+16. Added root-surface contract enforcement and wrapper-removal planning docs:
+    - `docs/root-surface.md`
+    - `docs/wrapper-removal-checklist.md`
+    - `scripts/quality/check_root_surface.py`
+    - `scripts/quality/root_surface_allowlist.txt`
+17. Added wrapper-command reference enforcement and allowlist:
+    - `scripts/quality/check_wrapper_references.py`
+    - `scripts/quality/wrapper_reference_allowlist.txt`
+18. Refactor smoke suite is active and passing.
+19. Phase 9 Slice A started:
+    - `cityclassifiers/models/tasks/losses.py` now contains native loss implementations (no root `losses.py` adapter import)
+    - `cityclassifiers/models/heads/predictor.py` now contains native PredictorModel implementation (no root `model.py` adapter import)
+    - root-model/loss adapters were fully replaced with package-local imports
+20. Phase 9 Slice A continued:
+    - `cityclassifiers/models/heads/sequence_head.py` now contains native `HeadModel` implementation (no root `head_model.py` adapter import)
+    - `cityclassifiers/models/heads/hybrid_head.py` now contains native `HybridHeadModel` implementation (no root `hybrid_model.py` adapter import)
+    - `cityclassifiers/models/backbones/early_extract.py` now contains native `EarlyExtractAnatomyModel` implementation (no root `model_early_extract.py` adapter import)
+21. Phase 9 Slice B started:
+    - dataset implementations moved into package-native modules:
+      - `cityclassifiers/data/datasets/embedding_dataset.py`
+      - `cityclassifiers/data/datasets/sequence_dataset.py`
+      - `cityclassifiers/data/datasets/image_dataset.py`
+    - data adapters now import package-local dataset modules only:
+      - `cityclassifiers/data/embeddings.py`
+      - `cityclassifiers/data/sequences.py`
+      - `cityclassifiers/data/images.py`
+    - root legacy modules removed:
+      - `head_model.py`
+      - `hybrid_model.py`
+      - `model_early_extract.py`
+      - `dataset.py`
+      - `sequence_dataset.py`
+      - `image_dataset.py`
+22. Phase 9 Slice C started:
+    - package runtime helpers extracted from root `utils.py` into package modules:
+      - `cityclassifiers/config/embed_params.py`
+      - `cityclassifiers/config/runtime_args.py`
+      - `cityclassifiers/training/wrapper.py`
+      - `cityclassifiers/training/state_io.py`
+      - `cityclassifiers/training/validation.py`
+    - package runtime imports now route through package modules only (no `from utils import ...` in `cityclassifiers/*`)
+    - quality/smoke checks updated to guard this import boundary
+23. Phase 9 Slice C/D completed:
+    - removed remaining root legacy implementation modules:
+      - `utils.py`
+      - `model.py`
+      - `losses.py`
+    - root-surface allowlist/docs updated to only include metadata/tooling and public utility/demo scripts
+    - smoke tests now assert these removed legacy helper modules stay deleted
+24. Phase 7 quality baseline hardened:
+    - quality gate `ty` step now targets refactored core package modules explicitly
+    - `ty` noisy rules are downgraded to warnings for incremental adoption
+    - quality/smoke/unit/integration pytest invocations now use `-s` to avoid environment-specific capture tmpfile failures
+25. Runtime documentation refreshed:
+    - added `docs/how-it-works-now.md` to describe current package-first runtime flow and extension points
+    - README structure/docs links updated to reflect removed root implementation modules and current package layout
 
 ## Remaining Work Queue
 1. Continue Phase 7:
-   - add minimal integration test(s) that execute one forward/backward step with synthetic data
-2. Phase 8 cleanup:
-   - contributor docs for adding models/datasets
-   - final deprecation notes and surface cleanup
+   - decide when to raise `ty` strictness from warning-heavy baseline to error-gated rules
+   - decide when to expand `ty` gate coverage to inference/optimizer and additional test paths

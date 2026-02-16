@@ -27,7 +27,7 @@ try:
         format_multi_model_prediction_raw,
         format_sequence_prediction,
     )
-    from utils import get_embed_params # Keep utils import
+    from cityclassifiers.config.embed_params import get_embed_params
 except ImportError as e:
     print(f"Error importing model classes or get_embed_params: {e}")
     raise

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def load_checkpoint(
@@ -15,9 +16,9 @@ def load_checkpoint(
     scaler: Any,
     target_dev: str,
     load_checkpoint_state_fn: Callable[..., tuple[int, int]],
-    load_optimizer_state_fn: Callable[..., None],
-    load_scheduler_state_fn: Callable[..., None],
-    load_scaler_state_fn: Callable[..., None],
+    load_optimizer_state_fn: Callable[..., bool],
+    load_scheduler_state_fn: Callable[..., bool],
+    load_scaler_state_fn: Callable[..., bool],
 ) -> tuple[int, int]:
     """Load checkpoint state through provided compatibility hooks."""
     return load_checkpoint_state_fn(

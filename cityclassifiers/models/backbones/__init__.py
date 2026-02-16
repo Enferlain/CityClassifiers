@@ -1,4 +1,4 @@
-"""Backbone model adapters exposed under package paths."""
+"""Backbone model implementations exposed under package paths."""
 
 from .early_extract import EarlyExtractAnatomyModel
 

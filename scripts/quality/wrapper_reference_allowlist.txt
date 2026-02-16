@@ -1,0 +1,10 @@
+# Files allowed to reference compatibility wrapper commands/paths.
+# The goal is to keep references contained to migration/deprecation docs and tests.
+
+docs/architecture.md
+docs/deprecations.md
+docs/migration-map.md
+docs/refactor-plan.md
+docs/root-surface.md
+docs/wrapper-removal-checklist.md
+tests/smoke/test_refactor_smoke.py

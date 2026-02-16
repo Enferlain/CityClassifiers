@@ -46,6 +46,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   - `docs/refactor-plan.md`
   - `docs/architecture.md`
   - `docs/migration-map.md`
+- Contributor extension and lifecycle docs:
+  - `docs/how-to-add-model.md`
+  - `docs/how-to-add-dataset.md`
+  - `docs/how-it-works-now.md`
+  - `docs/deprecations.md`
+  - `docs/root-surface.md`
+  - `docs/wrapper-removal-checklist.md`
+- Topic-oriented docs index and workflow guides:
+  - `docs/README.md`
+  - `docs/topics/configs.md`
+  - `docs/topics/datasets.md`
+  - `docs/topics/models.md`
+  - `docs/topics/training.md`
+  - `docs/topics/inference.md`
+  - `docs/topics/checkpoints.md`
 - Smoke test harness and smoke tests:
   - `scripts/smoke/run_smoke.sh`
   - `tests/smoke/test_refactor_smoke.py`
@@ -53,12 +68,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   - `tests/unit/test_training_engine.py`
   - `tests/unit/test_training_metrics.py`
   - `tests/unit/test_training_checkpoint.py`
+- Minimal synthetic integration training check:
+  - `tests/integration/test_training_one_step.py`
+- Quality gate command:
+  - `scripts/quality/run_quality.sh`
+  - `scripts/quality/check_root_surface.py`
+  - `scripts/quality/root_surface_allowlist.txt`
+  - `scripts/quality/check_wrapper_references.py`
+  - `scripts/quality/wrapper_reference_allowlist.txt`
 
 ### Changed
-- Root entrypoints are now compatibility wrappers that forward to package modules:
-  - `train.py`
-  - `train_features.py`
-  - `inference.py`
+- Root entrypoint usage has fully moved to package CLIs (`python -m cityclassifiers.cli.*`) and package inference modules.
 - Training CLIs now load a normalized experiment config via `load_experiment_config(...)`.
 - `train_features` and `train_embeddings` now use registry/factory helpers for loss and model construction.
 - Embedding model selection can now be configured with `model.model_id` (defaults to `hybrid_head_model` if unspecified).
@@ -74,6 +94,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Validation post-run train-mode restoration and last-eval-loss tracking now route through shared `cityclassifiers.training` helpers.
 - Training CLIs now delegate `train_loop(...)` execution to `cityclassifiers.training.loops`.
 - Model and loss imports now route through package adapter modules instead of root-level model/loss imports in registry/factory/engine paths.
+- `cityclassifiers/models/heads/sequence_head.py`, `cityclassifiers/models/heads/hybrid_head.py`, and `cityclassifiers/models/backbones/early_extract.py` now contain native implementations instead of root-import adapters.
+- Dataset implementations now live in `cityclassifiers/data/datasets/*`, and package data adapters import those package-local modules.
+- Runtime helpers previously imported from root `utils.py` now live under package modules:
+  - `cityclassifiers/config/embed_params.py`
+  - `cityclassifiers/config/runtime_args.py`
+  - `cityclassifiers/training/wrapper.py`
+  - `cityclassifiers/training/state_io.py`
+  - `cityclassifiers/training/validation.py`
+- Package runtime modules (`cityclassifiers/*`) no longer import from root `utils.py`.
+- Root-surface policy now treats root implementation modules as removed, retaining only metadata/tooling plus public demo/utility scripts.
 - Inference pipeline model-head imports now route through `cityclassifiers.models.heads`.
 - Inference output formatting now routes through `cityclassifiers.inference.postprocess` helpers shared by single-model, multi-model, and sequence pipelines.
 - Config normalization now infers mode from raw config only (no runtime-args fallback coupling), including `model.is_end_to_end` inference for image mode.
@@ -83,9 +113,40 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Data layer now documents explicit batch-key contracts via `cityclassifiers.data.contracts`.
 - End-to-end image processor loading now routes through `cityclassifiers.data.transforms.load_image_processor` instead of direct CLI import/use.
 - Data adapters now share common train/validation DataLoader construction and summary logging helpers via `cityclassifiers.data.dataloaders`.
+- README now documents a single quality-gate command and links contributor extension docs.
+- Integration coverage now includes synthetic one-step checks for feature-sequence and image-mode batch paths.
+- Embedding-loop batch preparation now accepts image-mode keys (`pixel_values`/`label`) in addition to embedding keys (`emb`/`val`).
+- Embeddings CLI now forwards `is_end_to_end` into shared loop execution (`is_e2e=...`) instead of hardcoding false.
+- Quality gate now enforces a tracked root-surface contract via `check_root_surface.py`.
+- Deprecation docs now include explicit root-surface policy and wrapper-removal checklist timeline.
+- Quality gate now enforces wrapper-command reference scope via `check_wrapper_references.py`.
+- README training examples are now package-first (`python -m cityclassifiers.cli.*`).
+- Quality gate type-check now targets the refactored core package surface explicitly (instead of full-repo strict checking).
+- Quality and smoke pytest invocations now disable capture (`-s`) to avoid environment-specific tmpfile capture failures.
+- README and docs now provide topic-based navigation for core repo workflows (configs, datasets, models, training, inference, checkpoints).
+- Dataset/model extension docs now align with post-refactor package-only paths (no root legacy module guidance).
 
 ### Fixed
 - Config normalization supports both new and legacy YAML shapes, with numeric coercion for string numeric values.
 - Inference local model path resolution was updated to be repo-root aware from package location.
 - Smoke checks cover refactor-critical modules and integration points to catch structural regressions early.
 - Feature-sequence loop no longer performs duplicate best-checkpoint save checks in the same validation pass.
+- Core typed modules now pass `ty` without diagnostics on the scoped quality target set.
+- Validation helpers now use `torch.amp.autocast(...)` instead of deprecated `torch.cuda.amp.autocast(...)`.
+
+### Removed
+- Root compatibility wrapper scripts:
+  - `train.py`
+  - `train_features.py`
+  - `inference.py`
+- Legacy root model/dataset modules:
+  - `head_model.py`
+  - `hybrid_model.py`
+  - `model_early_extract.py`
+  - `dataset.py`
+  - `sequence_dataset.py`
+  - `image_dataset.py`
+- Remaining legacy root helper modules:
+  - `model.py`
+  - `losses.py`
+  - `utils.py`

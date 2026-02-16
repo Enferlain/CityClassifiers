@@ -11,7 +11,7 @@ from cityclassifiers.data.dataloaders import (
     build_validation_dataloader,
     log_train_val_loader_summary,
 )
-from dataset import EmbeddingDataset
+from cityclassifiers.data.datasets.embedding_dataset import EmbeddingDataset
 
 
 def build_embedding_training_dataloaders(args, image_processor=None):

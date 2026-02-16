@@ -1,11 +1,9 @@
 # Script for training on pre-computed feature sequences with bucketing
 import argparse
+import importlib
 import os
+from typing import Any
 import torch
-try:
-    import wandb
-except ImportError:
-    wandb = None
 import math
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +11,6 @@ import traceback # Keep traceback
 from transformers import AutoProcessor # <<< Added AutoProcessor import
 
 # --- Local Imports ---
-# Assuming utils.py is in the same directory or accessible
 from cityclassifiers.training.bootstrap import (
     apply_sageattention_patch,
     configure_torch_runtime,
@@ -27,13 +24,27 @@ from cityclassifiers.training.loops import run_feature_sequence_training_loop
 from cityclassifiers.training.optim import setup_optimizer_scheduler as setup_optimizer_scheduler_common
 from cityclassifiers.config.loader import load_experiment_config
 from cityclassifiers.config.schema import ExperimentConfig
+from cityclassifiers.config.runtime_args import write_config
 from cityclassifiers.data.sequences import build_feature_sequence_dataloaders
 from cityclassifiers.models.factory import build_criterion, build_model, resolve_num_classes
-from utils import (
-    ModelWrapper, write_config,
-    load_optimizer_state, load_scheduler_state, load_scaler_state,
-    run_validation_sequences, SAVE_FOLDER  # Add load helpers if needed here
+from cityclassifiers.training.state_io import (
+    load_optimizer_state,
+    load_scaler_state,
+    load_scheduler_state,
 )
+from cityclassifiers.training.validation import run_validation_sequences
+from cityclassifiers.training.wrapper import ModelWrapper, SAVE_FOLDER
+
+
+def _load_optional_wandb() -> Any | None:
+    """Return wandb module when installed, otherwise None."""
+    try:
+        return importlib.import_module("wandb")
+    except ImportError:
+        return None
+
+
+wandb = _load_optional_wandb()
 
 apply_sageattention_patch(F)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -65,6 +76,9 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
     config_loss_function = experiment.train.loss_function
     config_arch = experiment.model.arch
     head_cfg = experiment.head_params
+    if head_cfg is None:
+        exit("Config Error: head_params must be set.")
+    head = head_cfg
 
     # --- 2. Get num_labels from Dataset ---
     num_labels_from_dataset = getattr(dataset, 'num_labels', 0)
@@ -104,7 +118,7 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
         criterion = build_criterion(
             loss_name=resolved_loss_name,
             num_classes=final_num_classes,
-            output_mode=head_cfg.output_mode or "linear",
+            output_mode=head.output_mode or "linear",
             class_weights_tensor=class_weights_tensor,
             args=args,
         )
@@ -116,16 +130,16 @@ def setup_model_criterion(args, dataset, experiment: ExperimentConfig):
     # --- 5. Instantiate the HeadModel (Using Validated Classes) ---
     print(f"DEBUG: Instantiating HeadModel...")
     try:
-        head_features = head_cfg.features
+        head_features = head.features
         if head_features is None: exit("Error: 'head_features' not specified.")
 
-        hidden_dim = head_cfg.hidden_dim
-        pooling_strategy = head_cfg.pooling_strategy
-        num_res_blocks = head_cfg.num_res_blocks
-        dropout_rate = head_cfg.dropout_rate
-        output_mode = head_cfg.output_mode or "linear"
-        attn_pool_heads = head_cfg.attn_pool_heads
-        attn_pool_dropout = head_cfg.attn_pool_dropout
+        hidden_dim = head.hidden_dim
+        pooling_strategy = head.pooling_strategy
+        num_res_blocks = head.num_res_blocks
+        dropout_rate = head.dropout_rate
+        output_mode = head.output_mode or "linear"
+        attn_pool_heads = head.attn_pool_heads
+        attn_pool_dropout = head.attn_pool_dropout
 
         model = build_model(
             "head_model",
@@ -283,7 +297,7 @@ def main():
     print("\n--- Final Calculated Args ---")
     for k, v in sorted(vars(args).items()): print(f"  {k}: {v}")
     print("--------------------------\n")
-    write_config(args) # From utils.py
+    write_config(args)
 
     # 9. Instantiate Wrapper (passing HeadModel)
     wrapper = ModelWrapper(

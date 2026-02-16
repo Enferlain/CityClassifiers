@@ -9,7 +9,7 @@ from cityclassifiers.data.dataloaders import (
     build_validation_dataloader,
     log_train_val_loader_summary,
 )
-from sequence_dataset import FeatureSequenceDataset, collate_sequences
+from cityclassifiers.data.datasets.sequence_dataset import FeatureSequenceDataset, collate_sequences
 
 
 def build_feature_sequence_dataloaders(args):
@@ -41,7 +41,7 @@ def build_feature_sequence_dataloaders(args):
         batch_size=args.batch,
         num_workers=args.num_workers,
         collate_fn=collate_sequences,
-        persistent_workers=True if args.num_workers > 0 else False,
+        persistent_workers=args.num_workers > 0,
         prefetch_factor=getattr(args, "prefetch_factor", 2) if args.num_workers > 0 else None,
         drop_last=getattr(args, "train_drop_last", True),
     )

@@ -18,21 +18,49 @@ def build_training_dataloader(
     prefetch_factor: int | None = None,
 ):
     """Create a training DataLoader with optional worker tuning flags."""
-    kwargs = {
-        "dataset": dataset,
-        "batch_size": batch_size,
-        "shuffle": shuffle,
-        "drop_last": drop_last,
-        "pin_memory": pin_memory,
-        "num_workers": num_workers,
-    }
-    if collate_fn is not None:
-        kwargs["collate_fn"] = collate_fn
-    if persistent_workers is not None:
-        kwargs["persistent_workers"] = persistent_workers
-    if prefetch_factor is not None:
-        kwargs["prefetch_factor"] = prefetch_factor
-    return DataLoader(**kwargs)
+    if persistent_workers is None and prefetch_factor is None:
+        return DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            pin_memory=pin_memory,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+        )
+    if persistent_workers is None:
+        return DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            pin_memory=pin_memory,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            prefetch_factor=prefetch_factor,
+        )
+    if prefetch_factor is None:
+        return DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            pin_memory=pin_memory,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            persistent_workers=persistent_workers,
+        )
+    return DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
 
 
 def build_validation_dataloader(dataset, *, batch_size: int, num_workers: int):

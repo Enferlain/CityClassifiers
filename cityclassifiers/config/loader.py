@@ -1,13 +1,14 @@
 """Configuration loading bridge.
 
 This module provides package-level config entrypoints while preserving legacy
-behavior by delegating argument construction to `utils.parse_and_load_args`.
+behavior through a package-local runtime-args compatibility parser.
 """
 
 from __future__ import annotations
 
 import copy
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -153,7 +154,7 @@ def load_raw_config(config_path: str) -> dict[str, Any]:
 
 def parse_and_load_args(config_path: str):
     """Compatibility wrapper around the existing legacy parser."""
-    from utils import parse_and_load_args as legacy_parse_and_load_args
+    from cityclassifiers.config.runtime_args import parse_and_load_args as legacy_parse_and_load_args
 
     raw = load_raw_config(config_path=config_path)
     prepared = _build_legacy_compatible_raw(raw, config_path=config_path)
@@ -168,10 +169,8 @@ def parse_and_load_args(config_path: str):
         return legacy_parse_and_load_args(config_path=tmp_path)
     finally:
         if tmp_path:
-            try:
+            with suppress(OSError):
                 Path(tmp_path).unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def normalize_experiment_config(
@@ -379,7 +378,7 @@ def normalize_experiment_config(
     if getattr(runtime_args, "model_id", None) is None and isinstance(model.model_id, str):
         model_id = model.model_id.strip().lower()
         if model_id:
-            setattr(runtime_args, "model_id", model_id)
+            runtime_args.model_id = model_id
 
     return ExperimentConfig(
         config_path=config_path,

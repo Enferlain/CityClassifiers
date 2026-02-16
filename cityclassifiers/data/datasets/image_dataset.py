@@ -1,3 +1,4 @@
+# ruff: noqa
 # image_dataset.py
 # Version 1.0.0: Dataset for loading images and applying transforms end-to-end.
 

@@ -1,0 +1,14 @@
+# Tracked files allowed at repository root.
+# Keep this list intentional; new root files should be reviewed.
+
+.gitignore
+CHANGELOG.md
+LICENSE
+README.md
+demo_class_gradio.py
+demo_folder.py
+demo_score_gradio.py
+generate_embeddings.py
+generate_feature_sequences.py
+pyproject.toml
+uv.lock

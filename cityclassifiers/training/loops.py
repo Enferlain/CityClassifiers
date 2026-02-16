@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import traceback
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from tqdm import tqdm
@@ -472,7 +473,7 @@ def run_feature_sequence_training_loop(
                     print(f"Warning: Skipping micro-batch {i} due to invalid batch_data.")
                     continue
 
-                loss_this_step = torch.tensor(float("nan"), device=target_dev)
+                loss_this_step: float = float("nan")
                 try:
                     prepared = prepare_sequence_micro_batch(
                         batch_data,
@@ -494,7 +495,7 @@ def run_feature_sequence_training_loop(
                             output_mode="linear",
                             cast_target_by_criterion=True,
                         )
-                        loss_this_step = loss.detach().item()
+                        loss_this_step = float(loss.detach().item())
                         if gradient_accumulation_steps > 1:
                             loss = loss / gradient_accumulation_steps
 

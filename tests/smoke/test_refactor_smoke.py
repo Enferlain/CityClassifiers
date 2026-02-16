@@ -11,16 +11,30 @@ pytestmark = pytest.mark.smoke
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_train_wrapper_targets_package_cli() -> None:
-    text = (REPO_ROOT / "train.py").read_text(encoding="utf-8")
-    assert "from cityclassifiers.cli.train_embeddings import main" in text
-    assert 'if __name__ == "__main__":' in text
+def test_legacy_root_wrappers_removed() -> None:
+    for rel_path in ["train.py", "train_features.py", "inference.py"]:
+        assert not (REPO_ROOT / rel_path).exists()
 
 
-def test_train_features_wrapper_targets_package_cli() -> None:
-    text = (REPO_ROOT / "train_features.py").read_text(encoding="utf-8")
-    assert "from cityclassifiers.cli.train_features import main" in text
-    assert 'if __name__ == "__main__":' in text
+def test_legacy_root_model_and_dataset_modules_removed() -> None:
+    for rel_path in [
+        "head_model.py",
+        "hybrid_model.py",
+        "model_early_extract.py",
+        "dataset.py",
+        "sequence_dataset.py",
+        "image_dataset.py",
+    ]:
+        assert not (REPO_ROOT / rel_path).exists()
+
+
+def test_legacy_root_helper_modules_removed() -> None:
+    for rel_path in [
+        "model.py",
+        "losses.py",
+        "utils.py",
+    ]:
+        assert not (REPO_ROOT / rel_path).exists()
 
 
 def test_cli_modules_define_main() -> None:
@@ -33,11 +47,6 @@ def test_cli_modules_define_main() -> None:
         assert "main" in fn_names, f"main() missing in {rel_path}"
 
 
-def test_inference_wrapper_targets_package_pipeline() -> None:
-    text = (REPO_ROOT / "inference.py").read_text(encoding="utf-8")
-    assert "from cityclassifiers.inference.pipeline import *" in text
-
-
 def test_inference_pipeline_uses_package_head_adapters() -> None:
     text = (REPO_ROOT / "cityclassifiers" / "inference" / "pipeline.py").read_text(encoding="utf-8")
     assert "from cityclassifiers.models.heads import (" in text
@@ -45,6 +54,52 @@ def test_inference_pipeline_uses_package_head_adapters() -> None:
     assert "from model import PredictorModel" not in text
     assert "from head_model import HeadModel" not in text
     assert "from hybrid_model import HybridHeadModel" not in text
+
+
+def test_package_model_modules_do_not_import_legacy_root_models() -> None:
+    sequence_text = (
+        REPO_ROOT / "cityclassifiers" / "models" / "heads" / "sequence_head.py"
+    ).read_text(encoding="utf-8")
+    hybrid_text = (
+        REPO_ROOT / "cityclassifiers" / "models" / "heads" / "hybrid_head.py"
+    ).read_text(encoding="utf-8")
+    early_text = (
+        REPO_ROOT / "cityclassifiers" / "models" / "backbones" / "early_extract.py"
+    ).read_text(encoding="utf-8")
+
+    assert "from head_model import HeadModel" not in sequence_text
+    assert "from hybrid_model import HybridHeadModel" not in hybrid_text
+    assert "from model_early_extract import EarlyExtractAnatomyModel" not in early_text
+
+
+def test_quality_gate_script_exists() -> None:
+    script_path = REPO_ROOT / "scripts" / "quality" / "run_quality.sh"
+    text = script_path.read_text(encoding="utf-8")
+    assert "ruff" in text
+    assert "check_root_surface.py" in text
+    assert "check_wrapper_references.py" in text
+    assert "pytest tests/unit" in text
+    assert "pytest tests/integration" in text
+    assert "scripts/smoke/run_smoke.sh" in text
+
+
+def test_extension_docs_exist() -> None:
+    for rel_path in [
+        "docs/how-to-add-model.md",
+        "docs/how-to-add-dataset.md",
+        "docs/how-it-works-now.md",
+        "docs/deprecations.md",
+        "docs/root-surface.md",
+        "docs/wrapper-removal-checklist.md",
+    ]:
+        assert (REPO_ROOT / rel_path).is_file()
+
+
+def test_wrapper_reference_checker_exists() -> None:
+    checker = REPO_ROOT / "scripts" / "quality" / "check_wrapper_references.py"
+    allowlist = REPO_ROOT / "scripts" / "quality" / "wrapper_reference_allowlist.txt"
+    assert checker.is_file()
+    assert allowlist.is_file()
 
 
 def test_config_loader_reads_yaml_mapping() -> None:
@@ -162,6 +217,15 @@ def test_model_factory_registry_basics() -> None:
     assert "from cityclassifiers.models.tasks import FocalLoss, GHMC_Loss" in engine_text
     assert "from losses import FocalLoss, GHMC_Loss" not in engine_text
 
+    tasks_losses_text = (
+        REPO_ROOT / "cityclassifiers" / "models" / "tasks" / "losses.py"
+    ).read_text(encoding="utf-8")
+    predictor_text = (
+        REPO_ROOT / "cityclassifiers" / "models" / "heads" / "predictor.py"
+    ).read_text(encoding="utf-8")
+    assert "from losses import FocalLoss, GHMC_Loss" not in tasks_losses_text
+    assert "from model import PredictorModel" not in predictor_text
+
 
 def test_config_normalization_propagates_model_id() -> None:
     from cityclassifiers.config.loader import normalize_experiment_config
@@ -227,6 +291,7 @@ def test_train_embeddings_uses_factory_registry_path() -> None:
     text = (REPO_ROOT / "cityclassifiers" / "cli" / "train_embeddings.py").read_text(encoding="utf-8")
     assert "from cityclassifiers.models.factory import (" in text
     assert "from model_early_extract import EarlyExtractAnatomyModel" not in text
+    assert "from utils import (" not in text
     assert 'embedding_model_id = str(experiment.model.model_id or "hybrid_head_model").strip().lower()' in text
 
 
@@ -246,6 +311,13 @@ def test_training_clis_delegate_dataloaders_to_data_layer() -> None:
 
     assert "from cityclassifiers.data.sequences import build_feature_sequence_dataloaders" in features_text
     assert "return build_feature_sequence_dataloaders(args)" in features_text
+    assert "from utils import (" not in features_text
+
+
+def test_config_loader_avoids_root_utils_dependency() -> None:
+    text = (REPO_ROOT / "cityclassifiers" / "config" / "loader.py").read_text(encoding="utf-8")
+    assert "from utils import parse_and_load_args" not in text
+    assert "from cityclassifiers.config.runtime_args import parse_and_load_args as legacy_parse_and_load_args" in text
 
 
 def test_data_adapters_use_shared_dataloader_helper() -> None:
@@ -268,6 +340,10 @@ def test_data_adapters_use_shared_dataloader_helper() -> None:
     assert "build_validation_dataloader(" in sequences_text
     assert "log_train_val_loader_summary(" in sequences_text
 
+    assert "from dataset import EmbeddingDataset" not in embeddings_text
+    assert "from image_dataset import ImageFolderDataset, collate_group_by_size" not in images_text
+    assert "from sequence_dataset import FeatureSequenceDataset, collate_sequences" not in sequences_text
+
 
 def test_train_embeddings_avoids_direct_autoprocessor_import() -> None:
     text = (REPO_ROOT / "cityclassifiers" / "cli" / "train_embeddings.py").read_text(encoding="utf-8")
@@ -286,6 +362,7 @@ def test_training_clis_delegate_training_loops() -> None:
 
     assert "from cityclassifiers.training.loops import run_embedding_training_loop" in embeddings_text
     assert "run_embedding_training_loop(" in embeddings_text
+    assert 'is_e2e=getattr(args, "is_end_to_end", False)' in embeddings_text
 
     assert "from cityclassifiers.training.loops import run_feature_sequence_training_loop" in features_text
     assert "run_feature_sequence_training_loop(" in features_text
@@ -509,17 +586,20 @@ def test_metrics_helpers_basics() -> None:
 
 def test_refactor_core_modules_compile() -> None:
     paths = [
-        "train.py",
-        "train_features.py",
-        "inference.py",
         "cityclassifiers/data/__init__.py",
         "cityclassifiers/data/contracts.py",
         "cityclassifiers/data/dataloaders.py",
+        "cityclassifiers/data/datasets/__init__.py",
+        "cityclassifiers/data/datasets/embedding_dataset.py",
+        "cityclassifiers/data/datasets/sequence_dataset.py",
+        "cityclassifiers/data/datasets/image_dataset.py",
         "cityclassifiers/data/embeddings.py",
         "cityclassifiers/data/images.py",
         "cityclassifiers/data/sequences.py",
         "cityclassifiers/data/transforms.py",
         "cityclassifiers/config/__init__.py",
+        "cityclassifiers/config/embed_params.py",
+        "cityclassifiers/config/runtime_args.py",
         "cityclassifiers/config/schema.py",
         "cityclassifiers/config/loader.py",
         "cityclassifiers/models/__init__.py",
@@ -542,6 +622,9 @@ def test_refactor_core_modules_compile() -> None:
         "cityclassifiers/training/engine.py",
         "cityclassifiers/training/loops.py",
         "cityclassifiers/training/metrics.py",
+        "cityclassifiers/training/state_io.py",
+        "cityclassifiers/training/validation.py",
+        "cityclassifiers/training/wrapper.py",
         "cityclassifiers/training/optim.py",
         "cityclassifiers/training/bootstrap.py",
     ]

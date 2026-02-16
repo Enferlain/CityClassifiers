@@ -11,4 +11,4 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$PYTHON_BIN" -m pytest tests/smoke -m smoke -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$PYTHON_BIN" -m pytest tests/smoke -m smoke -q -s
