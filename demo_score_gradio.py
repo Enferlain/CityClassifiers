@@ -1,7 +1,7 @@
 import os
 import gradio as gr
 
-from inference import CityAestheticsMultiModelPipeline, get_model_path
+from cityclassifiers.inference import CityAestheticsMultiModelPipeline, get_model_path
 
 TOKEN  = os.environ.get("HFS_TOKEN")
 HFREPO = "City96/CityAesthetics"

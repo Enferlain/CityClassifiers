@@ -183,7 +183,10 @@ def preprocess_naflex_resize(img_pil, target_patches=1024, patch_size=16):
 
 # --- Model Initialization (Now uses AutoImageProcessor) ---
 # v4.3.0: Use AutoImageProcessor
-import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
+try:
+    import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
+except ImportError:
+    dinov3_7b_quant_bnb = None
 
 def init_vision_model(model_name, device, dtype):
     """Initializes vision model and image processor."""
@@ -191,6 +194,8 @@ def init_vision_model(model_name, device, dtype):
     try:
         # <<< ADDED: DINOv3 8-bit BnB Model Loading >>>
         if model_name == "dinov3-vit7b16-pretrain-lvd1689m-8bit":
+            if dinov3_7b_quant_bnb is None:
+                raise ImportError("dinov3_7b_quant_bnb module not found. Cannot load DINOv3 8-bit model.")
             print(f"  Loading DINOv3 8-bit BnB model from saved path: {model_name}")
             model, processor = dinov3_7b_quant_bnb.load_from_saved_bnb(save_path=f"./{model_name}")
             # For 8-bit models, device_map="auto" already handles device placement.

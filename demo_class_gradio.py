@@ -2,7 +2,7 @@ import os
 import torch
 import gradio as gr
 
-from inference import CityClassifierMultiModelPipeline, get_model_path
+from cityclassifiers.inference import CityClassifierMultiModelPipeline, get_model_path
 
 TOKEN  = os.environ.get("HFS_TOKEN")
 HFREPO = "City96/AnimeClassifiers"
