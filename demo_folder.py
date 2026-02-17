@@ -13,9 +13,9 @@ import json # Needed for reading config to get labels
 # Make sure inference classes are imported correctly
 try:
     # <<< ADD HeadSequencePipeline to imports >>>
-    from inference import CityAestheticsPipeline, CityClassifierPipeline, HeadSequencePipeline, _load_config_helper
+    from cityclassifiers.inference import CityAestheticsPipeline, CityClassifierPipeline, HeadSequencePipeline, _load_config_helper
 except ImportError:
-    print("Error: Could not import pipeline classes or helpers from inference.py.")
+    print("Error: Could not import pipeline classes or helpers from cityclassifiers.inference.")
     exit(1)
 
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp"]

@@ -15,7 +15,11 @@ from transformers import AutoProcessor, AutoModel, AutoImageProcessor # Use Auto
 import math
 
 # --- Import Models ---
-import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
+try:
+    import dinov3_7b_quant_bnb # <<< ADDED: Import for DINOv3 BnB loading >>>
+except ImportError:
+    dinov3_7b_quant_bnb = None
+
 try:
     from cityclassifiers.models.heads import (
         HeadModel,  # Sequence head (unused by these pipelines directly)
@@ -245,6 +249,8 @@ def _load_state_dict_helper(model_path, expected_features=None, expected_outputs
     except Exception as e: print(f"Error loading state dict helper {model_path}: {e}"); raise
 
 
+
+
 # ================================================
 #        Base Pipeline Class
 # ================================================
@@ -379,6 +385,8 @@ class BasePipeline:
                 
                 # <<< MODIFIED: DINOv3 8-bit BnB Model Loading >>>
                 if model_name == "dinov3-vit7b16-pretrain-lvd1689m-8bit":
+                    if dinov3_7b_quant_bnb is None:
+                        raise ImportError("dinov3_7b_quant_bnb module not found. Cannot load DINOv3 8-bit model.")
                     print(f"  Loading DINOv3 8-bit BnB model from saved path: {model_name}")
                     self.vision_model, self.hf_processor = dinov3_7b_quant_bnb.load_from_saved_bnb(save_path=f"./{model_name}")
                     # For 8-bit models, device_map="auto" already handles device placement.
@@ -1419,3 +1427,110 @@ def get_model_path(name: str, repo: str, token: str | bool | None = None, extens
         raise
 
 # --- End get_model_path ---
+
+# ================================================
+#        Aesthetics Multi-Model Pipeline
+# ================================================
+class CityAestheticsMultiModelPipeline(BasePipeline):
+    """Pipeline for running multiple aesthetic/score models on one image."""
+    def __init__(self, model_paths: list[str], config_paths: list[str] = None, device: str = "cpu", clip_dtype: torch.dtype = torch.float32):
+        # Assumes all models use the SAME vision backbone (checked in BasePipeline)
+        first_config_path = None
+        if config_paths and config_paths[0]: first_config_path = config_paths[0]
+        super().__init__(model_path=model_paths[0], config_path=first_config_path, device=device, clip_dtype=clip_dtype)
+
+        self.model_paths = model_paths
+        self.config_paths = config_paths if config_paths else [None] * len(model_paths)
+        if len(self.model_paths) != len(self.config_paths):
+             raise ValueError("Mismatch between number of model paths and config paths.")
+
+        self.models = {}
+        print(f"Initializing MultiModel Aesthetics Pipeline for {len(self.model_paths)} models...")
+
+        for i, m_path in enumerate(self.model_paths):
+            if not os.path.isfile(m_path):
+                 print(f"Warning: Model path not found, skipping: {m_path}")
+                 continue
+            name = os.path.splitext(os.path.basename(m_path))[0]
+            c_path = self.config_paths[i]
+
+            if c_path is None or not os.path.isfile(c_path):
+                 inferred_c_path = self._infer_config_path(m_path)
+                 if inferred_c_path: c_path = inferred_c_path
+                 else:
+                     print(f"Warning: Could not load/infer config for {name}. Skipping.")
+                     continue
+
+            self._load_scorer(m_path, c_path, name)
+
+    def _load_scorer(self, m_path, c_path, name):
+        """Helper method to load a single scorer model."""
+        try:
+             current_config = _load_config_helper(c_path)
+             if not current_config: raise ValueError(f"Failed to load config from {c_path}")
+
+             # Load features/hidden/etc (simplified version of single model loading)
+             current_embed_ver = current_config.get("model", {}).get("embed_ver", self.embed_ver)
+             pred_params_conf = current_config.get("predictor_params", {}) or current_config.get("model_params", {})
+
+             expected_features = pred_params_conf.get("features")
+             if expected_features is None: expected_features = get_embed_params(current_embed_ver)["features"]
+
+             hidden_dim = pred_params_conf.get("hidden_dim", pred_params_conf.get("hidden"))
+             if hidden_dim is None: hidden_dim = get_embed_params(current_embed_ver)["hidden"]
+
+             # Aesthetics models usually have 1 output
+             num_classes = pred_params_conf.get("num_classes", pred_params_conf.get("outputs"))
+             sd, outputs_in_file = _load_model_helper(m_path, expected_features, None)
+
+             if num_classes is None:
+                  num_classes = outputs_in_file
+
+             try:
+                  num_classes = int(num_classes)
+             except (TypeError, ValueError):
+                  num_classes = outputs_in_file
+
+             if num_classes != outputs_in_file:
+                  print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}) for {name}. Using state dict value.")
+                  num_classes = outputs_in_file
+
+             if num_classes != 1:
+                  print(f"Warning: Model {name} has {num_classes} outputs, expected 1 for aesthetics scorer.")
+
+             # Instantiate
+             current_model = PredictorModel(
+                 features=expected_features,
+                 hidden_dim=hidden_dim,
+                 num_classes=num_classes, # Should be 1
+                 use_attention=pred_params_conf.get("use_attention", True),
+                 num_attn_heads=pred_params_conf.get("num_attn_heads", 8),
+                 attn_dropout=pred_params_conf.get("attn_dropout", 0.1),
+                 num_res_blocks=pred_params_conf.get("num_res_blocks", 1),
+                 dropout_rate=pred_params_conf.get("dropout_rate", 0.1),
+                 output_mode=pred_params_conf.get("output_mode", 'linear')
+             )
+             current_model.load_state_dict(sd, strict=True)
+             current_model.to(self.device).eval()
+
+             self.models[name] = current_model
+             print(f"  Loaded scorer: {name}")
+
+        except Exception as e:
+            print(f"Error loading scorer {name}: {e}")
+
+        if not self.models: raise ValueError("No valid models loaded.")
+
+    def __call__(self, raw_pil_image: Image.Image) -> dict:
+        """Returns dict of {model_name: score}."""
+        # Use simple single-view embedding (no tiling for scorers usually)
+        emb = self.get_clip_emb_tiled(raw_pil_image, tiling=False)
+        if emb is None: return {"error": "Failed to get embedding"}
+
+        results = {}
+        for name, model in self.models.items():
+             with torch.no_grad():
+                  pred = model(emb.to(self.device, dtype=torch.float32)).detach().cpu()
+             # Return float score
+             results[name] = float(pred.squeeze().item())
+        return results
