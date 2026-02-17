@@ -1479,7 +1479,18 @@ class CityAestheticsMultiModelPipeline(BasePipeline):
                  num_classes = pred_params_conf.get("num_classes", pred_params_conf.get("outputs"))
                  sd, outputs_in_file = _load_model_helper(m_path, expected_features, None)
 
-                 if num_classes is None: num_classes = outputs_in_file
+                 if num_classes is None:
+                      num_classes = outputs_in_file
+
+                 try:
+                      num_classes = int(num_classes)
+                 except (TypeError, ValueError):
+                      num_classes = outputs_in_file
+
+                 if num_classes != outputs_in_file:
+                      print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}) for {name}. Using state dict value.")
+                      num_classes = outputs_in_file
+
                  if num_classes != 1:
                       print(f"Warning: Model {name} has {num_classes} outputs, expected 1 for aesthetics scorer.")
 
