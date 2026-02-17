@@ -1461,59 +1461,63 @@ class CityAestheticsMultiModelPipeline(BasePipeline):
                      print(f"Warning: Could not load/infer config for {name}. Skipping.")
                      continue
 
-            try:
-                 current_config = _load_config_helper(c_path)
-                 if not current_config: raise ValueError(f"Failed to load config from {c_path}")
+            self._load_scorer(m_path, c_path, name)
 
-                 # Load features/hidden/etc (simplified version of single model loading)
-                 current_embed_ver = current_config.get("model", {}).get("embed_ver", self.embed_ver)
-                 pred_params_conf = current_config.get("predictor_params", {}) or current_config.get("model_params", {})
+    def _load_scorer(self, m_path, c_path, name):
+        """Helper method to load a single scorer model."""
+        try:
+             current_config = _load_config_helper(c_path)
+             if not current_config: raise ValueError(f"Failed to load config from {c_path}")
 
-                 expected_features = pred_params_conf.get("features")
-                 if expected_features is None: expected_features = get_embed_params(current_embed_ver)["features"]
+             # Load features/hidden/etc (simplified version of single model loading)
+             current_embed_ver = current_config.get("model", {}).get("embed_ver", self.embed_ver)
+             pred_params_conf = current_config.get("predictor_params", {}) or current_config.get("model_params", {})
 
-                 hidden_dim = pred_params_conf.get("hidden_dim", pred_params_conf.get("hidden"))
-                 if hidden_dim is None: hidden_dim = get_embed_params(current_embed_ver)["hidden"]
+             expected_features = pred_params_conf.get("features")
+             if expected_features is None: expected_features = get_embed_params(current_embed_ver)["features"]
 
-                 # Aesthetics models usually have 1 output
-                 num_classes = pred_params_conf.get("num_classes", pred_params_conf.get("outputs"))
-                 sd, outputs_in_file = _load_model_helper(m_path, expected_features, None)
+             hidden_dim = pred_params_conf.get("hidden_dim", pred_params_conf.get("hidden"))
+             if hidden_dim is None: hidden_dim = get_embed_params(current_embed_ver)["hidden"]
 
-                 if num_classes is None:
-                      num_classes = outputs_in_file
+             # Aesthetics models usually have 1 output
+             num_classes = pred_params_conf.get("num_classes", pred_params_conf.get("outputs"))
+             sd, outputs_in_file = _load_model_helper(m_path, expected_features, None)
 
-                 try:
-                      num_classes = int(num_classes)
-                 except (TypeError, ValueError):
-                      num_classes = outputs_in_file
+             if num_classes is None:
+                  num_classes = outputs_in_file
 
-                 if num_classes != outputs_in_file:
-                      print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}) for {name}. Using state dict value.")
-                      num_classes = outputs_in_file
+             try:
+                  num_classes = int(num_classes)
+             except (TypeError, ValueError):
+                  num_classes = outputs_in_file
 
-                 if num_classes != 1:
-                      print(f"Warning: Model {name} has {num_classes} outputs, expected 1 for aesthetics scorer.")
+             if num_classes != outputs_in_file:
+                  print(f"Warning: Config num_classes ({num_classes}) != state dict outputs ({outputs_in_file}) for {name}. Using state dict value.")
+                  num_classes = outputs_in_file
 
-                 # Instantiate
-                 current_model = PredictorModel(
-                     features=expected_features,
-                     hidden_dim=hidden_dim,
-                     num_classes=num_classes, # Should be 1
-                     use_attention=pred_params_conf.get("use_attention", True),
-                     num_attn_heads=pred_params_conf.get("num_attn_heads", 8),
-                     attn_dropout=pred_params_conf.get("attn_dropout", 0.1),
-                     num_res_blocks=pred_params_conf.get("num_res_blocks", 1),
-                     dropout_rate=pred_params_conf.get("dropout_rate", 0.1),
-                     output_mode=pred_params_conf.get("output_mode", 'linear')
-                 )
-                 current_model.load_state_dict(sd, strict=True)
-                 current_model.to(self.device).eval()
+             if num_classes != 1:
+                  print(f"Warning: Model {name} has {num_classes} outputs, expected 1 for aesthetics scorer.")
 
-                 self.models[name] = current_model
-                 print(f"  Loaded scorer: {name}")
+             # Instantiate
+             current_model = PredictorModel(
+                 features=expected_features,
+                 hidden_dim=hidden_dim,
+                 num_classes=num_classes, # Should be 1
+                 use_attention=pred_params_conf.get("use_attention", True),
+                 num_attn_heads=pred_params_conf.get("num_attn_heads", 8),
+                 attn_dropout=pred_params_conf.get("attn_dropout", 0.1),
+                 num_res_blocks=pred_params_conf.get("num_res_blocks", 1),
+                 dropout_rate=pred_params_conf.get("dropout_rate", 0.1),
+                 output_mode=pred_params_conf.get("output_mode", 'linear')
+             )
+             current_model.load_state_dict(sd, strict=True)
+             current_model.to(self.device).eval()
 
-            except Exception as e:
-                print(f"Error loading scorer {name}: {e}")
+             self.models[name] = current_model
+             print(f"  Loaded scorer: {name}")
+
+        except Exception as e:
+            print(f"Error loading scorer {name}: {e}")
 
         if not self.models: raise ValueError("No valid models loaded.")
 
