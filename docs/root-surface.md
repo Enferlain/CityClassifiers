@@ -15,12 +15,8 @@ This document defines the intended repository-root footprint after wrapper and l
    - `README.md`
    - `pyproject.toml`
    - `uv.lock`
-2. Public utility/demo scripts:
-   - `generate_embeddings.py`
-   - `generate_feature_sequences.py`
-   - `demo_folder.py`
-   - `demo_class_gradio.py`
-   - `demo_score_gradio.py`
+2. Root launcher:
+   - `launch.py` (dispatches to package CLIs under `cityclassifiers/cli/*`)
 
 ## Enforcement
 Root surface is checked by:

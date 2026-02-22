@@ -18,11 +18,11 @@ This document maps current files/functions to their target module locations and 
 | `hybrid_model.py` | hybrid head architecture | `cityclassifiers/models/heads/hybrid_head.py` |
 | `model_early_extract.py` | end-to-end model wrapper | `cityclassifiers/models/backbones/early_extract.py` or `models/assemblies/early_extract.py` |
 | `losses.py` | GHMC + Focal loss | `cityclassifiers/models/tasks/losses.py` |
-| `generate_embeddings.py` | embedding generation workflow | `cityclassifiers/cli/generate_embeddings.py` + `cityclassifiers/inference/pipeline.py` shared preprocess/model init |
-| `generate_feature_sequences.py` | feature sequence generation workflow | `cityclassifiers/cli/generate_feature_sequences.py` + shared model/proc helpers |
-| `demo_folder.py` | batch inference wrapper | `cityclassifiers/cli/infer_folder.py` (or argument mode in `cli/infer.py`) |
-| `demo_class_gradio.py` | UI wrapper | `cityclassifiers/cli/demo_class.py` |
-| `demo_score_gradio.py` | UI wrapper | `cityclassifiers/cli/demo_score.py` |
+| `generate_embeddings.py` | removed from root surface | `cityclassifiers/cli/generate_embeddings.py` + `cityclassifiers/inference/pipeline.py` shared preprocess/model init |
+| `generate_feature_sequences.py` | removed from root surface | `cityclassifiers/cli/generate_feature_sequences.py` + shared model/proc helpers |
+| `demo_folder.py` | removed from root surface | `cityclassifiers/cli/infer_folder.py` |
+| `demo_class_gradio.py` | removed legacy UI script | n/a |
+| `demo_score_gradio.py` | removed legacy UI script | n/a |
 | `optimizer/` | custom optimizer registry implementation | keep under `optimizer/`; accessed through `training/optim.py` adapter |
 
 ## 2. Function-Level Migration Targets

@@ -6,12 +6,15 @@ For action-oriented navigation by topic, see `docs/README.md`.
 ## 1. Entrypoints
 Main commands:
 
-1. `python -m cityclassifiers.cli.train_embeddings --config <config.yaml>`
-2. `python -m cityclassifiers.cli.train_features --config <config.yaml>`
-3. Inference and demos:
-`cityclassifiers/inference/pipeline.py`, `demo_folder.py`, `demo_class_gradio.py`, `demo_score_gradio.py`
+1. `python launch.py <task> -- <task-specific-args>` (root launcher for common workflows)
+2. `python -m cityclassifiers.cli.train_embeddings --config <config.yaml>`
+3. `python -m cityclassifiers.cli.train_features --config <config.yaml>`
+4. Dataset generation CLIs:
+`python -m cityclassifiers.cli.generate_embeddings ...`, `python -m cityclassifiers.cli.generate_feature_sequences ...`
+5. Folder inference CLI:
+`python -m cityclassifiers.cli.infer_folder ...`
 
-The old root training wrappers are removed. Package CLIs are the canonical path.
+Root wrappers are removed. Package CLIs are the canonical path.
 
 ## 2. Config Flow
 

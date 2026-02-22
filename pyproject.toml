@@ -222,11 +222,6 @@ exclude = [
   "stuff.py",
   "2head_model.py",
   "3head_model.py",
-  "demo_class_gradio.py",
-  "demo_score_gradio.py",
-  "demo_folder.py",
-  "generate_embeddings.py",
-  "generate_feature_sequences.py",
   "optimizer/distributed_shampoo",
   "optimizer/low_bit_optim",
 ]

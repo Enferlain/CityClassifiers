@@ -7,7 +7,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### 2026-02-15
+
 ### Added
+
 - Package-level CLIs for training and inference:
   - `cityclassifiers/cli/train_embeddings.py`
   - `cityclassifiers/cli/train_features.py`
@@ -78,6 +81,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   - `scripts/quality/wrapper_reference_allowlist.txt`
 
 ### Changed
+
 - Root entrypoint usage has fully moved to package CLIs (`python -m cityclassifiers.cli.*`) and package inference modules.
 - Training CLIs now load a normalized experiment config via `load_experiment_config(...)`.
 - `train_features` and `train_embeddings` now use registry/factory helpers for loss and model construction.
@@ -127,6 +131,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Dataset/model extension docs now align with post-refactor package-only paths (no root legacy module guidance).
 
 ### Fixed
+
 - Config normalization supports both new and legacy YAML shapes, with numeric coercion for string numeric values.
 - Inference local model path resolution was updated to be repo-root aware from package location.
 - Smoke checks cover refactor-critical modules and integration points to catch structural regressions early.
@@ -135,6 +140,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Validation helpers now use `torch.amp.autocast(...)` instead of deprecated `torch.cuda.amp.autocast(...)`.
 
 ### Removed
+
 - Root compatibility wrapper scripts:
   - `train.py`
   - `train_features.py`

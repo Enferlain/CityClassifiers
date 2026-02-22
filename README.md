@@ -25,7 +25,7 @@ This framework is built around a modular architecture that separates feature ext
 -   **Advanced Loss Functions:** Built-in support for `FocalLoss` and `GHMC_Loss` to effectively handle class imbalance and focus on hard examples.
 -   **YAML-based Configuration:** A clean and powerful configuration system using YAML files allows you to define every aspect of your training run without changing the code.
 -   **Efficient Inference:** Optimized package inference pipeline (`cityclassifiers/inference/pipeline.py`) for fast predictions on single images or entire folders.
--   **Interactive Demos:** Launch local web demos with **Gradio** to easily test and showcase your trained models.
+-   **Package-First CLI Surface:** Run training, dataset generation, and folder inference from `cityclassifiers/cli/*` (or `launch.py`).
 -   **Custom Optimizers & Schedulers:** The framework is extensible with a variety of custom optimizers (`AdamW`, `Lion`, `Sophia`, etc.) and learning rate schedulers.
 -   **Weights & Biases Integration:** Log metrics, configurations, and training progress automatically to your W&B dashboard.
 
@@ -46,11 +46,7 @@ This framework is built around a modular architecture that separates feature ext
 ├── tests/                          # Unit/integration/smoke suites
 ├── scripts/quality/                # Quality gate and root-surface checks
 ├── scripts/smoke/                  # Smoke command entrypoint
-├── generate_embeddings.py          # Pre-compute single-vector embeddings
-├── generate_feature_sequences.py   # Pre-compute feature sequences
-├── demo_folder.py                  # Batch-processing CLI for folders
-├── demo_class_gradio.py            # Gradio classifier demo
-└── demo_score_gradio.py            # Gradio score/predictor demo
+└── launch.py                       # Root task launcher (delegates to package CLIs)
 ```
 
 ## Usage
@@ -99,10 +95,10 @@ For most use cases, you'll pre-compute features from your image dataset. Your im
 
 **Option A: Generate Single-Vector Embeddings**
 
-Use `generate_embeddings.py` to create embeddings. This is fast and uses less disk space.
+Use `cityclassifiers.cli.generate_embeddings` to create embeddings. This is fast and uses less disk space.
 
 ```bash
-python generate_embeddings.py \
+python -m cityclassifiers.cli.generate_embeddings \
   --image_dir path/to/your/images \
   --output_dir_root data \
   --model_name google/siglip-so400m-patch14-384 \
@@ -111,10 +107,10 @@ python generate_embeddings.py \
 
 **Option B: Generate Feature Sequences**
 
-Use `generate_feature_sequences.py` for richer features. This can lead to higher accuracy but requires more disk space.
+Use `cityclassifiers.cli.generate_feature_sequences` for richer features. This can lead to higher accuracy but requires more disk space.
 
 ```bash
-python generate_feature_sequences.py \
+python -m cityclassifiers.cli.generate_feature_sequences \
   --image_dir path/to/your/images \
   --output_dir_root data \
   --model_name apple/aimv2-large-patch14-224-way-2b \
@@ -140,16 +136,16 @@ Training is controlled via YAML configuration files located in the `config/` dir
 
 The script will handle setting up the dataset, model, optimizer, and training loop, logging progress to the console and Weights & Biases.
 
-### 4. Inference and Demos
+### 4. Inference
 
 Once a model is trained, you can use it for inference.
 
 **Batch Processing a Folder**
 
-Use `demo_folder.py` to classify or score all images in a directory.
+Use `cityclassifiers.cli.infer_folder` to classify or score all images in a directory.
 
 ```bash
-python demo_folder.py \
+python -m cityclassifiers.cli.infer_folder \
   --src path/to/your/images \
   --dst output_folder \
   --model models/your_model_name.safetensors \
@@ -158,16 +154,10 @@ python demo_folder.py \
   --copy_passed
 ```
 
-**Running a Live Demo**
-
-Launch an interactive Gradio web UI to test your model.
+You can also use the root launcher:
 
 ```bash
-# For a classifier
-python demo_class_gradio.py
-
-# For a scorer/predictor
-python demo_score_gradio.py
+python launch.py infer-folder -- --src path/to/your/images --dst output_folder --model models/your_model_name.safetensors --arch class --target_label_name "Good Anatomy" --copy_passed
 ```
 
 ## Pre-trained Models
